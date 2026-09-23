@@ -24,11 +24,28 @@ export interface GenerateRequest {
   apiKey?: string;
   difficultyHint?: number;
   requireThinking?: boolean;
+  tools?: ToolDefinition[];
+  toolChoice?: 'auto' | 'none' | 'required' | string;
 }
 
 export interface Message {
   role: string;
   content: string;
+  toolCallId?: string;
+  toolCalls?: ToolCall[];
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
+}
+
+export interface ToolCall {
+  id: string;
+  type?: string;
+  name: string;
+  arguments: string;
 }
 
 export interface GenerateResponse {
@@ -36,6 +53,9 @@ export interface GenerateResponse {
   done: boolean;
   finishReason?: string;
   thinkingContent?: string;
+  role?: string;
+  text?: string;
+  toolCalls?: ToolCall[];
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -130,6 +150,15 @@ export class MocrProvider {
       provider: request.provider || this.creds?.provider || '',
       baseUrl: request.baseUrl || this.creds?.baseUrl || '',
       apiKey: request.apiKey || this.creds?.apiKey || '',
+      toolChoice: request.toolChoice || 'auto',
+      tools: (request.tools || []).map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parametersJson: JSON.stringify(tool.parameters || { type: 'object', properties: {} }),
+        },
+      })),
     };
 
     const stream: any = await new Promise((resolve, reject) => {
@@ -147,6 +176,16 @@ export class MocrProvider {
           done: !!resp.done,
           finishReason: resp.finishReason || (resp.done ? 'STOP' : undefined),
           thinkingContent: resp.thinkingContent || undefined,
+          role: resp.role || undefined,
+          text: resp.text || undefined,
+          toolCalls: Array.isArray(resp.toolCalls)
+            ? resp.toolCalls.map((tool: any) => ({
+                id: tool.id || '',
+                type: tool.type || 'function',
+                name: tool.functionName || tool.name || '',
+                arguments: tool.arguments || '{}',
+              }))
+            : undefined,
         }
         if (resp.usage) {
           out.usage = {

@@ -2,10 +2,11 @@
  * Agent main loop - Core can trigger via gRPC
  */
 
-import { MocrProvider } from '../provider/mocr.js';
+import { MocrProvider, Message, ToolCall } from '../provider/mocr.js';
 import { ToolRegistry, createDefaultRegistry } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
+import { McpManager, McpServerConfig } from '@0kay/mcp';
 
 export interface AgentConfig {
   mocrAddress: string;
@@ -21,6 +22,11 @@ export interface AgentSettings {
   default_agent_type?: string;
   enable_shell_tool?: boolean;
   enable_filesystem_tool?: boolean;
+  enable_web_tools?: boolean;
+  enable_computer_use?: boolean;
+  enable_mcp_tool?: boolean;
+  enable_task_tool?: boolean;
+  mcp_servers_json?: string;
   enable_skills?: boolean;
   skills_dir?: string;
 }
@@ -28,7 +34,8 @@ export interface AgentSettings {
 export interface AgentContext {
   taskId: string;
   prompt: string;
-  history: Array<{ role: string; content: string }>;
+  history: Message[];
+  todo: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' | 'cancelled'; priority?: 'high' | 'medium' | 'low' }>;
 }
 
 export class Agent {
@@ -36,6 +43,7 @@ export class Agent {
   private tools: ToolRegistry;
   private skills: SkillRegistry;
   private taskManager: TaskManager;
+  private mcp: McpManager;
   private config: AgentConfig;
   private settings: Required<AgentSettings>;
 
@@ -53,6 +61,11 @@ export class Agent {
       default_agent_type: 'general',
       enable_shell_tool: true,
       enable_filesystem_tool: true,
+      enable_web_tools: true,
+      enable_computer_use: false,
+      enable_mcp_tool: true,
+      enable_task_tool: true,
+      mcp_servers_json: '[]',
       enable_skills: true,
       skills_dir: '',
     };
@@ -60,6 +73,7 @@ export class Agent {
     this.mocr = new MocrProvider({ grpcAddress: this.config.mocrAddress });
     this.tools = createDefaultRegistry();
     this.skills = getSkillRegistry();
+    this.mcp = new McpManager();
     this.taskManager = new TaskManager({ maxConcurrentTasks: this.settings.max_concurrent_tasks });
 
     this.taskManager.setOnComplete((task) => {
@@ -90,6 +104,21 @@ export class Agent {
     if (typeof partial.enable_filesystem_tool === 'boolean') {
       this.settings.enable_filesystem_tool = partial.enable_filesystem_tool;
     }
+    if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
+    if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
+    if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
+    if (typeof partial.enable_task_tool === 'boolean') this.settings.enable_task_tool = partial.enable_task_tool;
+    if (typeof partial.mcp_servers_json === 'string') {
+      this.settings.mcp_servers_json = partial.mcp_servers_json.trim() || '[]';
+      try {
+        const parsed = JSON.parse(this.settings.mcp_servers_json);
+        if (!Array.isArray(parsed)) throw new Error('must be a JSON array');
+        this.mcp.configure(parsed as McpServerConfig[]);
+        void this.mcp.refresh().catch((error) => console.warn('[Agent] MCP refresh failed:', error.message));
+      } catch (error: any) {
+        console.warn('[Agent] ignoring invalid mcp_servers_json:', error.message);
+      }
+    }
     if (typeof partial.enable_skills === 'boolean') {
       this.settings.enable_skills = partial.enable_skills;
     }
@@ -108,19 +137,27 @@ export class Agent {
 
   private applyToolToggles(): void {
     // Rebuild registry so disabled tools are absent from listTools / call().
-    this.tools = createDefaultRegistry();
+    this.tools = createDefaultRegistry(this.skills);
     if (!this.settings.enable_filesystem_tool) {
-      this.tools.unregister('filesystem');
+      for (const name of ['read', 'write', 'edit', 'apply_patch', 'glob', 'grep']) this.tools.unregister(name);
     }
     if (!this.settings.enable_shell_tool) {
-      this.tools.unregister('shell');
+      this.tools.unregister('bash');
     }
+    if (!this.settings.enable_web_tools) for (const name of ['webfetch', 'websearch']) this.tools.unregister(name);
+    if (!this.settings.enable_computer_use) this.tools.unregister('computeruse');
+    if (!this.settings.enable_mcp_tool) this.tools.unregister('mcp');
+    if (!this.settings.enable_task_tool) this.tools.unregister('task');
   }
 
   /**
    * Execute a task - main agent loop
    */
   async executeTask(taskId: string, prompt: string, agentType?: string): Promise<string> {
+    return this.executeTaskInternal(taskId, prompt, agentType, 0);
+  }
+
+  private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
     const task = this.taskManager.createTask(taskId, prompt, type);
     task.state = 'RUNNING';
@@ -131,6 +168,7 @@ export class Agent {
         taskId,
         prompt,
         history: [{ role: 'user', content: prompt }],
+        todo: [],
       };
 
       let result = 'Max iterations reached';
@@ -153,6 +191,8 @@ export class Agent {
         }
 
         let fullResponse = '';
+        let finalText = '';
+        let receivedNativeCalls = false;
         for await (const chunk of this.mocr.generate({
           modelId,
           messages: context.history,
@@ -161,31 +201,54 @@ export class Agent {
           thinking: requireThinking,
           difficultyHint,
           requireThinking,
+          tools: this.tools.listTools(),
+          toolChoice: 'auto',
         })) {
           if (chunk.chunk) {
             fullResponse += chunk.chunk;
           }
           if (chunk.done) {
+            if (chunk.text) finalText = chunk.text;
+            const nativeCalls = chunk.toolCalls || [];
+            if (nativeCalls.length) {
+              receivedNativeCalls = true;
+              context.history.push({
+                role: 'assistant',
+                content: finalText || fullResponse,
+                toolCalls: nativeCalls,
+              });
+              for (const toolCall of nativeCalls) {
+                const toolResult = await this.executeToolCall(toolCall, context, type, depth);
+                if (toolCall.name === 'finish' && toolResult.success) {
+                  result = toolResult.data?.output || 'Task completed';
+                  break;
+                }
+                context.history.push({
+                  role: 'tool',
+                  toolCallId: toolCall.id,
+                  content: JSON.stringify(toolResult),
+                });
+              }
+              if (result !== 'Max iterations reached') break;
+            }
             break;
           }
         }
 
-        const toolCall = this.parseToolCall(fullResponse);
+        if (result !== 'Max iterations reached') break;
+        if (receivedNativeCalls) continue;
+        const toolCall = this.parseToolCall(finalText || fullResponse);
         if (toolCall) {
-          const toolResult = await this.tools.call(toolCall.name, toolCall.args);
-
-          context.history.push({ role: 'assistant', content: fullResponse });
-          context.history.push({
-            role: 'user',
-            content: `Tool result: ${JSON.stringify(toolResult)}`,
-          });
+          const toolResult = await this.executeToolCall({ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }, context, type, depth);
+          context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }] });
+          context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(toolResult) });
 
           if (toolResult.success && toolCall.name === 'finish') {
             result = toolResult.data?.output || 'Task completed';
             break;
           }
         } else {
-          result = fullResponse;
+          result = finalText || fullResponse;
           break;
         }
       }
@@ -207,7 +270,7 @@ export class Agent {
   private getSystemPrompt(taskPrompt?: string): string {
     const tools = this.tools.listTools();
     const toolDescriptions = tools
-      .map(t => `- ${t.name}: ${t.description}`)
+      .map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`)
       .join('\n');
 
     const skillBlock = this.settings.enable_skills
@@ -220,11 +283,32 @@ Available tools:
 ${toolDescriptions}
 ${skillBlock}
 
-When you need to use a tool, output a JSON object like:
+Use native tool calls when your model supports them. For providers without native
+function calling, output exactly one fallback JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
 
-When the task is complete, output:
-{"tool": "finish", "args": {"output": "your final answer"}}`;
+After tool results arrive, continue until the task is complete. Return a concise
+plain-text final answer when no further tools are needed.`;
+  }
+
+  private async executeToolCall(toolCall: ToolCall, context: AgentContext, agentType: string, depth: number) {
+    let args: Record<string, any> = {};
+    try {
+      args = toolCall.arguments ? JSON.parse(toolCall.arguments) : {};
+    } catch {
+      return { success: false, data: null, error: `invalid JSON arguments for ${toolCall.name}` };
+    }
+    if (toolCall.name === 'finish') return { success: true, data: { output: String(args.output ?? args.result ?? '') } };
+    return this.tools.call(toolCall.name, args, {
+      cwd: process.cwd(),
+      taskId: context.taskId,
+      agentType,
+      todo: context.todo,
+      mcp: this.mcp,
+      runSubAgent: depth >= 2
+        ? undefined
+        : async (subPrompt, subType) => this.executeTaskInternal(`${context.taskId}:sub:${Date.now()}`, subPrompt, subType || agentType, depth + 1),
+    });
   }
 
   private parseToolCall(response: string): { name: string; args: Record<string, any> } | null {
@@ -269,7 +353,13 @@ When the task is complete, output:
       return { success: true, result: String(parsed.output ?? parsed.result ?? args ?? ''), error: '' }
     }
 
-    const res = await this.tools.call(tool, parsed)
+    const res = await this.tools.call(tool, parsed, {
+      cwd: process.cwd(),
+      taskId: sessionIdOrEmpty(),
+      agentType: this.settings.default_agent_type,
+      todo: [],
+      mcp: this.mcp,
+    })
     if (res.success) {
       let result = ''
       try {
@@ -281,4 +371,8 @@ When the task is complete, output:
     }
     return { success: false, result: '', error: res.error || 'tool failed' }
   }
+}
+
+function sessionIdOrEmpty(): string {
+  return `direct:${Date.now()}`;
 }
