@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Vendored third-party checkout (huge; not part of this project)
+opencode/
+
+# Logs
+*.log
