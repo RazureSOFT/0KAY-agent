@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
+    "test": "node --import tsx --test src/regression.test.ts",
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"

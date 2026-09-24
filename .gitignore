@@ -9,3 +9,5 @@ opencode/
 
 # Logs
 *.log
+data/
+github_check.py

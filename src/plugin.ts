@@ -9,6 +9,8 @@ import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import * as os from 'os'
 import * as path from 'path'
+import { readFile, writeFile, mkdir } from 'fs/promises'
+import { randomUUID } from 'crypto'
 import { fileURLToPath } from 'url'
 import { Agent } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
@@ -34,6 +36,10 @@ const loaderOptions: protoLoader.Options = {
 
 let pluginId: string | null = null
 let shuttingDown = false
+let coreClient: any = null
+let grpcServer: grpc.Server | null = null
+let heartbeatTimer: NodeJS.Timeout | null = null
+let executorId = ''
 
 /**
  * Load protobuf definitions from the shared proto/ directory.
@@ -68,14 +74,16 @@ function buildHostInfo(): any {
  * Create a gRPC client for Core's PluginService.
  */
 function createCoreClient(proto: any): any {
+  if (coreClient) return coreClient
   const corePkg = proto.core?.v1
   if (!corePkg) {
     throw new Error('core.v1 package not found in proto definition')
   }
-  return new corePkg.PluginService(
+  coreClient = new corePkg.PluginService(
     CORE_ADDRESS,
     grpc.credentials.createInsecure()
   )
+  return coreClient
 }
 
 /**
@@ -92,7 +100,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
       author: '0kay',
       pluginType: 'PLUGIN_TYPE_SERVICE',
     },
-    capabilities: ['agent'],
+    capabilities: ['agent', `executor:${executorId}`],
     address: AGENT_ADDRESS,
     settingsSections: [
       {
@@ -215,13 +223,15 @@ async function registerWithCore(proto: any): Promise<string | null> {
         return
       }
 
-      client.Register(request, (err: grpc.ServiceError | null, resp: any) => {
+      client.Register(request, { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
         if (err) {
           console.error('[Agent] Register failed:', err.message)
           resolve(null)
-        } else {
+        } else if (resp?.success) {
           console.log(`[Agent] Registered with Core: plugin_id=${resp.pluginId}`)
           resolve(resp.pluginId)
+        } else {
+          resolve(null)
         }
       })
     })
@@ -232,7 +242,12 @@ async function registerWithCore(proto: any): Promise<string | null> {
  * Send a heartbeat to Core.
  */
 function sendHeartbeat(proto: any): void {
-  if (!pluginId || shuttingDown) return
+  if (shuttingDown) return
+  void agent.flushTaskRecords().catch(error => console.warn('Task ledger retry failed:', error.message))
+  if (!pluginId) {
+    void registerWithCore(proto).then(id => { pluginId = id })
+    return
+  }
 
   const client = createCoreClient(proto)
   const activeTasks = taskManager.getActiveTasks().length
@@ -244,7 +259,7 @@ function sendHeartbeat(proto: any): void {
     host: buildHostInfo(),
   }
 
-  client.Heartbeat(request, (err: grpc.ServiceError | null, resp: any) => {
+  client.Heartbeat(request, { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
     if (err) {
       console.warn('[Agent] Heartbeat failed:', err.message)
       // Try to re-register if we lost connection
@@ -258,6 +273,8 @@ function sendHeartbeat(proto: any): void {
     } else if (resp?.shutdownSignal) {
       console.log('[Agent] Received shutdown signal from Core')
       shutdown()
+    } else if (!resp?.ok) {
+      pluginId = null
     }
   })
 }
@@ -266,7 +283,7 @@ function sendHeartbeat(proto: any): void {
 const agent = new Agent({ mocrAddress: MOCR_ADDRESS })
 const taskManager = agent.getTaskManager()
 
-const CORE_HTTP = process.env.CORE_HTTP_ADDR || 'http://127.0.0.1:8080'
+const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080'
 let settingsPollTimer: NodeJS.Timeout | null = null
 
 /**
@@ -274,7 +291,7 @@ let settingsPollTimer: NodeJS.Timeout | null = null
  */
 async function pollAgentSettings(): Promise<void> {
   try {
-    const res = await fetch(`${CORE_HTTP}/api/settings/agent`)
+    const res = await fetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000) })
     if (!res.ok) return
     const body = await res.json()
     const values = body?.values || {}
@@ -311,6 +328,7 @@ function startAgentService(proto: any): Promise<number> {
   }
 
   const server = new grpc.Server()
+  grpcServer = server
 
   server.addService(agentPkg.AgentService.service, {
     ExecuteTask: async (
@@ -318,10 +336,12 @@ function startAgentService(proto: any): Promise<number> {
       callback: grpc.sendUnaryData<any>
     ) => {
       const { taskId, prompt, agentType, metadata } = call.request
+      const cancel = () => taskManager.cancelTask(taskId)
+      call.on('cancelled', cancel)
       console.log(`[Agent] ExecuteTask ${taskId}: ${prompt.substring(0, 80)}...`)
 
       try {
-        const result = await agent.executeTask(taskId, prompt, agentType)
+        const result = await agent.executeTask(taskId, prompt, agentType, metadata || {})
         callback(null, {
           taskId,
           state: 'TASK_STATE_DONE',
@@ -332,10 +352,12 @@ function startAgentService(proto: any): Promise<number> {
         console.error(`[Agent] Task ${taskId} failed:`, error.message)
         callback(null, {
           taskId,
-          state: 'TASK_STATE_FAILED',
+          state: taskManager.getTask(taskId)?.state === 'CANCELLED' ? 'TASK_STATE_CANCELLED' : 'TASK_STATE_FAILED',
           error: error.message,
           metadata: metadata || {},
         })
+      } finally {
+        call.removeListener('cancelled', cancel)
       }
     },
 
@@ -402,7 +424,7 @@ function startAgentService(proto: any): Promise<number> {
 
   return new Promise((resolve, reject) => {
     server.bindAsync(
-      `0.0.0.0:${AGENT_PORT}`,
+      `${process.env.AGENT_BIND_HOST || '127.0.0.1'}:${AGENT_PORT}`,
       grpc.ServerCredentials.createInsecure(),
       (err, boundPort) => {
         if (err) {
@@ -423,14 +445,25 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   if (settingsPollTimer) clearInterval(settingsPollTimer)
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
   console.log('[Agent] Shutting down...')
-  process.exit(0)
+  void agent.close().finally(() => {
+    grpcServer?.forceShutdown()
+    coreClient?.close()
+    process.exit(0)
+  })
 }
 
 /**
  * Main entry: start server, register with Core, start heartbeat loop.
  */
 export async function startPlugin(): Promise<void> {
+  const dataDir=process.env.AGENT_DATA_DIR || './data/agent'
+  await mkdir(dataDir,{recursive:true})
+  const identityPath=path.join(dataDir,'executor-id')
+  executorId=process.env.AGENT_EXECUTOR_ID || await readFile(identityPath,'utf8').catch(error=>{if(error.code!=='ENOENT') throw error;return ''})
+  if(!executorId.trim()) {executorId=randomUUID();await writeFile(identityPath,executorId,'utf8')}
+  executorId=executorId.trim()
   console.log('[Agent] Loading protos from', PROTO_DIR)
   const proto = loadProtos()
 
@@ -453,7 +486,7 @@ export async function startPlugin(): Promise<void> {
   }
 
   // 3. Heartbeat every 10s (Core timeout is 30s)
-  setInterval(() => sendHeartbeat(proto), 10_000)
+  heartbeatTimer = setInterval(() => sendHeartbeat(proto), 10_000)
 
   // First heartbeat soon after registration
   setTimeout(() => sendHeartbeat(proto), 1000)

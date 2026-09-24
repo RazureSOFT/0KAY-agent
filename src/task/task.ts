@@ -24,6 +24,9 @@ export class TaskManager {
   private tasks: Map<string, Task> = new Map();
   private config: TaskManagerConfig;
   private onComplete?: (task: Task) => void;
+  private controllers = new Map<string, AbortController>();
+  private waiters: Array<() => void> = [];
+  private running = 0;
 
   constructor(config: Partial<TaskManagerConfig> = {}) {
     this.config = {
@@ -38,6 +41,7 @@ export class TaskManager {
   setMaxConcurrentTasks(n: number): void {
     if (Number.isFinite(n) && n >= 1) {
       this.config.maxConcurrentTasks = Math.floor(n);
+      this.wake();
     }
   }
 
@@ -53,6 +57,7 @@ export class TaskManager {
     agentType: string = 'default',
     metadata: Record<string, string> = {}
   ): Task {
+    if (this.tasks.has(id)) throw new Error(`Task ${id} already exists`);
     const task: Task = {
       id,
       prompt,
@@ -64,6 +69,7 @@ export class TaskManager {
     };
 
     this.tasks.set(id, task);
+    this.controllers.set(id, new AbortController());
     return task;
   }
 
@@ -79,33 +85,47 @@ export class TaskManager {
     return this.getAllTasks().filter(t => t.state === 'PENDING' || t.state === 'RUNNING');
   }
 
-  async executeTask(id: string, executor: (task: Task) => Promise<string>): Promise<void> {
+  signal(id: string): AbortSignal {
+    const controller = this.controllers.get(id);
+    if (!controller) throw new Error(`Task ${id} not found`);
+    return controller.signal;
+  }
+
+  private wake(): void {
+    const waiting = this.waiters.splice(0);
+    for (const resolve of waiting) resolve();
+  }
+
+  async executeTask(id: string, executor: (task: Task) => Promise<string>, nested = false): Promise<string> {
     const task = this.tasks.get(id);
     if (!task) {
       throw new Error(`Task ${id} not found`);
     }
 
-    const activeCount = this.getActiveTasks().length;
-    if (activeCount >= this.config.maxConcurrentTasks) {
-      throw new Error('Max concurrent tasks reached');
-    }
-
-    task.state = 'RUNNING';
-    task.updatedAt = new Date();
-
+    let acquired = false;
     try {
+      while (!nested && this.running >= this.config.maxConcurrentTasks) {
+        this.signal(id).throwIfAborted();
+        await new Promise<void>(resolve => this.waiters.push(resolve));
+      }
+      this.signal(id).throwIfAborted();
+      if (!nested) { this.running++; acquired = true; }
+      task.state = 'RUNNING';
+      task.updatedAt = new Date();
       const result = await executor(task);
+      this.signal(id).throwIfAborted();
       task.state = 'DONE';
       task.result = result;
+      return result;
     } catch (error: any) {
-      task.state = 'FAILED';
+      task.state = this.signal(id).aborted ? 'CANCELLED' : 'FAILED';
       task.error = error.message;
-    }
-
-    task.updatedAt = new Date();
-
-    if (this.onComplete) {
-      this.onComplete(task);
+      throw error;
+    } finally {
+      if (acquired) this.running--;
+      task.updatedAt = new Date();
+      this.wake();
+      this.notifyComplete(task);
     }
   }
 
@@ -117,6 +137,11 @@ export class TaskManager {
 
     if (task.state === 'PENDING' || task.state === 'RUNNING') {
       task.state = 'CANCELLED';
+      this.controllers.get(id)?.abort(new Error('Task cancelled'));
+      for (const child of this.tasks.values()) {
+        if (child.id.startsWith(`${id}:sub:`)) this.cancelTask(child.id);
+      }
+      this.wake();
       task.updatedAt = new Date();
       return true;
     }
@@ -125,6 +150,8 @@ export class TaskManager {
   }
 
   removeTask(id: string): boolean {
+    if (this.getActiveTasks().some(task => task.id === id)) return false;
+    this.controllers.delete(id);
     return this.tasks.delete(id);
   }
 }

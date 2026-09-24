@@ -6,6 +6,7 @@ import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
+import { taskRecorder } from '../task/records.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -26,6 +27,9 @@ export interface GenerateRequest {
   requireThinking?: boolean;
   tools?: ToolDefinition[];
   toolChoice?: 'auto' | 'none' | 'required' | string;
+  signal?: AbortSignal;
+  taskId?: string;
+  sessionId?: string;
 }
 
 export interface Message {
@@ -94,62 +98,69 @@ function getStub(address: string): any {
 
 export class MocrProvider {
   private config: MocrConfig;
-  private creds: { provider: string; baseUrl: string; apiKey: string } | null = null;
-  private credPromise: Promise<void> | null = null;
+  private selectedProviders = new Map<string, string>();
+  recorder = taskRecorder;
 
   constructor(config: MocrConfig) {
     this.config = config;
   }
 
-  /** Load provider credentials from Core once (optional). */
-  private ensureCreds(): Promise<void> {
-    if (this.credPromise) return this.credPromise;
-    const coreHttp = process.env.CORE_HTTP || 'http://127.0.0.1:8080'
-    this.credPromise = (async () => {
-      try {
-        const res = await fetch(`${coreHttp}/api/providers`)
-        if (!res.ok) return
-        const data: any = await res.json()
-        const list: any[] = Array.isArray(data) ? data : (data.providers || [])
-        const defaultId = data.default_provider_id || data.defaultProviderId || ''
-        let chosen: any = null
-        for (const p of list) {
-          if (!p || typeof p !== 'object') continue
-          if (defaultId && p.id === defaultId) { chosen = p; break }
-          if (!chosen && p.enabled !== false && p.api_key) chosen = p
-        }
-        if (chosen?.api_key) {
-          this.creds = {
-            provider: chosen.provider || '',
-            baseUrl: chosen.base_url || '',
-            apiKey: chosen.api_key || '',
-          }
-        }
-      } catch {
-        // offline — leave creds null
-      }
-    })()
-    return this.credPromise
+  private async resolveCredentials(modelId: string, provider = '', signal?: AbortSignal) {
+    const base = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
+    const response = await fetch(`${base}/api/providers`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`Cannot load providers: HTTP ${response.status}`);
+    const data: any = await response.json();
+    const list: any[] = (Array.isArray(data) ? data : data.providers || []).filter((p: any) => p.enabled !== false);
+    const matches = list.filter(p => (!provider || p.provider === provider || p.id === provider) &&
+      (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) && !(p.disabled_models || []).includes(modelId));
+    const chosen = matches.find(p => p.id === data.default_provider_id) || matches[0];
+    if (!chosen) throw new Error(`No enabled provider configured for model ${modelId}`);
+    return { provider: chosen.provider || '', baseUrl: chosen.base_url || '', apiKey: chosen.api_key || '' };
   }
 
   /**
    * Call mocr for text generation (server-streaming gRPC).
    */
   async *generate(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
+    const event = { task_id: `agent-model:${crypto.randomUUID()}`, caller_id: 'agent', kind: 'think', prompt: request.modelId,
+      parent_id: request.taskId || '', session_id: request.sessionId || '', state: 'running' };
+    await this.recorder.record(event);
+    let text = '';
+    let lastPublished = 0;
+    try {
+      for await (const chunk of this.generateStream(request)) {
+        text += chunk.chunk || '';
+        if (chunk.done && chunk.text) text = chunk.text;
+        if (!chunk.done && text && Date.now() - lastPublished >= 1000) {
+          await this.recorder.record({ ...event, result: text });
+          lastPublished = Date.now();
+        }
+        if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_LENGTH', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) throw new Error(`Model finish: ${chunk.finishReason}`);
+        if (chunk.done) await this.recorder.record({ ...event, state: 'done', result: text });
+        yield chunk;
+      }
+    } catch (error: any) {
+      await this.recorder.record({ ...event, state: request.signal?.aborted ? 'cancelled' : 'failed', result: text, error: error.message });
+      throw error;
+    }
+  }
+
+  private async *generateStream(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
     const stub = getStub(this.config.grpcAddress);
-    await this.ensureCreds();
+    request.signal?.throwIfAborted();
+    const creds = request.baseUrl && request.apiKey ? request : await this.resolveCredentials(request.modelId, request.provider || this.selectedProviders.get(request.modelId), request.signal);
 
     const payload: any = {
       modelId: request.modelId,
-      messages: request.messages,
+      messages: request.messages.map(message => ({ ...message, toolCalls: message.toolCalls?.map(call => ({ id: call.id, type: call.type || 'function', functionName: call.name, arguments: call.arguments })) })),
       systemPrompt: request.systemPrompt || '',
-      maxTokens: request.maxTokens || 1024,
+      maxTokens: request.maxTokens || 8192,
       temperature: request.temperature ?? 0.7,
       stream: true,
       thinking: !!request.thinking,
-      provider: request.provider || this.creds?.provider || '',
-      baseUrl: request.baseUrl || this.creds?.baseUrl || '',
-      apiKey: request.apiKey || this.creds?.apiKey || '',
+      provider: creds.provider || '',
+      baseUrl: creds.baseUrl || '',
+      apiKey: creds.apiKey || '',
       toolChoice: request.toolChoice || 'auto',
       tools: (request.tools || []).map((tool) => ({
         type: 'function',
@@ -161,15 +172,13 @@ export class MocrProvider {
       })),
     };
 
-    const stream: any = await new Promise((resolve, reject) => {
-      const call = stub.Generate(payload)
-      call.on('metadata', () => resolve(call))
-      call.on('error', reject)
-      // some servers send first message before metadata callback settles
-      setTimeout(() => resolve(call), 50)
-    }).catch(() => stub.Generate(payload))
+    const stream = stub.Generate(payload, { deadline: Date.now() + 300_000 });
+    const cancel = () => stream.cancel();
+    request.signal?.addEventListener('abort', cancel, { once: true });
+    if (request.signal?.aborted) cancel();
 
     try {
+      let completed = false;
       for await (const resp of stream) {
         const out: GenerateResponse = {
           chunk: resp.chunk || undefined,
@@ -195,24 +204,12 @@ export class MocrProvider {
           }
         }
         yield out
-        if (resp.done) break
+        if (resp.done) { completed = true; break; }
       }
-    } catch (err: any) {
-      // Offline/fallback path: deterministic reply so the agent still works
-      const prompt = request.messages.map(m => `${m.role}: ${m.content}`).join('\n')
-      const response = `Agent offline reply (mocr unreachable): ${prompt.substring(0, 80)}...`
-      for (const chunk of this.splitIntoChunks(response, 40)) {
-        yield { chunk, done: false }
-      }
-      yield {
-        done: true,
-        finishReason: 'STOP',
-        usage: {
-          promptTokens: Math.max(1, Math.ceil(prompt.length / 4)),
-          completionTokens: Math.ceil(response.length / 4),
-          totalTokens: Math.max(1, Math.ceil(prompt.length / 4)) + Math.ceil(response.length / 4),
-        },
-      }
+      if (!completed) throw new Error('Model stream ended without completion');
+    } finally {
+      request.signal?.removeEventListener('abort', cancel);
+      stream.cancel();
     }
   }
 
@@ -224,11 +221,12 @@ export class MocrProvider {
     prompt: string,
     requireThinking = false,
     difficultyHint = 0.5,
+    signal?: AbortSignal,
   ): Promise<string> {
-    try {
+      signal?.throwIfAborted();
       const stub = getStub(this.config.grpcAddress)
       const resp: any = await new Promise((resolve, reject) => {
-        stub.ChooseModels(
+        const call = stub.ChooseModels(
           {
             prompt,
             context: {
@@ -237,14 +235,17 @@ export class MocrProvider {
               requireThinking,
             },
           },
-          (err: any, r: any) => (err ? reject(err) : resolve(r)),
+          { deadline: Date.now() + 15000 },
+          (err: any, r: any) => { signal?.removeEventListener('abort', cancel); err ? reject(err) : resolve(r); },
         )
+        const cancel = () => call.cancel();
+        signal?.addEventListener('abort', cancel, { once: true });
+        if (signal?.aborted) cancel();
       })
-      const id = resp?.outputModel?.modelId || resp?.thinkModel?.modelId || ''
-      return id || 'default-model'
-    } catch {
-      return 'default-model'
-    }
+      const model = requireThinking ? resp?.thinkModel : resp?.outputModel;
+      if (!model?.modelId) throw new Error('No model selected');
+      this.selectedProviders.set(model.modelId, model.provider || '');
+      return model.modelId;
   }
 
   private splitIntoChunks(text: string, size: number): string[] {

@@ -3,7 +3,7 @@
  * opencode's tool set while keeping execution local to the Agent host.
  */
 
-import { exec as execCallback } from 'child_process';
+import { exec as execCallback, execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -47,6 +47,7 @@ export interface ToolContext {
   todo: TodoItem[];
   runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
   mcp?: McpClientLike;
+  signal?: AbortSignal;
 }
 
 export abstract class Tool {
@@ -213,7 +214,7 @@ export class EditTool extends Tool {
 
 export class ApplyPatchTool extends Tool {
   get name(): string { return 'apply_patch'; }
-  get description(): string { return 'Apply one or more exact file replacements atomically. Each patch has filePath, oldString, newString, and optional replaceAll.'; }
+  get description(): string { return 'Validate and apply exact file replacements, rolling back completed writes on failure. Each patch has filePath, oldString, newString, and optional replaceAll.'; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['patches'], properties: {
@@ -229,13 +230,23 @@ export class ApplyPatchTool extends Tool {
       for (const patch of args.patches) {
         const filePath = resolvePath(patch?.filePath, context.cwd);
         if (typeof patch.oldString !== 'string' || typeof patch.newString !== 'string' || !patch.oldString) throw new Error(`invalid patch for ${filePath}`);
-        const original = await fs.readFile(filePath, 'utf8');
+        const original = [...staged].reverse().find(p => p.filePath === filePath)?.updated ?? await fs.readFile(filePath, 'utf8');
         const count = original.split(patch.oldString).length - 1;
         if (!count) throw new Error(`oldString was not found in ${filePath}`);
         if (count > 1 && patch.replaceAll !== true) throw new Error(`oldString occurs multiple times in ${filePath}`);
         staged.push({ filePath, original, updated: patch.replaceAll === true ? original.split(patch.oldString).join(patch.newString) : original.replace(patch.oldString, patch.newString) });
       }
-      for (const patch of staged) await fs.writeFile(patch.filePath, patch.updated, 'utf8');
+      const written: typeof staged = [];
+      try {
+        for (const patch of staged) {
+          context.signal?.throwIfAborted();
+          await fs.writeFile(patch.filePath, patch.updated, 'utf8');
+          written.push(patch);
+        }
+      } catch (error) {
+        for (const patch of written.reverse()) await fs.writeFile(patch.filePath, patch.original, 'utf8');
+        throw error;
+      }
       return success({ files: staged.map((patch) => ({ path: patch.filePath, diff: simpleDiff(patch.filePath, patch.original, patch.updated) })) });
     } catch (error) { return failure(error); }
   }
@@ -298,7 +309,7 @@ export class GrepTool extends Tool {
 
 export class ShellTool extends Tool {
   get name(): string { return 'bash'; }
-  get description(): string { return 'Run a shell command on the Agent host. Use cwd and timeout when needed.'; }
+  get description(): string { return `Run a command using ${process.platform === 'win32' ? 'Windows cmd.exe (NOT bash or PowerShell). Use dir/cd and &&, not pwd/ls or semicolons.' : '/bin/sh' } Use cwd and timeout when needed.`; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['command'], properties: {
@@ -311,7 +322,23 @@ export class ShellTool extends Tool {
       const cwd = args.cwd ? resolvePath(args.cwd, context.cwd) : context.cwd;
       const timeout = clamp(args.timeout, 30_000, 1_000, 300_000);
       try {
-        const result = await exec(args.command, { cwd, timeout, maxBuffer: MAX_OUTPUT, windowsHide: true });
+        const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          const command = process.platform === 'win32' ? `chcp 65001 >nul & ${args.command}` : args.command;
+          const child = execCallback(command, { cwd, maxBuffer: MAX_OUTPUT, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }, (error, stdout, stderr) => {
+            clearTimeout(timer);
+            context.signal?.removeEventListener('abort', cancel);
+            if (error) reject(Object.assign(error, { stdout, stderr }));
+            else resolve({ stdout, stderr });
+          });
+          const cancel = () => {
+            if (process.platform === 'win32' && child.pid) {
+              execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
+            } else child.kill('SIGTERM');
+          };
+          const timer = setTimeout(cancel, timeout);
+          context.signal?.addEventListener('abort', cancel, { once: true });
+          if (context.signal?.aborted) cancel();
+        });
         const stdout = limitOutput(result.stdout || '');
         const stderr = limitOutput(result.stderr || '');
         return success({ cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated });
@@ -332,13 +359,12 @@ export class WebFetchTool extends Tool {
       url: { type: 'string', format: 'uri' }, format: { type: 'string', enum: ['text', 'markdown', 'html'] }, timeout: { type: 'integer', minimum: 1, maximum: 120 },
     }};
   }
-  async execute(args: Record<string, any>): Promise<ToolResult> {
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     try {
       if (typeof args.url !== 'string' || !/^https?:\/\//i.test(args.url)) throw new Error('url must be an http(s) URL');
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), clamp(args.timeout, 30, 1, 120) * 1000);
-      const response = await fetch(args.url, { signal: controller.signal, headers: { 'User-Agent': '0kay-agent/0.2' }, redirect: 'follow' });
-      clearTimeout(timer);
+      const timeout = AbortSignal.timeout(clamp(args.timeout, 30, 1, 120) * 1000);
+      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
+      const response = await fetch(args.url, { signal, headers: { 'User-Agent': '0kay-agent/0.2' }, redirect: 'follow' });
       const html = await response.text();
       const format = args.format || 'markdown';
       const content = format === 'html' ? html : html
@@ -366,14 +392,15 @@ export class WebSearchTool extends Tool {
       query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
     }};
   }
-  async execute(args: Record<string, any>): Promise<ToolResult> {
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     try {
       if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
       const base = (process.env.SEARXNG_URL || 'http://127.0.0.1:8888').replace(/\/$/, '');
       const endpoint = new URL(`${base}/search`);
       endpoint.searchParams.set('q', args.query);
       endpoint.searchParams.set('format', 'json');
-      const response = await fetch(endpoint, { headers: { Accept: 'application/json' } });
+      const timeout = AbortSignal.timeout(30000);
+      const response = await fetch(endpoint, { headers: { Accept: 'application/json' }, signal: context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout });
       if (!response.ok) throw new Error(`SearXNG returned ${response.status}`);
       const body: any = await response.json();
       const limit = clamp(args.numResults, 5, 1, 20);
@@ -459,11 +486,11 @@ export class ComputerUseTool extends Tool {
       action: { type: 'string', enum: ['screenshot', 'move', 'click', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' },
     }};
   }
-  async execute(args: Record<string, any>): Promise<ToolResult> {
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     if (process.platform !== 'win32') return failure('computeruse currently supports Windows Agent hosts only');
     try {
       const action = args.action;
-      const ps = (script: string) => exec(`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/\"/g, '\\"')}"`, { timeout: 30_000, windowsHide: true });
+      const ps = (script: string) => promisify(execFile)('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 30_000, windowsHide: true, signal: context?.signal });
       if (action === 'screenshot') {
         const output = path.join(os.tmpdir(), `0kay-screen-${Date.now()}.png`);
         const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save('" + output.replace(/'/g, "''") + "',[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose()";
@@ -471,11 +498,13 @@ export class ComputerUseTool extends Tool {
         return success({ path: output, sha256: createHash('sha256').update(await fs.readFile(output)).digest('hex') });
       }
       if (action === 'type' || action === 'key') {
-        const raw = String(action === 'type' ? args.text ?? '' : args.key ?? '');
+        let raw = String(action === 'type' ? args.text ?? '' : args.key ?? '');
         if (!raw) throw new Error(`${action === 'type' ? 'text' : 'key'} is required`);
+        if (action === 'type') raw = raw.replace(/[+^%~(){}\[\]]/g, char => `{${char}}`);
         await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`);
         return success({ action, sent: raw });
       }
+      if (!['move', 'click'].includes(action)) throw new Error('invalid computer action');
       const x = clamp(args.x, -1, 0, 100000); const y = clamp(args.y, -1, 0, 100000);
       if (x < 0 || y < 0) throw new Error('x and y are required');
       const click = action === 'click' ? (args.button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
@@ -492,6 +521,7 @@ export class ToolRegistry {
   get(name: string): Tool | undefined { return this.tools.get(name); }
   unregister(name: string): boolean { return this.tools.delete(name); }
   async call(name: string, args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    context.signal?.throwIfAborted();
     const tool = this.tools.get(name);
     if (!tool) return failure(`Tool '${name}' not found`);
     return tool.execute(args, context);
