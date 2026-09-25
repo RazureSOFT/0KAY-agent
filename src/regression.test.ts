@@ -6,6 +6,7 @@ import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
 import { ShellTool } from './tools/tools.js';
 import { ApprovalManager } from './task/approvals.js';
+import {QuestionManager} from './task/questions.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -35,7 +36,7 @@ test('concurrency queues tasks; cancelling queued and running tasks preserves te
 });
 
 test('iteration exhaustion and model failure are FAILED, not DONE', async () => {
-  for (const failure of ['iterations', 'transport', 'finish']) {
+  for (const failure of ['transport', 'finish']) {
     const agent = new Agent();
     (agent as any).recorder.run = async (_k: any, _p: any, _id: any, _s: any, operation: any) => operation();
     agent.applySettings({ model_id: 'mock', max_iterations: 1 });
@@ -121,18 +122,17 @@ test('Windows shell runs Python with UTF-8 output', { skip: process.platform !==
   assert.equal(result.data.stdout.trim(), '✅');
 });
 
-test('budget exhaustion gives a final no-tool explanation and remains failed', async () => {
+test('execution continues beyond the old iteration setting', async () => {
   const agent = new Agent();
   (agent as any).recorder.run = async (_k: any, _p: any, _id: any, _s: any, operation: any) => operation();
   agent.applySettings({ model_id: 'mock', max_iterations: 1 });
-  let summarized = false;
+  let iterations = 0;
   (agent as any).mocr = { async *generate(request: any) {
-    if (request.toolChoice === 'none') { summarized = true; yield { chunk: 'Created script; network probe timed out.', done: true }; }
-    else yield { done: true, toolCalls: [{ id: 'c', name: 'missing', arguments: '{}' }] };
+    if (request.toolChoice === 'none' || iterations++>=12) yield {chunk:'completed',done:true};
+    else yield { done: true, toolCalls: [{ id: `c${iterations}`, name: 'missing', arguments: '{}' }] };
   }};
-  await assert.rejects(agent.executeTask('budget', 'test',undefined,{permission_mode:'full_access'}), /Created script; network probe timed out/);
-  assert.equal(summarized, true);
-  assert.equal(agent.getTaskManager().getTask('budget')?.state, 'FAILED');
+  assert.equal(await agent.executeTask('budget', 'test',undefined,{permission_mode:'full_access'}),'completed');
+  assert.ok(iterations>10);
 });
 
 test('per-turn workspace, model and thinking override global settings', async () => {
@@ -142,13 +142,21 @@ test('per-turn workspace, model and thinking override global settings', async ()
   let selected = false;
   (agent as any).mocr = {
     async chooseModels(_prompt: string, thinking: boolean, difficulty: number) { selected = true; assert.equal(thinking,true); assert.equal(difficulty,1); return 'auto-model'; },
-    async *generate(value: any) { request = value; yield {chunk:'ok',done:true}; },
+    async *generate(value: any) { if(value.toolChoice!=='none')request = value; yield {chunk:'ok',done:true}; },
   };
   await agent.executeTask('overrides','test','general',{workdir:process.cwd(),model_id:'chosen-model',thinking_intensity:'high'});
   assert.equal(request.modelId,'chosen-model'); assert.equal(request.thinking,true);
   assert.ok(request.systemPrompt.includes(process.cwd()));
   await agent.executeTask('auto','test','general',{model_id:'MOCR',thinking_intensity:'max'});
   assert.equal(selected,true); assert.equal(request.modelId,'auto-model');
+  await agent.executeTask('continuous','test','general',{model_id:'chosen-model',thinking_intensity:'83.7'});
+  assert.ok(Math.abs(request.difficultyHint-0.837)<1e-12);assert.equal(request.thinking,true);
+  await agent.executeTask('zero','test','general',{model_id:'chosen-model',thinking_intensity:'0'});
+  assert.equal(request.difficultyHint,0);assert.equal(request.thinking,false);
+  await agent.executeTask('off','test','general',{model_id:'chosen-model',thinking_intensity:'off'});
+  assert.equal(request.thinking,false);
+  await agent.executeTask('low','test','general',{model_id:'chosen-model',thinking_intensity:'low'});
+  assert.equal(request.thinking,true);assert.equal(request.difficultyHint,0.2);
   await assert.rejects(agent.executeTask('bad-path','test','general',{workdir:'Z:/nonexistent-workspace-0kay'}));
 });
 
@@ -184,4 +192,156 @@ test('normal Agent cannot run a tool before the user permits it',async()=>{
  assert.equal(executed,false);assert.equal(pending.length,1);
  await agent.runDirect('approval_decide',JSON.stringify({id:pending[0].id,allow:true}));
  assert.equal(await execution,'finished');assert.equal(executed,true);
+});
+
+test('question accepts custom reply and is removed on cancellation',async()=>{
+  const manager=new QuestionManager(),controller=new AbortController();
+  const pending=manager.ask('task','session',{question:'Choose?',options:['A','B']},controller.signal);
+  const item=manager.list()[0];assert.deepEqual(item.options,['A','B']);manager.answer(item.id,'Custom C');assert.equal(await pending,'Custom C');assert.equal(manager.list().length,0);
+  const aborted=manager.ask('task','session',{question:'Again?'},controller.signal);const checked=assert.rejects(aborted);controller.abort();await checked;assert.equal(manager.list().length,0);
+});
+
+test('subagent wrapper task_id equals children parent_id', async () => {
+  const agent = new Agent();
+  agent.applySettings({ model_id: 'mock' });
+  let wrapperTaskId = '';
+  let childModelTaskId = '';
+  (agent as any).recorder.run = async (kind: string, _prompt: string, _parentId: string, _sessionId: string, operation: () => Promise<any>, taskId?: string) => {
+    if (kind === 'subagent') wrapperTaskId = taskId || '';
+    return operation();
+  };
+  (agent as any).mocr = {
+    async *generate(request: any) {
+      if (!childModelTaskId) {
+        childModelTaskId = `pending:${request.messages.length}`;
+        yield { done: true, toolCalls: [{ id: 'c', name: 'task', arguments: JSON.stringify({ prompt: 'child prompt' }) }] };
+      } else if (childModelTaskId.startsWith('pending:')) {
+        childModelTaskId = request.taskId || '';
+        yield { chunk: 'child done', done: true };
+      } else {
+        yield { chunk: 'parent done', done: true };
+      }
+    },
+  };
+  await agent.executeTask('parent-task', 'parent prompt', undefined, { permission_mode: 'full_access', session_id: 's1' });
+  assert.ok(wrapperTaskId.startsWith('parent-task:sub:'), wrapperTaskId);
+  assert.equal(wrapperTaskId, childModelTaskId);
+});
+
+test('assistant reasoning_content is sent as reasoningContent', async () => {
+  const definition = loader.loadSync('../proto/mocr/v1/mocr.proto', { keepCase: false, defaults: true, enums: String });
+  const pkg: any = grpc.loadPackageDefinition(definition);
+  const server = new grpc.Server();
+  let received: any;
+  server.addService(pkg.mocr.v1.MocrService.service, {
+    Generate(call: any) {
+      received = call.request;
+      call.write({ chunk: 'ok' });
+      call.write({ done: true, finishReason: 'FINISH_REASON_STOP', thinkingContent: 'next thought' });
+      call.end();
+    },
+  });
+  const port = await new Promise<number>((resolve, reject) => server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (err, port) => err ? reject(err) : resolve(port)));
+  try {
+    const provider = new MocrProvider({ grpcAddress: `127.0.0.1:${port}` });
+    provider.recorder.record = async () => {};
+    const chunks = [];
+    for await (const chunk of provider.generate({
+      modelId: 'mock',
+      baseUrl: 'http://mock',
+      apiKey: 'mock',
+      messages: [
+        { role: 'assistant', content: 'hello', toolCalls: [{ id: 'c', name: 'read', arguments: '{}' }], reasoningContent: 'prior thought' },
+        { role: 'tool', toolCallId: 'c', content: 'result' },
+      ],
+    })) chunks.push(chunk);
+    assert.equal(received.messages[0].reasoningContent, 'prior thought');
+    assert.equal(received.messages[0].toolCallId, '');
+    assert.equal(received.messages[1].toolCallId, 'c');
+    assert.equal(chunks.find(chunk => chunk.done)?.thinkingContent, 'next thought');
+  } finally {
+    server.forceShutdown();
+  }
+});
+
+test('thinking chunks are recorded on assistant history for the next turn', async () => {
+  const agent = new Agent();
+  agent.applySettings({ model_id: 'mock' });
+  (agent as any).recorder.run = async (_k: any, _p: any, _i: any, _s: any, operation: any) => operation();
+  (agent as any).tools.call = async () => ({ success: true, data: 'ok' });
+  const requests: any[] = [];
+  let turn = 0;
+  (agent as any).mocr = {
+    async *generate(request: any) {
+      requests.push(request);
+      if (turn++ === 0) {
+        yield { done: true, thinkingContent: 'chain of thought', toolCalls: [{ id: 'c1', name: 'bash', arguments: '{"command":"echo hi"}' }] };
+      } else {
+        yield { chunk: 'completed', done: true };
+      }
+    },
+  };
+  await agent.executeTask('reason', 'go', undefined, { permission_mode: 'full_access', session_id: 's2' });
+  const assistant = requests[1].messages.find((message: any) => message.role === 'assistant');
+  assert.equal(assistant?.reasoningContent, 'chain of thought');
+});
+
+test('multiple native tool calls in one turn run in parallel with ordered results', async () => {
+  const agent = new Agent();
+  (agent as any).recorder.run = async (_k: any, _p: any, _i: any, _s: any, operation: any) => operation();
+  agent.applySettings({ model_id: 'mock' });
+  let active = 0;
+  let maxActive = 0;
+  const order: string[] = [];
+  (agent as any).tools.call = async (name: string) => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, name === 'alpha' ? 20 : 40));
+    active--;
+    order.push(name);
+    return { success: true, data: name };
+  };
+  const requests: any[] = [];
+  let turn = 0;
+  (agent as any).mocr = {
+    async *generate(request: any) {
+      requests.push(request);
+      if (turn++ === 0) {
+        yield { done: true, toolCalls: [
+          { id: 'a1', name: 'alpha', arguments: '{}' },
+          { id: 'a2', name: 'beta', arguments: '{}' },
+        ] };
+      } else {
+        yield { chunk: 'completed', done: true };
+      }
+    },
+  };
+  assert.equal(await agent.executeTask('parallel', 'go', undefined, { permission_mode: 'full_access', session_id: 's3' }), 'completed');
+  assert.equal(maxActive, 2, 'tool calls should overlap');
+  assert.deepEqual(order, ['alpha', 'beta']);
+  const second = requests[1];
+  const toolMessages = second.messages.filter((m: any) => m.role === 'tool');
+  assert.deepEqual(toolMessages.map((m: any) => m.toolCallId), ['a1', 'a2']);
+  assert.deepEqual(toolMessages.map((m: any) => JSON.parse(m.content).data), ['alpha', 'beta']);
+});
+
+test('skills_admin saves, lists and deletes skills; slash force-applies a skill', async () => {
+  const agent = new Agent();
+  agent.applySettings({ model_id: 'mock', enable_skills: true });
+  const saved = await agent.runDirect('skills_admin', JSON.stringify({ action: 'save', name: 'Ui Smoke', content: '# ui-smoke\n\nAlways check contrast first.\n' }));
+  assert.equal(saved.success, true);
+  const listed = JSON.parse((await agent.runDirect('skills_admin', JSON.stringify({ action: 'list' }))).result);
+  assert.ok(listed.skills.some((s: any) => s.name === 'ui-smoke' && s.source === 'file'));
+  const missing = await agent.runDirect('skills_admin', JSON.stringify({ action: 'delete', name: 'no-such-skill' }));
+  assert.equal(missing.success, false);
+  const removed = await agent.runDirect('skills_admin', JSON.stringify({ action: 'delete', name: 'ui-smoke' }));
+  assert.equal(removed.success, true);
+  const after = JSON.parse((await agent.runDirect('skills_admin', JSON.stringify({ action: 'list' }))).result);
+  assert.ok(!after.skills.some((s: any) => s.name === 'ui-smoke'));
+
+  await agent.runDirect('skills_admin', JSON.stringify({ action: 'save', name: 'slash-probe', content: 'NEVER_INVENT_PATHS' }));
+  const prompt = (agent as any).getSystemPrompt('/slash-probe do the thing', process.cwd(), 'slash-probe');
+  assert.match(prompt, /NEVER_INVENT_PATHS/);
+  const del = await agent.runDirect('skills_admin', JSON.stringify({ action: 'delete', name: 'slash-probe' }));
+  assert.equal(del.success, true);
 });

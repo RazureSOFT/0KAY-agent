@@ -11,12 +11,38 @@ import { randomUUID } from 'crypto';
 import * as path from 'path';
 import { stat, readdir, mkdir } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
+import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
 import { taskRecorder } from '../task/records.js';
 
 export interface AgentConfig {
   mocrAddress: string;
   maxIterations: number;
+}
+
+/** Comma-separated tools that execute without approval prompts (bash intentionally excluded). */
+export const DEFAULT_AUTO_APPROVE_TOOLS =
+  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill';
+
+/** Ledger-friendly tool arguments: drop bulky text payloads (line stats come from results). */
+function serializeToolArgs(args: Record<string, any>): string {
+  try {
+    const clean: Record<string, any> = { ...(args || {}) };
+    for (const key of ['content', 'oldString', 'newString']) delete clean[key];
+    if (Array.isArray(clean.patches)) {
+      clean.patches = clean.patches.map((patch: any) => {
+        if (!patch || typeof patch !== 'object') return patch;
+        const rest = { ...patch };
+        delete rest.oldString;
+        delete rest.newString;
+        return rest;
+      });
+    }
+    const json = JSON.stringify(clean) ?? '{}';
+    return json.length > 12000 ? json.slice(0, 12000) + '…' : json;
+  } catch {
+    return '{}';
+  }
 }
 
 /** Runtime settings pulled from Core's /api/settings/agent section. */
@@ -35,6 +61,7 @@ export interface AgentSettings {
   mcp_servers_json?: string;
   enable_skills?: boolean;
   skills_dir?: string;
+  always_allow_tools?: string;
 }
 
 export interface AgentContext {
@@ -58,6 +85,9 @@ export class Agent {
   private settings: Required<AgentSettings>;
   private recorder = taskRecorder;
   private approvals = new ApprovalManager();
+  private questions = new QuestionManager();
+  private handoffs = new Map<string,string>();
+  takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
 
   constructor(config: Partial<AgentConfig> = {}) {
     this.config = {
@@ -80,6 +110,7 @@ export class Agent {
       mcp_servers_json: '[]',
       enable_skills: true,
       skills_dir: '',
+      always_allow_tools: DEFAULT_AUTO_APPROVE_TOOLS,
     };
 
     this.mocr = new MocrProvider({ grpcAddress: this.config.mocrAddress });
@@ -144,11 +175,24 @@ export class Agent {
         this.skills.loadDir(this.settings.skills_dir);
       }
     }
+    if (typeof partial.always_allow_tools === 'string' && partial.always_allow_tools.trim() !== this.settings.always_allow_tools) {
+      this.settings.always_allow_tools = partial.always_allow_tools.trim();
+    }
     this.applyToolToggles();
   }
 
   getSettings(): Readonly<Required<AgentSettings>> {
     return { ...this.settings };
+  }
+
+  /** True when the tool is listed in always_allow_tools → skip approval prompts. */
+  private autoApproved(tool: string): boolean {
+    if (!tool) return false;
+    return this.settings.always_allow_tools
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .includes(tool);
   }
 
   private applyToolToggles(): void {
@@ -176,6 +220,16 @@ export class Agent {
 
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
+    // /{skill_name} [request] → force-apply that skill and use the rest as the task.
+    let forceSkill = '';
+    if (this.settings.enable_skills) {
+      const slash = /^\s*\/([A-Za-z0-9_-]{1,64})(?:\s+([\s\S]*))?$/.exec(prompt);
+      if (slash && this.skills.get(slash[1])) {
+        forceSkill = slash[1];
+        const rest = (slash[2] || '').trim();
+        prompt = rest || `Follow the "${forceSkill}" skill to produce the standard output for this request.`;
+      }
+    }
     this.taskManager.createTask(taskId, prompt, type);
     return this.taskManager.executeTask(taskId, async () => {
       const cwd = options.workdir ? path.resolve(options.workdir) : process.cwd();
@@ -188,21 +242,29 @@ export class Agent {
         signal: this.taskManager.signal(taskId),
         sessionId,
         cwd,
-        options,
+        options: forceSkill ? { ...options, force_skill: forceSkill } : options,
       };
 
-      let result = 'Max iterations reached';
-      const maxIters = this.settings.max_iterations || this.config.maxIterations;
+      let result = '';
       let lastModel = this.settings.model_id;
 
-      for (let i = 0; i < maxIters; i++) {
+      for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
+        // Unlimited iterations still need a bounded model context. Compact only
+        // between completed tool batches so call/result pairs remain intact.
+        if(context.history.reduce((size,message)=>size+message.content.length+JSON.stringify(message.toolCalls||[]).length,0)>80000 && lastModel){
+          let summary='';
+          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:JSON.stringify(context.history)}],systemPrompt:'Compress this execution transcript into a faithful working summary. Preserve file paths, changes, tool results/errors, user answers, acceptance criteria and pending work. Do not execute tools. Keep under 4000 words.',tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
+          if(!summary.trim())throw new Error('Context compaction returned no summary');
+          context.history=[{role:'user',content:prompt},{role:'assistant',content:`Execution context summary:\n${summary}`}];
+        }
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
         // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
         const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
         const intensity = (options.thinking_intensity || intMatch?.[1] || 'medium').toLowerCase()
-        const difficultyHint = { low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5
-        const requireThinking = intensity === 'high' || intensity === 'max'
+        const numericIntensity=Number(intensity)
+        const difficultyHint = Number.isFinite(numericIntensity) ? Math.max(0,Math.min(100,numericIntensity))/100 : ({ off:0, low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5)
+        const requireThinking = intensity !== 'off' && difficultyHint > 0
         let modelId = options.model_id === 'MOCR' ? '' : options.model_id || this.settings.model_id;
         if (!modelId) {
           modelId = await this.mocr.chooseModels(
@@ -216,16 +278,17 @@ export class Agent {
 
         let fullResponse = '';
         let finalText = '';
+        let fullReasoning = '';
         let receivedNativeCalls = false;
         for await (const chunk of this.mocr.generate({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd) + `\nTool iteration ${i + 1}/${maxIters}. ${i >= maxIters - 2 ? 'Finish verification and report the observed result; avoid unrelated changes.' : ''}`,
+          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence.`,
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,
           requireThinking,
-          tools: this.tools.listTools(),
+          tools: [...this.tools.listTools(),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}],
           toolChoice: 'auto',
           signal: context.signal,
           taskId: context.taskId,
@@ -233,6 +296,9 @@ export class Agent {
         })) {
           if (chunk.chunk) {
             fullResponse += chunk.chunk;
+          }
+          if (chunk.thinkingContent) {
+            fullReasoning += chunk.thinkingContent;
           }
           if (chunk.done) {
             if (chunk.finishReason === 'FINISH_REASON_ERROR' || chunk.finishReason === 'FINISH_REASON_LENGTH' || chunk.finishReason === 'FINISH_REASON_CONTENT_FILTER') throw new Error(`Model generation stopped: ${chunk.finishReason}`);
@@ -244,9 +310,14 @@ export class Agent {
                 role: 'assistant',
                 content: finalText || fullResponse,
                 toolCalls: nativeCalls,
+                reasoningContent: fullReasoning || undefined,
               });
-              for (const toolCall of nativeCalls) {
-                const toolResult = await this.executeToolCall(toolCall, context, type, depth);
+              const settled = await Promise.allSettled(nativeCalls.map(toolCall => this.executeToolCall(toolCall, context, type, depth)));
+              for (let idx = 0; idx < nativeCalls.length; idx++) {
+                const toolCall = nativeCalls[idx];
+                const item = settled[idx];
+                if (item.status === 'rejected') throw item.reason;
+                const toolResult = item.value;
                 if (toolCall.name === 'finish' && toolResult.success) {
                   result = toolResult.data?.output || 'Task completed';
                   break;
@@ -257,18 +328,18 @@ export class Agent {
                   content: JSON.stringify(toolResult),
                 });
               }
-              if (result !== 'Max iterations reached') break;
+              if (result) break;
             }
             break;
           }
         }
 
-        if (result !== 'Max iterations reached') break;
+        if (result) break;
         if (receivedNativeCalls) continue;
         const toolCall = this.parseToolCall(finalText || fullResponse);
         if (toolCall) {
           const toolResult = await this.executeToolCall({ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }, context, type, depth);
-          context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }] });
+          context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }], reasoningContent: fullReasoning || undefined });
           context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(toolResult) });
 
           if (toolResult.success && toolCall.name === 'finish') {
@@ -281,31 +352,30 @@ export class Agent {
         }
       }
 
-      if (result === 'Max iterations reached') {
-        let summary = '';
-        try {
-          for await (const chunk of this.mocr.generate({ modelId: lastModel, messages: context.history,
-            systemPrompt: this.getSystemPrompt(context.prompt, context.cwd) + '\nTool budget exhausted. Do not call tools. Summarize actual changes, file paths, observed stdout/errors, and unfinished work. A network probe returning unreachable is a valid measurement, not necessarily broken code. Do not claim unverified success.',
-            tools: [], toolChoice: 'none', signal: context.signal, taskId, sessionId })) {
-            summary += chunk.chunk || '';
-            if (chunk.done && chunk.text) summary = chunk.text;
-          }
-        } catch { /* execution evidence remains in the ledger */ }
-        throw new Error(`已达到工具执行轮次上限（${maxIters}），已停止继续操作。${summary ? '\n\n' + summary : '请查看已保留的回复和工具结果，继续对话可接着处理。'}`);
-      }
       if (!result.trim() || result.startsWith('[mocr offline]')) throw new Error(result || 'Model returned an empty response');
+      context.signal.throwIfAborted();
+      const caller=String(options.caller_id||'').toLowerCase();
+      const lifeCaller=caller==='life'||caller.startsWith('life:')||caller.startsWith('plugin:life');
+      if(depth===0&&lifeCaller){
+        try {
+          let handoff='';
+          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:result}],systemPrompt:'Extract the completed task handoff. Return JSON only: {"artifacts":[{"path":"","usage":""}],"outcome":"","limitations":""}. Use only explicit facts from the final result; never invent file paths or success. Keep under 1200 characters.',tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:600})) handoff+=chunk.chunk||'';
+          const parsed=JSON.parse(handoff.replace(/^```(?:json)?\s*|\s*```$/g,''));
+          this.handoffs.set(taskId,JSON.stringify(parsed));
+        }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'任务已结束，产物信息提取失败，请查看 Agent 会话。'}))}
+      }
       return result;
     }, depth > 0);
   }
 
-  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd()): string {
+  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = ''): string {
     const tools = this.tools.listTools();
     const toolDescriptions = tools
       .map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`)
       .join('\n');
 
     const skillBlock = this.settings.enable_skills
-      ? `\n\n${this.skills.contextBlock(taskPrompt || '')}`
+      ? `\n\n${this.skills.contextBlock(taskPrompt || '', forceSkill)}`
       : '';
 
     return `You are an AI agent that can use tools to complete tasks.
@@ -321,7 +391,9 @@ Available tools:
 ${toolDescriptions}
 ${skillBlock}
 
-Use native tool calls when your model supports them. For providers without native
+Use native tool calls when your model supports them. Independent tool calls in
+the same turn are executed in parallel, so batch them when they do not depend
+on each other. For providers without native
 function calling, output exactly one fallback JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
 
@@ -338,7 +410,8 @@ plain-text final answer when no further tools are needed.`;
       return { success: false, data: null, error: `invalid JSON arguments for ${toolCall.name}` };
     }
     if (toolCall.name === 'finish') return { success: true, data: { output: String(args.output ?? args.result ?? '') } };
-    if (context.options.permission_mode !== 'full_access') {
+    if(toolCall.name==='question')return {success:true,data:{answer:await this.questions.ask(context.taskId,context.sessionId,args,context.signal)}};
+    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
@@ -351,9 +424,13 @@ plain-text final answer when no further tools are needed.`;
       signal: context.signal,
       runSubAgent: depth >= 2
         ? undefined
-        : async (subPrompt, subType) => this.recorder.run('subagent', subPrompt, context.taskId, context.sessionId,
-            () => this.executeTaskInternal(`${context.taskId}:sub:${randomUUID()}`, subPrompt, subType || agentType, depth + 1, context.sessionId, context.options)),
-    }));
+        : async (subPrompt, subType) => {
+            const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
+            return this.recorder.run('subagent', subPrompt, context.taskId, context.sessionId,
+              () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, context.options),
+              subTaskId);
+          },
+    }), undefined, serializeToolArgs(args));
   }
 
   private parseToolCall(response: string): { name: string; args: Record<string, any> } | null {
@@ -403,6 +480,31 @@ plain-text final answer when no further tools are needed.`;
       }
     }
 
+    if(tool==='question_list')return {success:true,result:JSON.stringify(this.questions.list()),error:''};
+    if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
+    if (tool === 'skills_admin') {
+      try {
+        const dir = this.settings.skills_dir || this.skills.writableDir();
+        const action = String(parsed.action || 'list').toLowerCase();
+        if (action === 'list') {
+          return { success: true, result: JSON.stringify({
+            dir,
+            skills: this.skills.list().map((s) => ({ name: s.name, description: s.description, tags: s.tags, source: s.source })),
+          }), error: '' };
+        }
+        if (action === 'save') {
+          const skill = this.skills.save(String(parsed.name || ''), String(parsed.content || ''), dir);
+          return { success: true, result: JSON.stringify({ name: skill.name, description: skill.description, source: skill.source }), error: '' };
+        }
+        if (action === 'delete') {
+          const ok = this.skills.remove(String(parsed.name || ''), dir);
+          return { success: ok, result: JSON.stringify({ deleted: ok }), error: ok ? '' : `skill '${parsed.name}' not found` };
+        }
+        return { success: false, result: '', error: `unknown skills_admin action: ${action}` };
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'skills_admin failed' };
+      }
+    }
     if (tool === 'workspace_browse') {
       try {
         const directory = path.resolve(parsed.path || process.cwd());
@@ -448,8 +550,10 @@ plain-text final answer when no further tools are needed.`;
     }
 
     const directId=sessionIdOrEmpty();
-    try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
-    catch(error:any) {return {success:false,result:'',error:error.message}}
+    if (!this.autoApproved(tool)) {
+      try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
+      catch(error:any) {return {success:false,result:'',error:error.message}}
+    }
     const res = await this.tools.call(tool, parsed, {
       cwd: process.cwd(),
       taskId: sessionIdOrEmpty(),

@@ -180,7 +180,7 @@ export class WriteTool extends Tool {
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       const existed = await fs.stat(filePath).then(() => true).catch(() => false);
       await fs.writeFile(filePath, args.content, 'utf8');
-      return success({ path: filePath, created: !existed, bytes: Buffer.byteLength(args.content) });
+      return success({ path: filePath, created: !existed, bytes: Buffer.byteLength(args.content), lines: args.content.split(/\r?\n/).length });
     } catch (error) { return failure(error); }
   }
 }
@@ -364,7 +364,11 @@ export class WebFetchTool extends Tool {
       if (typeof args.url !== 'string' || !/^https?:\/\//i.test(args.url)) throw new Error('url must be an http(s) URL');
       const timeout = AbortSignal.timeout(clamp(args.timeout, 30, 1, 120) * 1000);
       const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
-      const response = await fetch(args.url, { signal, headers: { 'User-Agent': '0kay-agent/0.2' }, redirect: 'follow' });
+      const response = await fetch(args.url, { signal, headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      }, redirect: 'follow' });
       const html = await response.text();
       const format = args.format || 'markdown';
       const content = format === 'html' ? html : html

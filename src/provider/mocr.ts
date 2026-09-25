@@ -7,6 +7,7 @@ import * as protoLoader from '@grpc/proto-loader'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
 import { taskRecorder } from '../task/records.js'
+import {coreHeaders,coreCredentials,coreOptions,coreMetadata,coreFetch} from '../connection.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -37,6 +38,8 @@ export interface Message {
   content: string;
   toolCallId?: string;
   toolCalls?: ToolCall[];
+  /** Prior assistant chain-of-thought (DeepSeek thinking mode pass-back). */
+  reasoningContent?: string;
 }
 
 export interface ToolDefinition {
@@ -90,7 +93,7 @@ function getStub(address: string): any {
   if (!pkg?.MocrService) {
     throw new Error('mocr.v1.MocrService not found in proto definition')
   }
-  const client = new pkg.MocrService(address, grpc.credentials.createInsecure())
+  const client = new pkg.MocrService(address, process.env.CORE_TLS_CA?coreCredentials():grpc.credentials.createInsecure(),coreOptions())
   cachedStub = client
   cachedAddress = address
   return client
@@ -107,7 +110,7 @@ export class MocrProvider {
 
   private async resolveCredentials(modelId: string, provider = '', signal?: AbortSignal) {
     const base = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
-    const response = await fetch(`${base}/api/providers`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
+    const response = await coreFetch(`${base}/api/providers`, { headers:coreHeaders(), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error(`Cannot load providers: HTTP ${response.status}`);
     const data: any = await response.json();
     const list: any[] = (Array.isArray(data) ? data : data.providers || []).filter((p: any) => p.enabled !== false);
@@ -127,19 +130,21 @@ export class MocrProvider {
     await this.recorder.record(event);
     let text = '';
     let lastPublished = 0;
+    let publishing: Promise<void> | null = null;
     try {
       for await (const chunk of this.generateStream(request)) {
         text += chunk.chunk || '';
         if (chunk.done && chunk.text) text = chunk.text;
-        if (!chunk.done && text && Date.now() - lastPublished >= 1000) {
-          await this.recorder.record({ ...event, result: text });
+        if (!chunk.done && text && !publishing && Date.now() - lastPublished >= 200) {
+          publishing = this.recorder.record({ ...event, result: text }).catch(error=>console.warn('Progress delivery failed:',error.message)).finally(()=>{publishing=null});
           lastPublished = Date.now();
         }
         if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_LENGTH', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) throw new Error(`Model finish: ${chunk.finishReason}`);
-        if (chunk.done) await this.recorder.record({ ...event, state: 'done', result: text });
+        if (chunk.done) {await publishing;await this.recorder.record({ ...event, state: 'done', result: text });}
         yield chunk;
       }
     } catch (error: any) {
+      await publishing;
       await this.recorder.record({ ...event, state: request.signal?.aborted ? 'cancelled' : 'failed', result: text, error: error.message });
       throw error;
     }
@@ -152,7 +157,22 @@ export class MocrProvider {
 
     const payload: any = {
       modelId: request.modelId,
-      messages: request.messages.map(message => ({ ...message, toolCalls: message.toolCalls?.map(call => ({ id: call.id, type: call.type || 'function', functionName: call.name, arguments: call.arguments })) })),
+      messages: request.messages.map(message => {
+        const wire: any = {
+          role: message.role,
+          content: message.content,
+          toolCalls: message.toolCalls?.map(call => ({ id: call.id, type: call.type || 'function', functionName: call.name, arguments: call.arguments })),
+        };
+        // Prior assistant chain-of-thought (DeepSeek thinking mode requires
+        // it on every assistant message once tools are present).
+        if (message.reasoningContent) {
+          wire.reasoningContent = message.reasoningContent;
+        }
+        if (message.toolCallId) {
+          wire.toolCallId = message.toolCallId;
+        }
+        return wire;
+      }),
       systemPrompt: request.systemPrompt || '',
       maxTokens: request.maxTokens || 8192,
       temperature: request.temperature ?? 0.7,
@@ -172,7 +192,12 @@ export class MocrProvider {
       })),
     };
 
-    const stream = stub.Generate(payload, { deadline: Date.now() + 300_000 });
+    const metadata=coreMetadata();
+    if(request.sessionId) metadata.set('x-0kay-session-id', request.sessionId);
+    if(request.taskId) metadata.set('x-0kay-request-id', request.taskId);
+    const difficulty=request.difficultyHint ?? 0.5;
+    metadata.set('x-0kay-thinking-level',!request.thinking?'off':difficulty<=0.25?'low':difficulty<0.7?'medium':difficulty<1?'high':'max');
+    const stream = stub.Generate(payload, metadata, { deadline: Date.now() + 300_000 });
     const cancel = () => stream.cancel();
     request.signal?.addEventListener('abort', cancel, { once: true });
     if (request.signal?.aborted) cancel();
@@ -235,7 +260,7 @@ export class MocrProvider {
               requireThinking,
             },
           },
-          { deadline: Date.now() + 15000 },
+          coreMetadata(), { deadline: Date.now() + 15000 },
           (err: any, r: any) => { signal?.removeEventListener('abort', cancel); err ? reject(err) : resolve(r); },
         )
         const cancel = () => call.cancel();

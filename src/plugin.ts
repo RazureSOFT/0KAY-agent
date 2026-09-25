@@ -11,8 +11,9 @@ import * as os from 'os'
 import * as path from 'path'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { randomUUID } from 'crypto'
+import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetch} from './connection.js'
 import { fileURLToPath } from 'url'
-import { Agent } from './agent/agent.js'
+import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -81,7 +82,7 @@ function createCoreClient(proto: any): any {
   }
   coreClient = new corePkg.PluginService(
     CORE_ADDRESS,
-    grpc.credentials.createInsecure()
+    coreCredentials(), coreOptions()
   )
   return coreClient
 }
@@ -100,7 +101,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
       author: '0kay',
       pluginType: 'PLUGIN_TYPE_SERVICE',
     },
-    capabilities: ['agent', `executor:${executorId}`],
+    capabilities: ['agent', `executor:${executorId}`, 'requires:mocr'],
     address: AGENT_ADDRESS,
     settingsSections: [
       {
@@ -123,13 +124,6 @@ async function registerWithCore(proto: any): Promise<string | null> {
             label: '温度',
             defaultValue: '0.7',
             help: 'Agent LLM 采样温度（0–2）',
-          },
-          {
-            key: 'max_iterations',
-            type: 'number',
-            label: '最大迭代次数',
-            defaultValue: '10',
-            help: '单个任务的最大 Agent 循环次数',
           },
           {
             key: 'max_concurrent_tasks',
@@ -207,7 +201,14 @@ async function registerWithCore(proto: any): Promise<string | null> {
             type: 'text',
             label: '技能目录',
             defaultValue: '',
-            help: '留空 = 使用内置 + agent/skills/*.md；可指向自定义目录',
+            help: '留空 = 内置 + agent/skills/*.md；可指向自定义目录',
+          },
+          {
+            key: 'always_allow_tools',
+            type: 'text',
+            label: '免审批工具',
+            defaultValue: DEFAULT_AUTO_APPROVE_TOOLS,
+            help: '逗号分隔的工具名，直接执行不弹确认；bash 建议保持审批（如需放开：read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,bash）',
           },
         ],
       },
@@ -223,7 +224,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
         return
       }
 
-      client.Register(request, { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
+      client.Register(request, coreMetadata(), { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
         if (err) {
           console.error('[Agent] Register failed:', err.message)
           resolve(null)
@@ -259,7 +260,7 @@ function sendHeartbeat(proto: any): void {
     host: buildHostInfo(),
   }
 
-  client.Heartbeat(request, { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
+  client.Heartbeat(request, coreMetadata(), { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
     if (err) {
       console.warn('[Agent] Heartbeat failed:', err.message)
       // Try to re-register if we lost connection
@@ -291,7 +292,7 @@ let settingsPollTimer: NodeJS.Timeout | null = null
  */
 async function pollAgentSettings(): Promise<void> {
   try {
-    const res = await fetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000) })
+    const res = await coreFetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() })
     if (!res.ok) return
     const body = await res.json()
     const values = body?.values || {}
@@ -311,6 +312,8 @@ async function pollAgentSettings(): Promise<void> {
       mcp_servers_json: typeof values.mcp_servers_json === 'string' ? values.mcp_servers_json : '[]',
       enable_skills: values.enable_skills !== false,
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
+      always_allow_tools:
+        typeof values.always_allow_tools === 'string' ? values.always_allow_tools : DEFAULT_AUTO_APPROVE_TOOLS,
     })
     taskManager.setMaxConcurrentTasks(Number(values.max_concurrent_tasks ?? 5))
   } catch {
@@ -327,7 +330,12 @@ function startAgentService(proto: any): Promise<number> {
     return Promise.reject(new Error('agent.v1 package not found'))
   }
 
-  const server = new grpc.Server()
+  const server = new grpc.Server({
+    'grpc.keepalive_time_ms': 30000,
+    'grpc.keepalive_timeout_ms': 10000,
+    'grpc.permit_keepalive_time_ms': 10000,
+    'grpc.permit_keepalive_without_calls': 1,
+  })
   grpcServer = server
 
   server.addService(agentPkg.AgentService.service, {
@@ -336,6 +344,7 @@ function startAgentService(proto: any): Promise<number> {
       callback: grpc.sendUnaryData<any>
     ) => {
       const { taskId, prompt, agentType, metadata } = call.request
+      if(!authorized(call)){callback({code:grpc.status.UNAUTHENTICATED,message:'paired Core required'} as grpc.ServiceError);return}
       const cancel = () => taskManager.cancelTask(taskId)
       call.on('cancelled', cancel)
       console.log(`[Agent] ExecuteTask ${taskId}: ${prompt.substring(0, 80)}...`)
@@ -346,7 +355,7 @@ function startAgentService(proto: any): Promise<number> {
           taskId,
           state: 'TASK_STATE_DONE',
           result,
-          metadata: metadata || {},
+          metadata: {...(metadata || {}),handoff:agent.takeHandoff(taskId)},
         })
       } catch (error: any) {
         console.error(`[Agent] Task ${taskId} failed:`, error.message)
@@ -366,6 +375,7 @@ function startAgentService(proto: any): Promise<number> {
       callback: grpc.sendUnaryData<any>
     ) => {
       const { taskId } = call.request
+      if(!authorized(call)){callback({code:grpc.status.UNAUTHENTICATED,message:'paired Core required'} as grpc.ServiceError);return}
       console.log(`[Agent] CancelTask ${taskId}`)
       const success = taskManager.cancelTask(taskId)
       callback(null, {
@@ -378,6 +388,7 @@ function startAgentService(proto: any): Promise<number> {
       call: grpc.ServerUnaryCall<any, any>,
       callback: grpc.sendUnaryData<any>
     ) => {
+      if(!authorized(call)){callback({code:grpc.status.UNAUTHENTICATED,message:'paired Core required'} as grpc.ServiceError);return}
       const { taskId } = call.request
       const task = taskManager.getTask(taskId)
       if (!task) {
@@ -404,6 +415,7 @@ function startAgentService(proto: any): Promise<number> {
       callback: grpc.sendUnaryData<any>
     ) => {
       const { tool, args, sessionId } = call.request
+      if(!authorized(call)){callback({code:grpc.status.UNAUTHENTICATED,message:'paired Core required'} as grpc.ServiceError);return}
       console.log(`[Agent] RunDirect tool=${tool} session=${sessionId || '-'}`)
       try {
         const res = await agent.runDirect(tool || '', args || '')

@@ -111,6 +111,7 @@ const BUILTIN: AgentSkill[] = [
 
 export class SkillRegistry {
   private skills = new Map<string, AgentSkill>()
+  private loadedDirs: string[] = []
 
   constructor() {
     for (const s of BUILTIN) this.skills.set(s.name, s)
@@ -128,6 +129,7 @@ export class SkillRegistry {
     if (!dir) return 0
     try {
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return 0
+      if (!this.loadedDirs.includes(dir)) this.loadedDirs.push(dir)
       let n = 0
       for (const file of fs.readdirSync(dir).sort()) {
         if (!file.toLowerCase().endsWith('.md')) continue
@@ -148,6 +150,49 @@ export class SkillRegistry {
 
   register(skill: AgentSkill): void {
     this.skills.set(skill.name, skill)
+  }
+
+  /** Directory used for saving/deleting skill files (first loaded dir or env). */
+  writableDir(): string {
+    const envDir = process.env.AGENT_SKILLS_DIR || ''
+    if (envDir) return envDir
+    return path.resolve(__dirname, '../../skills')
+  }
+
+  /**
+   * Save or overwrite a skill markdown file and reload it into the registry.
+   * `name` becomes both the filename stem and the skill name (slash target).
+   */
+  save(name: string, content: string, dirOverride?: string): AgentSkill {
+    const clean = String(name || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+    if (!clean || clean.length > 64) throw new Error('invalid skill name')
+    const text = String(content || '').trim()
+    if (!text) throw new Error('skill content is required')
+    const dir = dirOverride || this.writableDir()
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${clean}.md`), text, 'utf-8')
+    const skill = parseMdSkill(clean, text)
+    skill.name = clean
+    this.skills.set(clean, skill)
+    return skill
+  }
+
+  /** Delete a file-backed skill. Builtins cannot be removed. */
+  remove(name: string, dirOverride?: string): boolean {
+    const clean = String(name || '').trim().toLowerCase()
+    const skill = this.skills.get(clean)
+    if (!skill) return false
+    if (skill.source === 'builtin') throw new Error('builtin skills cannot be deleted')
+    this.skills.delete(clean)
+    const dirs = [dirOverride || this.writableDir(), ...this.loadedDirs]
+    for (const dir of dirs) {
+      if (!dir) continue
+      try { fs.unlinkSync(path.join(dir, `${clean}.md`)) } catch { /* ignore missing */ }
+    }
+    // Same name as a builtin → restore the builtin definition.
+    const builtin = BUILTIN.find((b) => b.name === clean)
+    if (builtin) this.skills.set(builtin.name, builtin)
+    return true
   }
 
   get(name: string): AgentSkill | undefined {
@@ -175,16 +220,18 @@ export class SkillRegistry {
   }
 
   /** Skill guidance block for the system prompt / task kickoff. */
-  contextBlock(text = ''): string {
+  contextBlock(text = '', forceName?: string): string {
     const all = this.list()
     if (!all.length) return 'No agent skills loaded.'
     const lines = ['Available agent skills (follow when relevant):']
     for (const s of all) lines.push(`- ${s.name}: ${s.description}`)
-    const match = this.match(text)
+    const forced = forceName ? this.get(forceName) : undefined
+    const match = forced || this.match(text)
     if (match) {
       lines.push('')
       lines.push(`### Skill: ${match.name}`)
       lines.push(match.content.trim())
+      if (forced) lines.push(`Apply this skill to the user's request above.`)
     }
     return lines.join('\n')
   }
