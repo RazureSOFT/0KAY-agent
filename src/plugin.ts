@@ -17,6 +17,15 @@ import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
 
 const __filename = fileURLToPath(import.meta.url)
+/** Version reported to Core on registration; manifest.json is the source of truth. */
+async function manifestVersion(): Promise<string> {
+  try {
+    const manifest = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
+    return manifest.version || '0.1.0'
+  } catch {
+    return '0.1.0'
+  }
+}
 const __dirname = path.dirname(__filename)
 
 const PROTO_DIR = process.env.PROTO_DIR || path.resolve(__dirname, '../../proto')
@@ -96,7 +105,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
   const request = {
     pluginInfo: {
       name: 'agent',
-      version: '0.1.0',
+      version: await manifestVersion(),
       description: '0kay Agent - Task execution engine',
       author: '0kay',
       pluginType: 'PLUGIN_TYPE_SERVICE',
