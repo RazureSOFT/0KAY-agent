@@ -547,12 +547,17 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
 
 function simpleDiff(filePath: string, original: string, updated: string): string {
   const oldLines = original.split(/\r?\n/); const newLines = updated.split(/\r?\n/);
-  const limit = 200; const out = [`--- ${filePath}`, `+++ ${filePath}`];
+  const limit = 400; const out = [`--- a/${filePath}`, `+++ b/${filePath}`];
   const max = Math.max(oldLines.length, newLines.length);
+  // Aligned comparison (writes are positional): group consecutive changes into a
+  // hunk and emit `@@ -old +new @@` so the UI can show the changed line numbers.
+  let oldNo = 1, newNo = 1, inHunk = false;
   for (let i = 0; i < max && out.length < limit; i++) {
-    if (oldLines[i] === newLines[i]) continue;
-    if (oldLines[i] !== undefined) out.push(`-${oldLines[i]}`);
-    if (newLines[i] !== undefined) out.push(`+${newLines[i]}`);
+    const before = oldLines[i]; const after = newLines[i];
+    if (before === after) { oldNo++; newNo++; inHunk = false; continue; }
+    if (!inHunk) { out.push(`@@ -${oldNo} +${newNo} @@`); inHunk = true; }
+    if (before !== undefined) { out.push(`-${before}`); oldNo++; }
+    if (after !== undefined) { out.push(`+${after}`); newNo++; }
   }
   if (out.length >= limit) out.push('[diff truncated]');
   return out.join('\n');
