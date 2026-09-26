@@ -110,7 +110,10 @@ export class MocrProvider {
 
   private async resolveCredentials(modelId: string, provider = '', signal?: AbortSignal) {
     const base = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
-    const response = await coreFetch(`${base}/api/providers`, { headers:coreHeaders(), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
+    // Credentials are resolved per call: GET /api/providers is redacted now, so
+    // the secret-bearing catalog comes from /api/providers/credentials. Not
+    // caching keeps provider edits effective immediately.
+    const response = await coreFetch(`${base}/api/providers/credentials`, { headers:coreHeaders(), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error(`Cannot load providers: HTTP ${response.status}`);
     const data: any = await response.json();
     const list: any[] = (Array.isArray(data) ? data : data.providers || []).filter((p: any) => p.enabled !== false);
