@@ -487,7 +487,7 @@ export class ComputerUseTool extends Tool {
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action'], properties: {
-      action: { type: 'string', enum: ['screenshot', 'move', 'click', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' },
+      action: { type: 'string', enum: ['screenshot', 'listwindows', 'move', 'click', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' },
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
@@ -495,11 +495,30 @@ export class ComputerUseTool extends Tool {
     try {
       const action = args.action;
       const ps = (script: string) => promisify(execFile)('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 30_000, windowsHide: true, signal: context?.signal });
+      if (action === 'listwindows') {
+        const script = "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { \"$($_.ProcessName) :: $($_.MainWindowTitle)\" }";
+        const { stdout } = await ps(script) as { stdout: string };
+        const windows = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        return success({ windows, count: windows.length });
+      }
       if (action === 'screenshot') {
-        const output = path.join(os.tmpdir(), `0kay-screen-${Date.now()}.png`);
-        const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save('" + output.replace(/'/g, "''") + "',[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose()";
+        const stamp = Date.now();
+        const output = path.join(os.tmpdir(), `0kay-screen-${stamp}.png`);
+        const preview = path.join(os.tmpdir(), `0kay-screen-${stamp}.jpg`);
+        const q = (value: string) => "'" + value.replace(/'/g, "''") + "'";
+        const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(" + q(output) + ",[System.Drawing.Imaging.ImageFormat]::Png); $mw=1280; if($b.Width -gt $mw){$nh=[int]($b.Height*$mw/$b.Width); $small=New-Object System.Drawing.Bitmap $mw,$nh; $g2=[System.Drawing.Graphics]::FromImage($small); $g2.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g2.DrawImage($bmp,0,0,$mw,$nh); $g2.Dispose(); $small.Save(" + q(preview) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg); $small.Dispose()} else {$bmp.Save(" + q(preview) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg)}; $g.Dispose(); $bmp.Dispose()";
         await ps(script);
-        return success({ path: output, sha256: createHash('sha256').update(await fs.readFile(output)).digest('hex') });
+        const png = await fs.readFile(output);
+        const previewBytes = await fs.readFile(preview);
+        return success({
+          path: output,
+          preview,
+          sha256: createHash('sha256').update(png).digest('hex'),
+          width: png.readUInt32BE(16),
+          height: png.readUInt32BE(20),
+          mime: 'image/jpeg',
+          base64: previewBytes.toString('base64'),
+        });
       }
       if (action === 'type' || action === 'key') {
         let raw = String(action === 'type' ? args.text ?? '' : args.key ?? '');

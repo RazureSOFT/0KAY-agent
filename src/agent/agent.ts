@@ -195,6 +195,11 @@ export class Agent {
       .includes(tool);
   }
 
+  /** computeruse screenshot/listwindows are read-only and may run without a prompt. */
+  private readOnlyComputerUse(tool: string, args: Record<string, any>): boolean {
+    return tool === 'computeruse' && ['screenshot', 'listwindows'].includes(String(args?.action || ''));
+  }
+
   private applyToolToggles(): void {
     // Rebuild registry so disabled tools are absent from listTools / call().
     this.tools = createDefaultRegistry(this.skills);
@@ -411,7 +416,7 @@ plain-text final answer when no further tools are needed.`;
     }
     if (toolCall.name === 'finish') return { success: true, data: { output: String(args.output ?? args.result ?? '') } };
     if(toolCall.name==='question')return {success:true,data:{answer:await this.questions.ask(context.taskId,context.sessionId,args,context.signal)}};
-    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name)) {
+    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
@@ -550,7 +555,7 @@ plain-text final answer when no further tools are needed.`;
     }
 
     const directId=sessionIdOrEmpty();
-    if (!this.autoApproved(tool)) {
+    if (!this.autoApproved(tool) && !this.readOnlyComputerUse(tool, parsed)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }
