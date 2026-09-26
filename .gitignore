@@ -11,3 +11,19 @@ opencode/
 *.log
 data/
 github_check.py
+
+# Agent scratch artifacts (web search dumps / temp clones)
+/bili.json
+/bing.html
+/ev.json
+/issues.json
+/npm.json
+/org.json
+/orgrepos.json
+/payload.json
+/pypi.json
+/rc.json
+/rc.md
+/rdap.json
+/repos.json
+/repos/
