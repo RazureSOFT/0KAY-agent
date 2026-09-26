@@ -1,1 +1,1 @@
-{"schema":1,"name":"@razuresoft/0kay-agent","version":"0.1.0","tags":["0kay-plugin"],"dependencies":["@razuresoft/0kay-mcp"],"requires":["core","mocr"],"install":[["npm","ci"],["npm","run","build"]],"start":["node","dist/index.js"]}
+{"schema":1,"name":"@razuresoft/0kay-agent","version":"0.1.0","dependencies":["@razuresoft/0kay-mcp"],"requires":["core","mocr"],"install":[["npm","ci"],["npm","run","build"]],"start":["node","dist/index.js"]}
