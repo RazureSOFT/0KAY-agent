@@ -14,7 +14,7 @@ tools, approvals, task records and MCP/LLM integration.
 ## Install with 0kay-pm
 
 ```powershell
-0kay-pm install @razuresoft/0kay-agent@0.1.0
+0kay-pm install @razuresoft/0kay-agent@0.1.1
 ```
 
 The installer downloads this repository as a release source archive, fetches

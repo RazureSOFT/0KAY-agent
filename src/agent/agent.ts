@@ -24,6 +24,15 @@ export interface AgentConfig {
 export const DEFAULT_AUTO_APPROVE_TOOLS =
   'read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill';
 
+/**
+ * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
+ * COMPACTION_HEADINGS so a compacted run and a compacted chat read the same.
+ */
+export const COMPACTION_SCHEMA_PROMPT =
+  'Compress this execution transcript into a faithful, structured working summary so the run can continue after the raw history is dropped. Use EXACTLY these Markdown sections, in this order, and keep every section:\n' +
+  '## Objective\n## Important Details\n## Work State\n## Next Move\n## Relevant Files\n' +
+  'Objective: the current goal and what done means. Important Details: durable facts, decisions, constraints, file paths, IDs, tool results and errors, user answers, acceptance criteria, and questions already answered (never secrets). Work State: grouped as Completed / Active / Blocked, reporting only observed results and never inventing success. Next Move: the concrete immediate next step(s). Relevant Files: file_path:line references needed to continue. If a section has nothing, write 无. Carry prior facts forward. Start directly with ## Objective; no preamble or restated instructions. Be terse and factual, no process narration. Do not execute tools. Keep under 4000 words.';
+
 /** Ledger-friendly tool arguments: drop bulky text payloads (line stats come from results). */
 function serializeToolArgs(args: Record<string, any>): string {
   try {
@@ -259,9 +268,9 @@ export class Agent {
         // between completed tool batches so call/result pairs remain intact.
         if(context.history.reduce((size,message)=>size+message.content.length+JSON.stringify(message.toolCalls||[]).length,0)>80000 && lastModel){
           let summary='';
-          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:JSON.stringify(context.history)}],systemPrompt:'Compress this execution transcript into a faithful working summary. Preserve file paths, changes, tool results/errors, user answers, acceptance criteria and pending work. Do not execute tools. Keep under 4000 words.',tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
+          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:JSON.stringify(context.history)}],systemPrompt:COMPACTION_SCHEMA_PROMPT,tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
           if(!summary.trim())throw new Error('Context compaction returned no summary');
-          context.history=[{role:'user',content:prompt},{role:'assistant',content:`Execution context summary:\n${summary}`}];
+          context.history=[{role:'user',content:prompt},{role:'assistant',content:`Structured context summary:\n${summary}`}];
         }
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
         // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]

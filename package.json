@@ -1,6 +1,6 @@
 {
   "name": "@0kay/agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "0kay Agent - Task execution engine",
   "type": "module",
   "main": "dist/index.js",

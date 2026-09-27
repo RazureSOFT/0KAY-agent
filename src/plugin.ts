@@ -21,9 +21,9 @@ const __filename = fileURLToPath(import.meta.url)
 async function manifestVersion(): Promise<string> {
   try {
     const manifest = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
-    return manifest.version || '0.1.0'
+    return manifest.version || '0.1.1'
   } catch {
-    return '0.1.0'
+    return '0.1.1'
   }
 }
 const __dirname = path.dirname(__filename)
