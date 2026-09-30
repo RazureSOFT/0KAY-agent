@@ -320,6 +320,27 @@ export class Agent {
     }
   }
 
+  /** Prompt-level thinking budget, applied to every model regardless of provider. */
+  private thinkingDirective(intensity: string, difficultyHint: number): string {
+    const level = intensity === 'off' || difficultyHint <= 0
+      ? 'none'
+      : difficultyHint <= 0.25 ? 'low'
+      : difficultyHint < 0.7 ? 'medium'
+      : difficultyHint < 1 ? 'high' : 'max';
+    switch (level) {
+      case 'none':
+        return 'Thinking budget: minimal. Do not narrate your reasoning; answer directly and concisely.';
+      case 'low':
+        return 'Thinking budget: low. Think briefly, then answer; keep the reasoning short and skip exhaustive analysis.';
+      case 'medium':
+        return 'Thinking budget: medium. Think the problem through at a normal depth before answering.';
+      case 'high':
+        return 'Thinking budget: high. Reason thoroughly: break the problem down, weigh alternatives, check edge cases, and verify before answering.';
+      default:
+        return 'Thinking budget: maximum. Reason as deeply as possible: explore multiple angles, consider counter-examples and alternative approaches, and validate the conclusion before answering.';
+    }
+  }
+
   /** Rough token estimate: ~4 chars per token plus a flat cost per image part. */
   private estimateTokens(messages: Message[]): number {
     let chars = 0;
@@ -430,7 +451,7 @@ export class Agent {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence.`,
+          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`,
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,

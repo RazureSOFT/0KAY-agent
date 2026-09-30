@@ -440,3 +440,14 @@ test('agent parses a provider context window and detects overflow', async () => 
   }
 });
 
+
+test('thinking intensity maps to distinct prompt directives', () => {
+  const agent = new Agent();
+  const d = (i: string, dh: number) => (agent as any).thinkingDirective(i, dh);
+  assert.match(d('off', 0), /minimal/);
+  assert.match(d('low', 0.2), /low/);
+  assert.match(d('medium', 0.5), /medium/);
+  assert.match(d('high', 0.75), /high/);
+  assert.match(d('max', 1), /maximum/);
+  assert.notEqual(d('low', 0.2), d('max', 1));
+});
