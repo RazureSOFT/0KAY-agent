@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { createHash, randomUUID } from 'crypto';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
+import { egressFetch } from '../connection.js';
 
 const exec = promisify(execCallback);
 const MAX_OUTPUT = 120_000;
@@ -364,11 +365,11 @@ export class WebFetchTool extends Tool {
       if (typeof args.url !== 'string' || !/^https?:\/\//i.test(args.url)) throw new Error('url must be an http(s) URL');
       const timeout = AbortSignal.timeout(clamp(args.timeout, 30, 1, 120) * 1000);
       const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
-      const response = await fetch(args.url, { signal, headers: {
+      const response = await egressFetch(args.url, { signal, headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      }, redirect: 'follow' });
+      }, redirect: 'follow' }, clamp(args.timeout, 30, 1, 120) * 1000);
       const html = await response.text();
       const format = args.format || 'markdown';
       const content = format === 'html' ? html : html
@@ -404,7 +405,7 @@ export class WebSearchTool extends Tool {
       endpoint.searchParams.set('q', args.query);
       endpoint.searchParams.set('format', 'json');
       const timeout = AbortSignal.timeout(30000);
-      const response = await fetch(endpoint, { headers: { Accept: 'application/json' }, signal: context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout });
+      const response = await egressFetch(endpoint.toString(), { headers: { Accept: 'application/json' }, signal: context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout }, 30000);
       if (!response.ok) throw new Error(`SearXNG returned ${response.status}`);
       const body: any = await response.json();
       const limit = clamp(args.numResults, 5, 1, 20);

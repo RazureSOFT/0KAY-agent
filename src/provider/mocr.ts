@@ -7,7 +7,7 @@ import * as protoLoader from '@grpc/proto-loader'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
 import { taskRecorder } from '../task/records.js'
-import {coreHeaders,coreCredentials,coreOptions,coreMetadata,coreFetch} from '../connection.js'
+import {coreHeaders,coreCredentials,coreOptions,coreMetadata,coreFetch,egressFetch} from '../connection.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -182,18 +182,23 @@ export class MocrProvider {
 
   private async contextLengthFrom(url: string, headers: Record<string, string>, signal: AbortSignal, matchId = ''): Promise<number> {
     try {
-      const response = await fetch(url, { headers, signal });
+      const response = await egressFetch(url, { headers, signal }, 8000);
       if (!response.ok) return 0;
       const data: any = await response.json();
-      if (matchId) {
-        const list: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-        const target = matchId.toLowerCase();
-        const hit = list.find((m: any) => String(m?.id || '').toLowerCase() === target)
-          || list.find((m: any) => { const id = String(m?.id || '').toLowerCase(); return id && (id.includes(target) || target.includes(id)); });
-        return extractContextLength(hit) || extractContextLength(data);
-      }
-      return extractContextLength(data) || extractContextLength(data?.data);
+      return this.parseContextLength(data, matchId);
     } catch { return 0; }
+  }
+
+  /** Extract a context window from a provider /models payload (pure). */
+  private parseContextLength(data: any, matchId = ''): number {
+    if (matchId) {
+      const list: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+      const target = matchId.toLowerCase();
+      const hit = list.find((m: any) => String(m?.id || '').toLowerCase() === target)
+        || list.find((m: any) => { const id = String(m?.id || '').toLowerCase(); return id && (id.includes(target) || target.includes(id)); });
+      return extractContextLength(hit) || extractContextLength(data);
+    }
+    return extractContextLength(data) || extractContextLength(data?.data);
   }
 
   /**
@@ -210,18 +215,18 @@ export class MocrProvider {
     const isAnthropic = String(creds.provider).toLowerCase() === 'anthropic' || String(creds.format).toLowerCase() === 'anthropic';
     if (isAnthropic) {
       const url = endpoint.endsWith('/v1') ? `${endpoint}/messages` : `${endpoint}/v1/messages`;
-      const res = await fetch(url, { method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-api-key': creds.apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
+      const res = await egressFetch(url, { method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-api-key': creds.apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mime, data: base64 } },
         { type: 'text', text: ask },
-      ] }] }) });
+      ] }] }) }, 60000);
       if (!res.ok) throw new Error(`vision HTTP ${res.status}`);
       const payload: any = await res.json();
       return (payload.content || []).map((part: any) => part?.text || '').join('').trim();
     }
-    const res = await fetch(`${endpoint}/chat/completions`, { method: 'POST', signal, headers: { 'content-type': 'application/json', Authorization: `Bearer ${creds.apiKey}` }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
+    const res = await egressFetch(`${endpoint}/chat/completions`, { method: 'POST', signal, headers: { 'content-type': 'application/json', Authorization: `Bearer ${creds.apiKey}` }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
       { type: 'text', text: ask },
       { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
-    ] }] }) });
+    ] }] }) }, 60000);
     if (!res.ok) throw new Error(`vision HTTP ${res.status}`);
     const payload: any = await res.json();
     const content = payload.choices?.[0]?.message?.content;

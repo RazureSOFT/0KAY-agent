@@ -11,7 +11,7 @@ import * as os from 'os'
 import * as path from 'path'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { randomUUID } from 'crypto'
-import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetch} from './connection.js'
+import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetch,setPluginIdentity} from './connection.js'
 import { fileURLToPath } from 'url'
 import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
@@ -24,6 +24,19 @@ async function manifestVersion(): Promise<string> {
     return manifest.version || '0.1.1'
   } catch {
     return '0.1.1'
+  }
+}
+
+/** Declared permissions from manifest.json, sent to Core on registration. */
+async function manifestPermissions(): Promise<Record<string, unknown> | undefined> {
+  try {
+    const manifest = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
+    const p = manifest.permissions
+    if (!p) return undefined
+    const api = p.api || {}
+    return { apiRequires: api.requires || [], apiExposes: api.exposes || [], egress: p.egress || [] }
+  } catch {
+    return undefined
   }
 }
 const __dirname = path.dirname(__filename)
@@ -109,6 +122,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
       description: '0kay Agent - Task execution engine',
       author: '0kay',
       pluginType: 'PLUGIN_TYPE_SERVICE',
+      permissions: await manifestPermissions(),
     },
     capabilities: ['agent', `executor:${executorId}`, 'requires:mocr'],
     address: AGENT_ADDRESS,
@@ -252,6 +266,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
           console.error('[Agent] Register failed:', err.message)
           resolve(null)
         } else if (resp?.success) {
+          setPluginIdentity('agent', resp.serviceToken)
           console.log(`[Agent] Registered with Core: plugin_id=${resp.pluginId}`)
           resolve(resp.pluginId)
         } else {

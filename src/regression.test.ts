@@ -423,21 +423,9 @@ test('agent parses a provider context window and detects overflow', async () => 
   assert.equal((agent as any).looksContextOverflow(new Error('connection timeout')), false);
   assert.equal((agent as any).estimateTokens([{ role: 'user', content: 'x'.repeat(400), parts: [{ type: 'image' }] }]), 101 + 850);
 
-  const server = http.createServer((_req, res) => {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ data: [{ id: 'm1', context_length: 131072 }, { id: 'm2' }] }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-  const address = server.address() as { port: number };
-  try {
-    const list = await (agent as any).mocr.contextLengthFrom(`http://127.0.0.1:${address.port}/models`, {}, new AbortController().signal, 'm1');
-    assert.equal(list, 131072);
-    const single = await (agent as any).mocr.contextLengthFrom(`http://127.0.0.1:${address.port}/models/m1`, {}, new AbortController().signal);
-    assert.equal(single, 0);
-  } finally {
-    server.closeAllConnections?.();
-    server.close();
-  }
+  const payload = { data: [{ id: 'm1', context_length: 131072 }, { id: 'm2' }] };
+  assert.equal((agent as any).mocr.parseContextLength(payload, 'm1'), 131072);
+  assert.equal((agent as any).mocr.parseContextLength(payload, ''), 0);
 });
 
 
