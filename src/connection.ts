@@ -32,6 +32,37 @@ export async function coreFetch(url:string,options:RequestInit={}):Promise<Respo
 }
 
 /**
+ * Invoke a plugin-contributed tool through Core. Returns the tool result.
+ */
+export async function callPluginTool(tool:string,args:Record<string,any>={},sessionId='',caller='agent'):Promise<{success:boolean;result?:any;error?:string}>{
+ try{
+  const res=await coreFetch(`${coreHttpBase()}/api/tools/call`,{
+   method:'POST',
+   headers:{'Content-Type':'application/json',...coreHeaders()},
+   body:JSON.stringify({tool,args,session_id:sessionId,caller}),
+   signal:AbortSignal.timeout(120000),
+  });
+  const data:any=await res.json().catch(()=>({}));
+  if(!res.ok)return{success:false,error:data?.error||`HTTP ${res.status}`};
+  return{success:!!data?.success,result:data?.result,error:data?.error};
+ }catch(error:any){
+  return{success:false,error:error?.message||String(error)};
+ }
+}
+
+/** List plugin tools Core offers for a consumer scope. */
+export async function listPluginTools(scope:'agent'|'life'='agent'):Promise<Array<{plugin:string;name:string;description:string;parameters?:Record<string,any>;dangerous?:boolean;scopes?:string[]}>>{
+ try{
+  const res=await coreFetch(`${coreHttpBase()}/api/tools?scope=${scope}`,{headers:coreHeaders(),signal:AbortSignal.timeout(10000)});
+  if(!res.ok)return[];
+  const data:any=await res.json().catch(()=>({}));
+  return Array.isArray(data?.tools)?data.tools:[];
+ }catch{
+  return[];
+ }
+}
+
+/**
  * Perform an outbound HTTP request through Core's egress proxy so it is checked
  * against the plugin's declared egress allow-list. Returns a Response shaped
  * like fetch(), or throws when Core blocks/fails the request.

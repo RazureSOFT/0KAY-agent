@@ -3,7 +3,7 @@
  */
 
 import { MocrProvider, Message, MessagePart, GenerateRequest, GenerateResponse, ToolCall } from '../provider/mocr.js';
-import { ToolRegistry, createDefaultRegistry } from '../tools/tools.js';
+import { ToolRegistry, createDefaultRegistry, PluginTool } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
@@ -14,7 +14,7 @@ import { ApprovalManager } from '../task/approvals.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
 import { taskRecorder } from '../task/records.js';
-import { coreFetch, coreHeaders } from '../connection.js';
+import { coreFetch, coreHeaders, listPluginTools } from '../connection.js';
 
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
@@ -73,6 +73,8 @@ export interface AgentSettings {
   /** Manual context window in tokens (0 = auto from the provider). */
   context_window?: number;
   enable_mcp_tool?: boolean;
+  /** Allow tools contributed by plugins (via Core's tool catalog). */
+  enable_plugin_tools?: boolean;
   enable_task_tool?: boolean;
   mcp_servers_json?: string;
   enable_skills?: boolean;
@@ -103,6 +105,8 @@ export class Agent {
   private approvals = new ApprovalManager();
   private questions = new QuestionManager();
   private handoffs = new Map<string,string>();
+  /** Names of plugin-contributed tools currently registered (for refresh). */
+  private pluginToolNames = new Set<string>();
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
 
   constructor(config: Partial<AgentConfig> = {}) {
@@ -124,6 +128,7 @@ export class Agent {
       vision_model: '',
       context_window: 0,
       enable_mcp_tool: true,
+      enable_plugin_tools: true,
       enable_task_tool: true,
       mcp_servers_json: '[]',
       enable_skills: true,
@@ -173,6 +178,7 @@ export class Agent {
     if (typeof partial.vision_model === 'string') this.settings.vision_model = partial.vision_model.trim();
     if (typeof partial.context_window === 'number' && partial.context_window >= 0) this.settings.context_window = Math.floor(partial.context_window);
     if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
+    if (typeof partial.enable_plugin_tools === 'boolean') this.settings.enable_plugin_tools = partial.enable_plugin_tools;
     if (typeof partial.enable_task_tool === 'boolean') this.settings.enable_task_tool = partial.enable_task_tool;
     if (typeof partial.mcp_servers_json === 'string' && partial.mcp_servers_json.trim() !== this.settings.mcp_servers_json) {
       this.settings.mcp_servers_json = partial.mcp_servers_json.trim() || '[]';
@@ -199,6 +205,7 @@ export class Agent {
       this.settings.always_allow_tools = partial.always_allow_tools.trim();
     }
     this.applyToolToggles();
+    void this.refreshPluginTools();
   }
 
   getSettings(): Readonly<Required<AgentSettings>> {
@@ -234,6 +241,22 @@ export class Agent {
     if (!this.settings.enable_mcp_tool) this.tools.unregister('mcp');
     if (!this.settings.enable_task_tool) this.tools.unregister('task');
     if (!this.settings.enable_skills) this.tools.unregister('skill');
+  }
+
+  /**
+   * Pull tools contributed by plugins from Core's tool catalog and register
+   * each as a dynamic tool that routes execution back through Core.
+   */
+  private async refreshPluginTools(): Promise<void> {
+    for (const name of this.pluginToolNames) this.tools.unregister(name);
+    this.pluginToolNames.clear();
+    if (!this.settings.enable_plugin_tools) return;
+    const defs = await listPluginTools('agent');
+    for (const def of defs) {
+      if (!def?.name || this.tools.get(def.name)) continue;
+      this.tools.register(new PluginTool(def));
+      this.pluginToolNames.add(def.name);
+    }
   }
 
   /**

@@ -206,6 +206,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '例如 [{"id":"filesystem","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","C:\\work"]}]',
           },
           {
+            key: 'enable_plugin_tools',
+            type: 'bool',
+            label: '插件工具',
+            defaultValue: 'true',
+            help: '允许 Agent 调用插件注册到 Core 的工具（工具目录见 /api/tools）',
+          },
+          {
             key: 'enable_computer_use',
             type: 'bool',
             label: 'Agent 主机计算机操作',
@@ -346,6 +353,7 @@ async function pollAgentSettings(): Promise<void> {
       enable_web_tools: values.enable_web_tools !== false,
       enable_task_tool: values.enable_task_tool !== false,
       enable_mcp_tool: values.enable_mcp_tool !== false,
+      enable_plugin_tools: values.enable_plugin_tools !== false,
         enable_computer_use: values.enable_computer_use === true,
         vision_model: typeof values.vision_model === 'string' ? values.vision_model : '',
         context_window: Number(values.context_window || 0),

@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { createHash, randomUUID } from 'crypto';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
-import { egressFetch } from '../connection.js';
+import { egressFetch, callPluginTool } from '../connection.js';
 
 const exec = promisify(execCallback);
 const MAX_OUTPUT = 120_000;
@@ -758,6 +758,33 @@ export class ToolRegistry {
   }
   listTools(): ToolSchema[] {
     return [...this.tools.values()].map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, dangerous: tool.dangerous }));
+  }
+}
+
+/** A tool contributed by a plugin; execution is routed through Core. */
+export interface PluginToolDef {
+  plugin: string;
+  name: string;
+  description?: string;
+  parameters?: Record<string, any>;
+  dangerous?: boolean;
+  scopes?: string[];
+}
+
+export class PluginTool extends Tool {
+  private readonly def: PluginToolDef;
+  constructor(def: PluginToolDef) { super(); this.def = def; }
+  get name(): string { return this.def.name; }
+  get description(): string { return this.def.description || `Tool contributed by plugin ${this.def.plugin}.`; }
+  get parameters(): Record<string, any> {
+    const params = this.def.parameters;
+    return params && typeof params === 'object' ? params : { type: 'object', properties: {} };
+  }
+  get dangerous(): boolean { return !!this.def.dangerous; }
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
+    const result = await callPluginTool(this.def.name, args || {}, context?.taskId || '', `agent:${context?.agentType || 'general'}`);
+    if (result.success) return success(result.result);
+    return failure(result.error || 'plugin tool failed');
   }
 }
 
