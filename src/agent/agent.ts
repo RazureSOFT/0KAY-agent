@@ -2,14 +2,14 @@
  * Agent main loop - Core can trigger via gRPC
  */
 
-import { MocrProvider, Message, ToolCall } from '../provider/mocr.js';
+import { MocrProvider, Message, MessagePart, ToolCall } from '../provider/mocr.js';
 import { ToolRegistry, createDefaultRegistry } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
 import { randomUUID } from 'crypto';
 import * as path from 'path';
-import { stat, readdir, mkdir, writeFile } from 'fs/promises';
+import { stat, readdir, mkdir } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
@@ -236,12 +236,6 @@ export class Agent {
     return this.executeTaskInternal(taskId, prompt, agentType, 0, metadata.session_id || '', metadata);
   }
 
-  /** Strip directory components and unsafe characters from an upload filename. */
-  private sanitizeAttachmentName(name: string): string {
-    const base = path.basename(name).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '');
-    return base.slice(0, 120) || 'attachment';
-  }
-
   /** True for filenames/mimes whose bytes are safe to inline as UTF-8 text. */
   private isTextAttachment(name: string, mime: string): boolean {
     if (mime.startsWith('text/')) return true;
@@ -254,54 +248,44 @@ export class Agent {
   }
 
   /**
-   * Download attachments referenced by the Core metadata (`attachments` is a
-   * JSON array of {name,url,mime,size}) into `<cwd>/.0kay/attachments` and turn
-   * them into prompt content the text-only model can actually use: text files
-   * are inlined, images are described by the vision model. Returns a bullet
-   * list; individual failures are reported inline rather than aborting.
+   * Fetch uploaded attachments referenced by the Core metadata (`attachments` is
+   * a JSON array of {name,url,mime,size}) into memory and turn them into prompt
+   * content: text files are inlined, images become multimodal parts sent
+   * straight to the model. Nothing is written to disk.
    */
-  private async materializeAttachments(raw: string, cwd: string, signal: AbortSignal, visionModel = ''): Promise<string> {
+  private async collectAttachments(raw: string, signal: AbortSignal): Promise<{ text: string; images: MessagePart[] }> {
     let refs: Array<{ name?: string; url?: string; mime?: string }> = [];
-    try { refs = JSON.parse(raw); } catch { return ''; }
-    if (!Array.isArray(refs) || refs.length === 0) return '';
-    const dir = path.join(cwd, '.0kay', 'attachments');
-    await mkdir(dir, { recursive: true });
+    try { refs = JSON.parse(raw); } catch { return { text: '', images: [] }; }
+    if (!Array.isArray(refs) || refs.length === 0) return { text: '', images: [] };
     const lines: string[] = [];
-    for (let i = 0; i < refs.length; i++) {
-      const ref = refs[i] || {};
-      const url = String(ref.url || '');
+    const images: MessagePart[] = [];
+    for (const ref of refs) {
+      const url = String(ref?.url || '');
       if (!url) continue;
-      const name = ref.name || path.basename(url.split('?')[0]);
-      const mime = String(ref.mime || '');
-      const relative = `.0kay/attachments/${i + 1}-${this.sanitizeAttachmentName(name)}`;
-      const local = path.join(cwd, relative);
+      const name = String(ref?.name || path.basename(url.split('?')[0]));
+      const mime = String(ref?.mime || '');
       const absolute = /^https?:\/\//.test(url) ? url : `${CORE_HTTP}${url}`;
       try {
         const response = await coreFetch(absolute, { headers: coreHeaders(), signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const bytes = Buffer.from(await response.arrayBuffer());
-        await writeFile(local, bytes);
         if (this.isImageAttachment(name, mime)) {
-          try {
-            const description = await this.mocr.describeImage(visionModel, bytes.toString('base64'), mime || 'image/png',
-              `用户上传了图片「${name}」，请用简洁的中文描述它的内容与要点。`, 1024, signal);
-            lines.push(`- ${relative} (image) — description: ${description || '(no description returned)'}`);
-          } catch (error: any) {
-            lines.push(`- ${relative} (image; vision description failed: ${error?.message || error})`);
-          }
+          const type = mime || 'image/png';
+          images.push({ type: 'image', imageUrl: `data:${type};base64,${bytes.toString('base64')}`, mimeType: type });
+          lines.push(`- ${name} (image attached to this turn)`);
         } else if (this.isTextAttachment(name, mime) && bytes.length <= 1_000_000) {
           const text = bytes.toString('utf8');
           const clipped = text.length > 12000 ? `${text.slice(0, 12000)}\n…(truncated)` : text;
-          lines.push(`- ${relative} (${mime || 'text'}, ${bytes.length} bytes):\n\`\`\`\n${clipped}\n\`\`\``);
+          lines.push(`- ${name} (${mime || 'text'}, ${bytes.length} bytes):\n\`\`\`\n${clipped}\n\`\`\``);
         } else {
-          lines.push(`- ${relative} (${mime || 'application/octet-stream'}, ${bytes.length} bytes; read it with the read tool)`);
+          lines.push(`- ${name} (${mime || 'application/octet-stream'}, ${bytes.length} bytes)`);
         }
       } catch (error: any) {
         if (signal.aborted) throw error;
         lines.push(`- ${url} (download failed: ${error?.message || error})`);
       }
     }
-    return lines.join('\n');
+    return { text: lines.join('\n'), images };
   }
 
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
@@ -321,15 +305,16 @@ export class Agent {
       const cwd = options.workdir ? path.resolve(options.workdir) : process.cwd();
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
       const signal = this.taskManager.signal(taskId);
+      let initialParts: MessagePart[] | undefined;
       if (options.attachments) {
-        const visionModel = (options.model_id && options.model_id !== 'MOCR' ? options.model_id : this.settings.model_id) || '';
-        const listing = await this.materializeAttachments(options.attachments, cwd, signal, visionModel);
-        if (listing) prompt += `\n\nAttachments: the user uploaded these files. Text content is inlined and every file is also saved under .0kay/attachments in the workspace.\n${listing}`;
+        const { text, images } = await this.collectAttachments(options.attachments, signal);
+        if (text) prompt += `\n\nAttachments: the user uploaded these files.\n${text}`;
+        if (images.length) initialParts = [{ type: 'text', text: prompt }, ...images];
       }
       const context: AgentContext = {
         taskId,
         prompt,
-        history: [{ role: 'user', content: prompt }],
+        history: [initialParts ? { role: 'user', content: '', parts: initialParts } : { role: 'user', content: prompt }],
         todo: [],
         signal,
         sessionId,
@@ -346,7 +331,8 @@ export class Agent {
         // between completed tool batches so call/result pairs remain intact.
         if(context.history.reduce((size,message)=>size+message.content.length+JSON.stringify(message.toolCalls||[]).length,0)>80000 && lastModel){
           let summary='';
-          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:JSON.stringify(context.history)}],systemPrompt:COMPACTION_SCHEMA_PROMPT,tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
+          const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
+          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:transcript}],systemPrompt:COMPACTION_SCHEMA_PROMPT,tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
           if(!summary.trim())throw new Error('Context compaction returned no summary');
           context.history=[{role:'user',content:prompt},{role:'assistant',content:`Structured context summary:\n${summary}`}];
         }

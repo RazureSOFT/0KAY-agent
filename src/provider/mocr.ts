@@ -38,8 +38,20 @@ export interface Message {
   content: string;
   toolCallId?: string;
   toolCalls?: ToolCall[];
+  /** Multimodal parts (text + images) sent straight to the model. */
+  parts?: MessagePart[];
   /** Prior assistant chain-of-thought (DeepSeek thinking mode pass-back). */
   reasoningContent?: string;
+}
+
+/** One segment of a multimodal message. */
+export interface MessagePart {
+  /** "text" or "image". */
+  type: string;
+  text?: string;
+  /** data URL (data:<mime>;base64,<data>) or https URL. */
+  imageUrl?: string;
+  mimeType?: string;
 }
 
 export interface ToolDefinition {
@@ -215,6 +227,14 @@ export class MocrProvider {
         }
         if (message.toolCallId) {
           wire.toolCallId = message.toolCallId;
+        }
+        if (message.parts?.length) {
+          wire.contentParts = message.parts.map((part) => ({
+            type: part.type,
+            text: part.text || '',
+            imageUrl: part.imageUrl || '',
+            mimeType: part.mimeType || '',
+          }));
         }
         return wire;
       }),

@@ -3,9 +3,6 @@ import assert from 'node:assert/strict';
 import * as grpc from '@grpc/grpc-js';
 import * as loader from '@grpc/proto-loader';
 import * as http from 'node:http';
-import * as fs from 'node:fs/promises';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
 import { ShellTool, ComputerUseTool, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
@@ -368,32 +365,28 @@ test('hotkeys map to portable macOS and Linux backends', () => {
   assert.equal(linuxKeyExpression('ctrl+alt+Delete'), 'ctrl+alt+Delete');
 });
 
-test('attachment metadata downloads into the workspace and sanitizes names', async () => {
+test('attachment metadata becomes inlined text and multimodal image parts', async () => {
   const server = http.createServer((req, res) => {
     if (!req.url?.startsWith('/api/files')) { res.writeHead(404); res.end('missing'); return; }
     res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ATTACH-BYTES');
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address() as { port: number };
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-att-'));
   try {
     const agent = new Agent();
-    (agent as any).mocr = { describeImage: async () => 'a screenshot of a cat' };
-    const listing = await (agent as any).materializeAttachments(JSON.stringify([
-      { name: '../evil name.txt', url: `http://127.0.0.1:${address.port}/api/files?file=file_1.txt`, mime: 'text/plain', size: 12 },
+    const { text, images } = await (agent as any).collectAttachments(JSON.stringify([
+      { name: 'notes.txt', url: `http://127.0.0.1:${address.port}/api/files?file=file_1.txt`, mime: 'text/plain', size: 12 },
       { name: 'shot.png', url: `http://127.0.0.1:${address.port}/api/files?file=file_2.png`, mime: 'image/png', size: 12 },
       { name: 'missing.bin', url: `http://127.0.0.1:${address.port}/nope`, mime: 'application/octet-stream', size: 0 },
-    ]), dir, new AbortController().signal);
-    assert.match(listing, /\.0kay\/attachments\/1-evil_name\.txt/);
-    assert.match(listing, /```\nATTACH-BYTES\n```/); // text inlined into the prompt
-    assert.match(listing, /description: a screenshot of a cat/); // image seen via the vision model
-    assert.match(listing, /download failed/);
-    const files = await fs.readdir(path.join(dir, '.0kay', 'attachments'));
-    assert.equal(files.length, 2);
-    assert.ok(!files.some((file) => file.includes('..')));
-    assert.equal(await fs.readFile(path.join(dir, '.0kay', 'attachments', files[0]), 'utf8'), 'ATTACH-BYTES');
+    ]), new AbortController().signal);
+    assert.match(text, /notes\.txt/);
+    assert.match(text, /```\nATTACH-BYTES\n```/); // text inlined into the prompt
+    assert.match(text, /download failed/);
+    assert.equal(images.length, 1);
+    assert.equal(images[0].type, 'image');
+    assert.equal(images[0].mimeType, 'image/png');
+    assert.match(images[0].imageUrl || '', /^data:image\/png;base64,/); // image handed straight to the model
   } finally {
     server.close();
-    await fs.rm(dir, { recursive: true, force: true });
   }
 });
