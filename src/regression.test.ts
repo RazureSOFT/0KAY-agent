@@ -2,9 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as grpc from '@grpc/grpc-js';
 import * as loader from '@grpc/proto-loader';
+import * as http from 'node:http';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
-import { ShellTool } from './tools/tools.js';
+import { ShellTool, ComputerUseTool, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
 import { ApprovalManager } from './task/approvals.js';
 import {QuestionManager} from './task/questions.js';
 
@@ -344,4 +348,48 @@ test('skills_admin saves, lists and deletes skills; slash force-applies a skill'
   assert.match(prompt, /NEVER_INVENT_PATHS/);
   const del = await agent.runDirect('skills_admin', JSON.stringify({ action: 'delete', name: 'slash-probe' }));
   assert.equal(del.success, true);
+});
+
+test('computeruse exposes every action and rejects unknown ones', async () => {
+  const tool = new ComputerUseTool();
+  const actions = [...tool.parameters.properties.action.enum].sort();
+  assert.deepEqual(actions, ['click', 'key', 'listwindows', 'move', 'screenshot', 'type']);
+  const bad = await tool.execute({ action: 'nope' });
+  assert.equal(bad.success, false);
+  assert.match(String(bad.error), /invalid computer action/);
+});
+
+test('hotkeys map to portable macOS and Linux backends', () => {
+  assert.equal(appleScriptForKey('cmd+shift+t'), 'keystroke "t" using {command down, shift down}');
+  assert.equal(appleScriptForKey('return'), 'key code 36');
+  assert.equal(appleScriptForKey('a'), 'keystroke "a"');
+  assert.throws(() => appleScriptForKey(''), /key is required/);
+  assert.equal(linuxKeyExpression('cmd+c'), 'super+c');
+  assert.equal(linuxKeyExpression('ctrl+alt+Delete'), 'ctrl+alt+Delete');
+});
+
+test('attachment metadata downloads into the workspace and sanitizes names', async () => {
+  const server = http.createServer((req, res) => {
+    if (!req.url?.startsWith('/api/files')) { res.writeHead(404); res.end('missing'); return; }
+    res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ATTACH-BYTES');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address() as { port: number };
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-att-'));
+  try {
+    const agent = new Agent();
+    const listing = await (agent as any).materializeAttachments(JSON.stringify([
+      { name: '../evil name.txt', url: `http://127.0.0.1:${address.port}/api/files?file=file_1.txt`, mime: 'text/plain', size: 12 },
+      { name: 'missing.bin', url: `http://127.0.0.1:${address.port}/nope`, mime: 'application/octet-stream', size: 0 },
+    ]), dir, new AbortController().signal);
+    assert.match(listing, /\.0kay\/attachments\/1-evil_name\.txt/);
+    assert.match(listing, /download failed/);
+    const files = await fs.readdir(path.join(dir, '.0kay', 'attachments'));
+    assert.equal(files.length, 1);
+    assert.ok(!files[0].includes('..'));
+    assert.equal(await fs.readFile(path.join(dir, '.0kay', 'attachments', files[0]), 'utf8'), 'ATTACH-BYTES');
+  } finally {
+    server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

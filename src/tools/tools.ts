@@ -481,9 +481,65 @@ export class McpTool extends Tool {
   }
 }
 
+/** macOS virtual keycodes for special keys (used by `osascript ... key code N`). */
+const MAC_KEY_CODES: Record<string, number> = {
+  return: 36, enter: 36, tab: 48, space: 49, delete: 51, backspace: 51, escape: 53, esc: 53,
+  left: 123, right: 124, down: 125, up: 126, home: 115, end: 119, pageup: 116, pagedown: 121,
+  f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97, f7: 98, f8: 100, f9: 101, f10: 109, f11: 103, f12: 111,
+};
+
+/** AppleScript modifier clauses for a leading hotkey token. */
+const MAC_MODIFIERS: Record<string, string> = {
+  cmd: 'command down', command: 'command down', meta: 'command down', super: 'command down',
+  ctrl: 'control down', control: 'control down', alt: 'option down', option: 'option down', shift: 'shift down',
+};
+
+/** xdotool keysym names for tokens that differ from the plain name. */
+const LINUX_KEYS: Record<string, string> = {
+  cmd: 'super', command: 'super', meta: 'super', win: 'super',
+  ctrl: 'ctrl', control: 'ctrl', alt: 'alt', shift: 'shift',
+  return: 'Return', enter: 'Return', escape: 'Escape', esc: 'Escape', space: 'space', tab: 'Tab',
+  delete: 'Delete', backspace: 'BackSpace', left: 'Left', right: 'Right', up: 'Up', down: 'Down',
+  home: 'Home', end: 'End', pageup: 'Prior', pagedown: 'Next',
+};
+
+function appleScriptEscape(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n');
+}
+
+/** Build the AppleScript statement that emits a hotkey such as `cmd+shift+t` or `return`. */
+export function appleScriptForKey(raw: string): string {
+  const parts = raw.split('+').map((part) => part.trim()).filter(Boolean);
+  const key = parts.pop() || '';
+  if (!key) throw new Error('key is required');
+  const modifiers: string[] = [];
+  for (const part of parts) {
+    const clause = MAC_MODIFIERS[part.toLowerCase()];
+    if (clause && !modifiers.includes(clause)) modifiers.push(clause);
+  }
+  const using = modifiers.length ? ` using {${modifiers.join(', ')}}` : '';
+  const code = MAC_KEY_CODES[key.toLowerCase()];
+  if (code !== undefined) return `key code ${code}${using}`;
+  if ([...key].length === 1) return `keystroke "${appleScriptEscape(key)}"${using}`;
+  throw new Error(`unsupported key: ${raw}`);
+}
+
+/** Map a canonical `ctrl+shift+t` hotkey to an xdotool key expression. */
+export function linuxKeyExpression(raw: string): string {
+  return raw.split('+').map((part) => part.trim()).filter(Boolean)
+    .map((part) => LINUX_KEYS[part.toLowerCase()] ?? part).join('+');
+}
+
+/**
+ * Operate the host desktop (screenshot, list windows, mouse, keyboard).
+ *
+ * Backends: Windows PowerShell (always present), macOS `screencapture` +
+ * `osascript` + `cliclick`, Linux `grim`/`scrot`/ImageMagick + `xdotool`.
+ * Any missing backend is reported as a clear, actionable error.
+ */
 export class ComputerUseTool extends Tool {
   get name(): string { return 'computeruse'; }
-  get description(): string { return 'Operate the Agent host computer: screenshot, mouse move/click, type text, or press keys. Requires explicit computer-use permission.'; }
+  get description(): string { return 'Operate the Agent host computer: screenshot, list open windows, move/click the mouse, type text, or press keys. Supports Windows, macOS and Linux hosts. Requires explicit computer-use permission.'; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action'], properties: {
@@ -491,50 +547,195 @@ export class ComputerUseTool extends Tool {
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    if (process.platform !== 'win32') return failure('computeruse currently supports Windows Agent hosts only');
     try {
-      const action = args.action;
-      const ps = (script: string) => promisify(execFile)('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 30_000, windowsHide: true, signal: context?.signal });
-      if (action === 'listwindows') {
-        const script = "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { \"$($_.ProcessName) :: $($_.MainWindowTitle)\" }";
-        const { stdout } = await ps(script) as { stdout: string };
-        const windows = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        return success({ windows, count: windows.length });
+      const action = String(args.action || '');
+      switch (action) {
+        case 'listwindows': return success(await this.listWindows(context));
+        case 'screenshot': return success(await this.screenshot(context));
+        case 'type': return success(await this.typeText(args, context));
+        case 'key': return success(await this.pressKey(args, context));
+        case 'move': return success(await this.pointer(args, false, context));
+        case 'click': return success(await this.pointer(args, true, context));
+        default: throw new Error('invalid computer action');
       }
-      if (action === 'screenshot') {
-        const stamp = Date.now();
-        const output = path.join(os.tmpdir(), `0kay-screen-${stamp}.png`);
-        const preview = path.join(os.tmpdir(), `0kay-screen-${stamp}.jpg`);
-        const q = (value: string) => "'" + value.replace(/'/g, "''") + "'";
-        const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(" + q(output) + ",[System.Drawing.Imaging.ImageFormat]::Png); $mw=1280; if($b.Width -gt $mw){$nh=[int]($b.Height*$mw/$b.Width); $small=New-Object System.Drawing.Bitmap $mw,$nh; $g2=[System.Drawing.Graphics]::FromImage($small); $g2.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g2.DrawImage($bmp,0,0,$mw,$nh); $g2.Dispose(); $small.Save(" + q(preview) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg); $small.Dispose()} else {$bmp.Save(" + q(preview) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg)}; $g.Dispose(); $bmp.Dispose()";
-        await ps(script);
-        const png = await fs.readFile(output);
-        const previewBytes = await fs.readFile(preview);
-        return success({
-          path: output,
-          preview,
-          sha256: createHash('sha256').update(png).digest('hex'),
-          width: png.readUInt32BE(16),
-          height: png.readUInt32BE(20),
-          mime: 'image/jpeg',
-          base64: previewBytes.toString('base64'),
-        });
-      }
-      if (action === 'type' || action === 'key') {
-        let raw = String(action === 'type' ? args.text ?? '' : args.key ?? '');
-        if (!raw) throw new Error(`${action === 'type' ? 'text' : 'key'} is required`);
-        if (action === 'type') raw = raw.replace(/[+^%~(){}\[\]]/g, char => `{${char}}`);
-        await ps(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`);
-        return success({ action, sent: raw });
-      }
-      if (!['move', 'click'].includes(action)) throw new Error('invalid computer action');
-      const x = clamp(args.x, -1, 0, 100000); const y = clamp(args.y, -1, 0, 100000);
-      if (x < 0 || y < 0) throw new Error('x and y are required');
-      const click = action === 'click' ? (args.button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
-      const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + (click ? click.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '');
-      await ps(script);
-      return success({ action, x, y, button: action === 'click' ? (args.button || 'left') : undefined });
     } catch (error) { return failure(error); }
+  }
+
+  /** Run a command with a bounded lifetime and no console window. */
+  private run(file: string, args: string[], context?: ToolContext, timeout = 30_000): Promise<{ stdout: string; stderr: string }> {
+    return promisify(execFile)(file, args, { timeout, windowsHide: true, signal: context?.signal, maxBuffer: 32 << 20 }) as Promise<{ stdout: string; stderr: string }>;
+  }
+
+  private async hasCommand(name: string, context?: ToolContext): Promise<boolean> {
+    try {
+      if (process.platform === 'win32') await this.run('where', [name], context, 8000);
+      else await this.run('/bin/sh', ['-c', `command -v ${name}`], context, 8000);
+      return true;
+    } catch { return false; }
+  }
+
+  private async requireCommand(name: string, context: ToolContext | undefined, hint: string): Promise<void> {
+    if (!(await this.hasCommand(name, context))) throw new Error(`computeruse needs \`${name}\` on this host (${hint})`);
+  }
+
+  // --- screenshot -----------------------------------------------------------
+  private async screenshot(context?: ToolContext) {
+    const stamp = Date.now();
+    const png = path.join(os.tmpdir(), `0kay-screen-${stamp}.png`);
+    const jpg = path.join(os.tmpdir(), `0kay-screen-${stamp}.jpg`);
+    let previewPath = png;
+    let mime = 'image/png';
+    if (process.platform === 'win32') {
+      const q = (value: string) => "'" + value.replace(/'/g, "''") + "'";
+      const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(" + q(png) + ",[System.Drawing.Imaging.ImageFormat]::Png); $mw=1280; if($b.Width -gt $mw){$nh=[int]($b.Height*$mw/$b.Width); $small=New-Object System.Drawing.Bitmap $mw,$nh; $g2=[System.Drawing.Graphics]::FromImage($small); $g2.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g2.DrawImage($bmp,0,0,$mw,$nh); $g2.Dispose(); $small.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg); $small.Dispose()} else {$bmp.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg)}; $g.Dispose(); $bmp.Dispose()";
+      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], context, 40_000);
+      previewPath = jpg; mime = 'image/jpeg';
+    } else if (process.platform === 'darwin') {
+      await this.run('screencapture', ['-x', png], context);
+      previewPath = (await this.downscaleMac(png, jpg, context)) ? jpg : png;
+      mime = previewPath === jpg ? 'image/jpeg' : 'image/png';
+    } else if (process.platform === 'linux') {
+      await this.captureLinux(png, context);
+      previewPath = (await this.downscaleLinux(png, jpg, context)) ? jpg : png;
+      mime = previewPath === jpg ? 'image/jpeg' : 'image/png';
+    } else {
+      throw new Error(`computeruse is not supported on ${process.platform}`);
+    }
+    const pngBytes = await fs.readFile(png);
+    const previewBytes = await fs.readFile(previewPath);
+    return {
+      path: png,
+      preview: previewPath,
+      sha256: createHash('sha256').update(pngBytes).digest('hex'),
+      width: pngBytes.length > 24 ? pngBytes.readUInt32BE(16) : undefined,
+      height: pngBytes.length > 24 ? pngBytes.readUInt32BE(20) : undefined,
+      mime,
+      base64: previewBytes.toString('base64'),
+    };
+  }
+
+  private async downscaleMac(png: string, jpg: string, context?: ToolContext): Promise<boolean> {
+    try { await this.run('sips', ['-Z', '1280', '-s', 'format', 'jpeg', png, '--out', jpg], context); } catch { return false; }
+    return fs.stat(jpg).then(() => true).catch(() => false);
+  }
+
+  private async downscaleLinux(png: string, jpg: string, context?: ToolContext): Promise<boolean> {
+    const attempts: Array<[string, string[]]> = [
+      ['magick', ['-resize', '1280x', '-quality', '82', png, jpg]],
+      ['convert', ['-resize', '1280x', '-quality', '82', png, jpg]],
+      ['ffmpeg', ['-y', '-loglevel', 'error', '-i', png, '-vf', 'scale=1280:-1', jpg]],
+      ['python3', ['-c', 'import sys\nfrom PIL import Image\nim=Image.open(sys.argv[1]);im.thumbnail((1280,1280));im.convert("RGB").save(sys.argv[2],"JPEG",quality=82)', png, jpg]],
+    ];
+    for (const [cmd, args] of attempts) {
+      if (!(await this.hasCommand(cmd, context))) continue;
+      try { await this.run(cmd, args, context); } catch { continue; }
+      if (await fs.stat(jpg).then(() => true).catch(() => false)) return true;
+    }
+    return false;
+  }
+
+  private async captureLinux(png: string, context?: ToolContext): Promise<void> {
+    const backends: Array<[string, string[]]> = [
+      ['grim', [png]],
+      ['scrot', ['-o', png]],
+      ['import', ['-window', 'root', png]],
+      ['gnome-screenshot', ['-f', png]],
+      ['spectacle', ['-b', '-n', '-o', png]],
+    ];
+    for (const [cmd, args] of backends) {
+      if (!(await this.hasCommand(cmd, context))) continue;
+      await this.run(cmd, args, context, 40_000);
+      return;
+    }
+    throw new Error('computeruse screenshot needs grim, scrot, ImageMagick import, gnome-screenshot or spectacle on Linux');
+  }
+
+  // --- windows list ---------------------------------------------------------
+  private async listWindows(context?: ToolContext) {
+    let windows: string[];
+    if (process.platform === 'win32') {
+      const script = "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { \"$($_.ProcessName) :: $($_.MainWindowTitle)\" }";
+      const { stdout } = await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], context);
+      windows = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    } else if (process.platform === 'darwin') {
+      const script = 'tell application "System Events" to get name of (processes where background only is false)';
+      const { stdout } = await this.run('osascript', ['-e', script], context);
+      windows = String(stdout || '').split(/,\s*/).map((line) => line.trim()).filter(Boolean);
+    } else if (process.platform === 'linux') {
+      windows = await this.listWindowsLinux(context);
+    } else {
+      throw new Error(`computeruse is not supported on ${process.platform}`);
+    }
+    return { windows, count: windows.length };
+  }
+
+  private async listWindowsLinux(context?: ToolContext): Promise<string[]> {
+    if (await this.hasCommand('wmctrl', context)) {
+      const { stdout } = await this.run('wmctrl', ['-l'], context);
+      return String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+        .map((line) => line.replace(/^\S+\s+\S+\s+\S+\s+/, ''));
+    }
+    await this.requireCommand('xdotool', context, 'install xdotool or wmctrl');
+    const { stdout } = await this.run('xdotool', ['search', '--onlyvisible', '--name', '.*', 'getwindowname', '%@'], context);
+    return String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  }
+
+  // --- keyboard -------------------------------------------------------------
+  private async typeText(args: Record<string, any>, context?: ToolContext) {
+    const text = String(args.text ?? '');
+    if (!text) throw new Error('text is required');
+    if (process.platform === 'win32') {
+      const escaped = text.replace(/[+^%~(){}\[\]]/g, (char) => `{${char}}`);
+      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`], context);
+    } else if (process.platform === 'darwin') {
+      await this.run('osascript', ['-e', `tell application "System Events" to keystroke "${appleScriptEscape(text)}"`], context);
+    } else if (process.platform === 'linux') {
+      await this.requireCommand('xdotool', context, 'install xdotool');
+      await this.run('xdotool', ['type', '--', text], context);
+    } else {
+      throw new Error(`computeruse is not supported on ${process.platform}`);
+    }
+    return { action: 'type', sent: text };
+  }
+
+  private async pressKey(args: Record<string, any>, context?: ToolContext) {
+    const raw = String(args.key ?? '');
+    if (!raw) throw new Error('key is required');
+    if (process.platform === 'win32') {
+      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`], context);
+    } else if (process.platform === 'darwin') {
+      await this.run('osascript', ['-e', `tell application "System Events" to ${appleScriptForKey(raw)}`], context);
+    } else if (process.platform === 'linux') {
+      await this.requireCommand('xdotool', context, 'install xdotool');
+      await this.run('xdotool', ['key', '--', linuxKeyExpression(raw)], context);
+    } else {
+      throw new Error(`computeruse is not supported on ${process.platform}`);
+    }
+    return { action: 'key', sent: raw };
+  }
+
+  // --- pointer --------------------------------------------------------------
+  private async pointer(args: Record<string, any>, click: boolean, context?: ToolContext) {
+    const x = clamp(args.x, -1, 0, 100000);
+    const y = clamp(args.y, -1, 0, 100000);
+    if (x < 0 || y < 0) throw new Error('x and y are required');
+    const button = args.button === 'right' ? 'right' : 'left';
+    if (process.platform === 'win32') {
+      const flags = click ? (button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
+      const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + (flags ? flags.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '');
+      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], context);
+    } else if (process.platform === 'darwin') {
+      await this.requireCommand('cliclick', context, 'brew install cliclick');
+      const command = click ? `${button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
+      await this.run('cliclick', [command], context);
+    } else if (process.platform === 'linux') {
+      await this.requireCommand('xdotool', context, 'install xdotool');
+      const args2 = click ? ['mousemove', String(x), String(y), 'click', button === 'right' ? '3' : '1'] : ['mousemove', String(x), String(y)];
+      await this.run('xdotool', args2, context);
+    } else {
+      throw new Error(`computeruse is not supported on ${process.platform}`);
+    }
+    return { action: click ? 'click' : 'move', x, y, button: click ? button : undefined };
   }
 }
 

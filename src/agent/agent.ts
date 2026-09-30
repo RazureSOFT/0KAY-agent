@@ -9,11 +9,15 @@ import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
 import { randomUUID } from 'crypto';
 import * as path from 'path';
-import { stat, readdir, mkdir } from 'fs/promises';
+import { stat, readdir, mkdir, writeFile } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
 import { taskRecorder } from '../task/records.js';
+import { coreFetch, coreHeaders } from '../connection.js';
+
+/** Core HTTP base, used to pull uploaded attachments onto the agent host. */
+const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
 
 export interface AgentConfig {
   mocrAddress: string;
@@ -232,6 +236,45 @@ export class Agent {
     return this.executeTaskInternal(taskId, prompt, agentType, 0, metadata.session_id || '', metadata);
   }
 
+  /** Strip directory components and unsafe characters from an upload filename. */
+  private sanitizeAttachmentName(name: string): string {
+    const base = path.basename(name).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '');
+    return base.slice(0, 120) || 'attachment';
+  }
+
+  /**
+   * Download attachments referenced by the Core metadata (`attachments` is a
+   * JSON array of {name,url,mime,size}) into `<cwd>/.0kay/attachments` so the
+   * agent's filesystem tools can read them. Returns a bullet list for the
+   * prompt; individual failures are reported inline rather than aborting.
+   */
+  private async materializeAttachments(raw: string, cwd: string, signal: AbortSignal): Promise<string> {
+    let refs: Array<{ name?: string; url?: string; mime?: string }> = [];
+    try { refs = JSON.parse(raw); } catch { return ''; }
+    if (!Array.isArray(refs) || refs.length === 0) return '';
+    const dir = path.join(cwd, '.0kay', 'attachments');
+    await mkdir(dir, { recursive: true });
+    const lines: string[] = [];
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i] || {};
+      const url = String(ref.url || '');
+      if (!url) continue;
+      const local = path.join(dir, `${i + 1}-${this.sanitizeAttachmentName(ref.name || path.basename(url.split('?')[0]))}`);
+      const absolute = /^https?:\/\//.test(url) ? url : `${CORE_HTTP}${url}`;
+      try {
+        const response = await coreFetch(absolute, { headers: coreHeaders(), signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const bytes = Buffer.from(await response.arrayBuffer());
+        await writeFile(local, bytes);
+        lines.push(`- ${path.relative(cwd, local).split(path.sep).join('/')} (${ref.mime || 'application/octet-stream'}, ${bytes.length} bytes)`);
+      } catch (error: any) {
+        if (signal.aborted) throw error;
+        lines.push(`- ${url} (download failed: ${error?.message || error})`);
+      }
+    }
+    return lines.join('\n');
+  }
+
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
     // /{skill_name} [request] → force-apply that skill and use the rest as the task.
@@ -248,12 +291,17 @@ export class Agent {
     return this.taskManager.executeTask(taskId, async () => {
       const cwd = options.workdir ? path.resolve(options.workdir) : process.cwd();
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
+      const signal = this.taskManager.signal(taskId);
+      if (options.attachments) {
+        const listing = await this.materializeAttachments(options.attachments, cwd, signal);
+        if (listing) prompt += `\n\nAttachments: the user uploaded the following files and they were downloaded into the workspace. Read them with the read/glob tools.\n${listing}`;
+      }
       const context: AgentContext = {
         taskId,
         prompt,
         history: [{ role: 'user', content: prompt }],
         todo: [],
-        signal: this.taskManager.signal(taskId),
+        signal,
         sessionId,
         cwd,
         options: forceSkill ? { ...options, force_skill: forceSkill } : options,
@@ -564,7 +612,11 @@ plain-text final answer when no further tools are needed.`;
     }
 
     const directId=sessionIdOrEmpty();
-    if (!this.autoApproved(tool) && !this.readOnlyComputerUse(tool, parsed)) {
+    // Direct computeruse calls are already gated by Core's `computer_use`
+    // permission (RunDirect) and the enable_computer_use setting, so LIFE's
+    // autonomous loop can drive the mouse/keyboard without a second prompt.
+    // Interactive agent tasks still prompt for non-read-only actions below.
+    if (!this.autoApproved(tool) && tool !== 'computeruse') {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }
