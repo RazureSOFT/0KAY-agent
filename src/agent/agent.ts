@@ -242,13 +242,25 @@ export class Agent {
     return base.slice(0, 120) || 'attachment';
   }
 
+  /** True for filenames/mimes whose bytes are safe to inline as UTF-8 text. */
+  private isTextAttachment(name: string, mime: string): boolean {
+    if (mime.startsWith('text/')) return true;
+    if (['application/json', 'application/xml', 'application/javascript', 'application/x-yaml', 'application/yaml', 'application/toml'].includes(mime)) return true;
+    return /\.(txt|md|markdown|json|ya?ml|toml|csv|tsv|log|py|js|mjs|cjs|ts|tsx|jsx|vue|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|sh|ps1|bat|cmd|html?|css|scss|xml|ini|cfg|conf|sql|env)$/i.test(name);
+  }
+
+  private isImageAttachment(name: string, mime: string): boolean {
+    return mime.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
+  }
+
   /**
    * Download attachments referenced by the Core metadata (`attachments` is a
-   * JSON array of {name,url,mime,size}) into `<cwd>/.0kay/attachments` so the
-   * agent's filesystem tools can read them. Returns a bullet list for the
-   * prompt; individual failures are reported inline rather than aborting.
+   * JSON array of {name,url,mime,size}) into `<cwd>/.0kay/attachments` and turn
+   * them into prompt content the text-only model can actually use: text files
+   * are inlined, images are described by the vision model. Returns a bullet
+   * list; individual failures are reported inline rather than aborting.
    */
-  private async materializeAttachments(raw: string, cwd: string, signal: AbortSignal): Promise<string> {
+  private async materializeAttachments(raw: string, cwd: string, signal: AbortSignal, visionModel = ''): Promise<string> {
     let refs: Array<{ name?: string; url?: string; mime?: string }> = [];
     try { refs = JSON.parse(raw); } catch { return ''; }
     if (!Array.isArray(refs) || refs.length === 0) return '';
@@ -259,14 +271,31 @@ export class Agent {
       const ref = refs[i] || {};
       const url = String(ref.url || '');
       if (!url) continue;
-      const local = path.join(dir, `${i + 1}-${this.sanitizeAttachmentName(ref.name || path.basename(url.split('?')[0]))}`);
+      const name = ref.name || path.basename(url.split('?')[0]);
+      const mime = String(ref.mime || '');
+      const relative = `.0kay/attachments/${i + 1}-${this.sanitizeAttachmentName(name)}`;
+      const local = path.join(cwd, relative);
       const absolute = /^https?:\/\//.test(url) ? url : `${CORE_HTTP}${url}`;
       try {
         const response = await coreFetch(absolute, { headers: coreHeaders(), signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const bytes = Buffer.from(await response.arrayBuffer());
         await writeFile(local, bytes);
-        lines.push(`- ${path.relative(cwd, local).split(path.sep).join('/')} (${ref.mime || 'application/octet-stream'}, ${bytes.length} bytes)`);
+        if (this.isImageAttachment(name, mime)) {
+          try {
+            const description = await this.mocr.describeImage(visionModel, bytes.toString('base64'), mime || 'image/png',
+              `用户上传了图片「${name}」，请用简洁的中文描述它的内容与要点。`, 1024, signal);
+            lines.push(`- ${relative} (image) — description: ${description || '(no description returned)'}`);
+          } catch (error: any) {
+            lines.push(`- ${relative} (image; vision description failed: ${error?.message || error})`);
+          }
+        } else if (this.isTextAttachment(name, mime) && bytes.length <= 1_000_000) {
+          const text = bytes.toString('utf8');
+          const clipped = text.length > 12000 ? `${text.slice(0, 12000)}\n…(truncated)` : text;
+          lines.push(`- ${relative} (${mime || 'text'}, ${bytes.length} bytes):\n\`\`\`\n${clipped}\n\`\`\``);
+        } else {
+          lines.push(`- ${relative} (${mime || 'application/octet-stream'}, ${bytes.length} bytes; read it with the read tool)`);
+        }
       } catch (error: any) {
         if (signal.aborted) throw error;
         lines.push(`- ${url} (download failed: ${error?.message || error})`);
@@ -293,8 +322,9 @@ export class Agent {
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
       const signal = this.taskManager.signal(taskId);
       if (options.attachments) {
-        const listing = await this.materializeAttachments(options.attachments, cwd, signal);
-        if (listing) prompt += `\n\nAttachments: the user uploaded the following files and they were downloaded into the workspace. Read them with the read/glob tools.\n${listing}`;
+        const visionModel = (options.model_id && options.model_id !== 'MOCR' ? options.model_id : this.settings.model_id) || '';
+        const listing = await this.materializeAttachments(options.attachments, cwd, signal, visionModel);
+        if (listing) prompt += `\n\nAttachments: the user uploaded these files. Text content is inlined and every file is also saved under .0kay/attachments in the workspace.\n${listing}`;
       }
       const context: AgentContext = {
         taskId,

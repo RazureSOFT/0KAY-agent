@@ -378,15 +378,19 @@ test('attachment metadata downloads into the workspace and sanitizes names', asy
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-att-'));
   try {
     const agent = new Agent();
+    (agent as any).mocr = { describeImage: async () => 'a screenshot of a cat' };
     const listing = await (agent as any).materializeAttachments(JSON.stringify([
       { name: '../evil name.txt', url: `http://127.0.0.1:${address.port}/api/files?file=file_1.txt`, mime: 'text/plain', size: 12 },
+      { name: 'shot.png', url: `http://127.0.0.1:${address.port}/api/files?file=file_2.png`, mime: 'image/png', size: 12 },
       { name: 'missing.bin', url: `http://127.0.0.1:${address.port}/nope`, mime: 'application/octet-stream', size: 0 },
     ]), dir, new AbortController().signal);
     assert.match(listing, /\.0kay\/attachments\/1-evil_name\.txt/);
+    assert.match(listing, /```\nATTACH-BYTES\n```/); // text inlined into the prompt
+    assert.match(listing, /description: a screenshot of a cat/); // image seen via the vision model
     assert.match(listing, /download failed/);
     const files = await fs.readdir(path.join(dir, '.0kay', 'attachments'));
-    assert.equal(files.length, 1);
-    assert.ok(!files[0].includes('..'));
+    assert.equal(files.length, 2);
+    assert.ok(!files.some((file) => file.includes('..')));
     assert.equal(await fs.readFile(path.join(dir, '.0kay', 'attachments', files[0]), 'utf8'), 'ATTACH-BYTES');
   } finally {
     server.close();

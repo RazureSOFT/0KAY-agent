@@ -117,11 +117,53 @@ export class MocrProvider {
     if (!response.ok) throw new Error(`Cannot load providers: HTTP ${response.status}`);
     const data: any = await response.json();
     const list: any[] = (Array.isArray(data) ? data : data.providers || []).filter((p: any) => p.enabled !== false);
-    const matches = list.filter(p => (!provider || p.provider === provider || p.id === provider) &&
-      (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) && !(p.disabled_models || []).includes(modelId));
-    const chosen = matches.find(p => p.id === data.default_provider_id) || matches[0];
-    if (!chosen) throw new Error(`No enabled provider configured for model ${modelId}`);
-    return { provider: chosen.provider || '', baseUrl: chosen.base_url || '', apiKey: chosen.api_key || '' };
+    const defaultProvider = list.find(p => p.id === data.default_provider_id);
+    let chosen: any;
+    if (modelId) {
+      const matches = list.filter(p => (!provider || p.provider === provider || p.id === provider) &&
+        (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) && !(p.disabled_models || []).includes(modelId));
+      chosen = matches.find(p => p.id === data.default_provider_id) || matches[0];
+      if (!chosen) throw new Error(`No enabled provider configured for model ${modelId}`);
+    } else {
+      chosen = defaultProvider || list[0];
+      if (!chosen) throw new Error('No enabled provider configured');
+    }
+    const resolvedModel = modelId || chosen.default_model || data.default_model ||
+      (chosen.models || []).map((m: any) => (typeof m === 'string' ? m : m.id || m.model_id)).filter(Boolean)[0] || '';
+    return { provider: chosen.provider || '', baseUrl: chosen.base_url || '', apiKey: chosen.api_key || '', format: chosen.format || '', model: resolvedModel };
+  }
+
+  /**
+   * Describe an image with a vision-capable provider model (OpenAI-compatible
+   * or Anthropic format). Used to make uploaded images visible to the text-only
+   * agent loop.
+   */
+  async describeImage(modelId: string, base64: string, mime = 'image/png', prompt = '', maxTokens = 1024, signal?: AbortSignal): Promise<string> {
+    if (!base64) return '';
+    const creds = await this.resolveCredentials(modelId, '', signal);
+    if (!creds.baseUrl) throw new Error('vision provider has no base_url');
+    const ask = prompt || 'Describe this image in two or three sentences.';
+    const endpoint = creds.baseUrl.replace(/\/$/, '');
+    const isAnthropic = String(creds.provider).toLowerCase() === 'anthropic' || String(creds.format).toLowerCase() === 'anthropic';
+    if (isAnthropic) {
+      const url = endpoint.endsWith('/v1') ? `${endpoint}/messages` : `${endpoint}/v1/messages`;
+      const res = await fetch(url, { method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-api-key': creds.apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mime, data: base64 } },
+        { type: 'text', text: ask },
+      ] }] }) });
+      if (!res.ok) throw new Error(`vision HTTP ${res.status}`);
+      const payload: any = await res.json();
+      return (payload.content || []).map((part: any) => part?.text || '').join('').trim();
+    }
+    const res = await fetch(`${endpoint}/chat/completions`, { method: 'POST', signal, headers: { 'content-type': 'application/json', Authorization: `Bearer ${creds.apiKey}` }, body: JSON.stringify({ model: creds.model, max_tokens: maxTokens, messages: [{ role: 'user', content: [
+      { type: 'text', text: ask },
+      { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
+    ] }] }) });
+    if (!res.ok) throw new Error(`vision HTTP ${res.status}`);
+    const payload: any = await res.json();
+    const content = payload.choices?.[0]?.message?.content;
+    if (Array.isArray(content)) return content.map((part: any) => part?.text || '').join('').trim();
+    return String(content || '').trim();
   }
 
   /**
