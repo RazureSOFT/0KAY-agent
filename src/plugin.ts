@@ -201,9 +201,9 @@ async function registerWithCore(proto: any): Promise<string | null> {
           {
             key: 'mcp_servers_json',
             type: 'text',
-            label: 'MCP 服务 JSON',
+            label: 'MCP 服务 JSON（回退）',
             defaultValue: '[]',
-            help: '例如 [{"id":"filesystem","transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","C:\\work"]}]',
+            help: '优先使用 设置 → MCP 的共享配置；这里仅在 Core 未提供 MCP 分组时作为回退',
           },
           {
             key: 'enable_plugin_tools',

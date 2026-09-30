@@ -206,6 +206,7 @@ export class Agent {
     }
     this.applyToolToggles();
     void this.refreshPluginTools();
+    void this.refreshMcpServers();
   }
 
   getSettings(): Readonly<Required<AgentSettings>> {
@@ -256,6 +257,26 @@ export class Agent {
       if (!def?.name || this.tools.get(def.name)) continue;
       this.tools.register(new PluginTool(def));
       this.pluginToolNames.add(def.name);
+    }
+  }
+
+  /**
+   * Load the shared MCP server list from Core (Settings → MCP) and configure
+   * the MCP manager. Falls back to the agent-local mcp_servers_json value.
+   */
+  private async refreshMcpServers(): Promise<void> {
+    try {
+      const res = await coreFetch(`${CORE_HTTP}/api/settings/mcp`, { headers: coreHeaders(), signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return;
+      const data: any = await res.json();
+      const raw = data?.values?.servers;
+      if (typeof raw !== 'string' || !raw.trim()) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      this.mcp.configure(parsed as McpServerConfig[]);
+      void this.mcp.refresh().catch((error) => console.warn('[Agent] MCP refresh failed:', error.message));
+    } catch {
+      // Keep the existing MCP configuration.
     }
   }
 
