@@ -394,6 +394,10 @@ export class Agent {
         const numericIntensity=Number(intensity)
         const difficultyHint = Number.isFinite(numericIntensity) ? Math.max(0,Math.min(100,numericIntensity))/100 : ({ off:0, low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5)
         const requireThinking = intensity !== 'off' && difficultyHint > 0
+        // Thinking budget scales with intensity: reasoning tokens count toward
+        // max_tokens for most reasoning models, so a flat default made every
+        // level look identical.
+        const maxTokens = Math.max(4096, Math.round(difficultyHint * 32768))
         let modelId = options.model_id === 'MOCR' ? '' : options.model_id || this.settings.model_id;
         if (!modelId) {
           modelId = await this.mocr.chooseModels(
@@ -431,6 +435,7 @@ export class Agent {
           thinking: requireThinking,
           difficultyHint,
           requireThinking,
+          maxTokens,
           tools: [...this.tools.listTools(),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}],
           toolChoice: 'auto',
           signal: context.signal,
