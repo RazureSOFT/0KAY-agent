@@ -390,3 +390,28 @@ test('attachment metadata becomes inlined text and multimodal image parts', asyn
     server.close();
   }
 });
+
+test('vision fallback retries on the configured vision model when images are rejected', async () => {
+  const agent = new Agent();
+  agent.applySettings({ vision_model: 'vision-x' });
+  assert.equal((agent as any).historyHasImages([{ role: 'user', content: '', parts: [{ type: 'image', imageUrl: 'data:image/png;base64,AA' }] }]), true);
+  assert.equal((agent as any).historyHasImages([{ role: 'user', content: 'hi' }]), false);
+
+  const calls: string[] = [];
+  (agent as any).mocr = { async *generate(req: any) {
+    calls.push(req.modelId);
+    if (req.modelId === 'text-x') throw new Error('model does not support image content');
+    yield { chunk: 'ok', done: true };
+  } };
+
+  let out = '';
+  for await (const chunk of (agent as any).generateWithVisionFallback({ modelId: 'text-x', messages: [{ role: 'user', content: '', parts: [{ type: 'image' }] }] })) out += chunk.chunk || '';
+  assert.equal(out, 'ok');
+  assert.deepEqual(calls, ['text-x', 'vision-x']);
+
+  calls.length = 0;
+  await assert.rejects(async () => {
+    for await (const _chunk of (agent as any).generateWithVisionFallback({ modelId: 'text-x', messages: [{ role: 'user', content: 'hi' }] })) { /* noop */ }
+  }, /support image/);
+  assert.deepEqual(calls, ['text-x']);
+});

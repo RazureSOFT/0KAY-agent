@@ -199,6 +199,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '允许 computeruse 在 Agent 所在 Windows 主机上截图、键盘和鼠标操作',
           },
           {
+            key: 'vision_model',
+            type: 'text',
+            label: '视觉回退模型',
+            defaultValue: '',
+            help: '当前模型不支持图片时，用这个模型重试本轮（留空则不回退）',
+          },
+          {
             key: 'enable_skills',
             type: 'bool',
             label: '技能系统',
@@ -317,7 +324,8 @@ async function pollAgentSettings(): Promise<void> {
       enable_web_tools: values.enable_web_tools !== false,
       enable_task_tool: values.enable_task_tool !== false,
       enable_mcp_tool: values.enable_mcp_tool !== false,
-      enable_computer_use: values.enable_computer_use === true,
+        enable_computer_use: values.enable_computer_use === true,
+        vision_model: typeof values.vision_model === 'string' ? values.vision_model : '',
       mcp_servers_json: typeof values.mcp_servers_json === 'string' ? values.mcp_servers_json : '[]',
       enable_skills: values.enable_skills !== false,
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',

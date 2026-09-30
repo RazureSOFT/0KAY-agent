@@ -2,7 +2,7 @@
  * Agent main loop - Core can trigger via gRPC
  */
 
-import { MocrProvider, Message, MessagePart, ToolCall } from '../provider/mocr.js';
+import { MocrProvider, Message, MessagePart, GenerateRequest, GenerateResponse, ToolCall } from '../provider/mocr.js';
 import { ToolRegistry, createDefaultRegistry } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
@@ -69,6 +69,7 @@ export interface AgentSettings {
   enable_filesystem_tool?: boolean;
   enable_web_tools?: boolean;
   enable_computer_use?: boolean;
+  vision_model?: string;
   enable_mcp_tool?: boolean;
   enable_task_tool?: boolean;
   mcp_servers_json?: string;
@@ -118,6 +119,7 @@ export class Agent {
       enable_filesystem_tool: true,
       enable_web_tools: true,
       enable_computer_use: false,
+      vision_model: '',
       enable_mcp_tool: true,
       enable_task_tool: true,
       mcp_servers_json: '[]',
@@ -165,6 +167,7 @@ export class Agent {
     }
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
+    if (typeof partial.vision_model === 'string') this.settings.vision_model = partial.vision_model.trim();
     if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
     if (typeof partial.enable_task_tool === 'boolean') this.settings.enable_task_tool = partial.enable_task_tool;
     if (typeof partial.mcp_servers_json === 'string' && partial.mcp_servers_json.trim() !== this.settings.mcp_servers_json) {
@@ -288,6 +291,31 @@ export class Agent {
     return { text: lines.join('\n'), images };
   }
 
+  /** True when any message in the history carries an image part. */
+  private historyHasImages(messages: Message[]): boolean {
+    return messages.some((message) => (message.parts || []).some((part) => part.type === 'image'));
+  }
+
+  /**
+   * Run a model request, retrying once on the configured vision model when the
+   * primary model rejects the attached images. The structured handoff schema is
+   * never involved here.
+   */
+  private async *generateWithVisionFallback(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
+    try {
+      yield* this.mocr.generate(request);
+    } catch (error: any) {
+      const vision = this.settings.vision_model;
+      const message = String(error?.message || error);
+      if (vision && vision !== request.modelId && this.historyHasImages(request.messages) && /image|vision|multimodal|modality|unsupported content|invalid content|content type|图片|不支持/i.test(message)) {
+        console.warn(`[Agent] vision fallback ${request.modelId} -> ${vision}: ${message}`);
+        yield* this.mocr.generate({ ...request, modelId: vision });
+        return;
+      }
+      throw error;
+    }
+  }
+
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
     // /{skill_name} [request] → force-apply that skill and use the rest as the task.
@@ -327,15 +355,9 @@ export class Agent {
 
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
-        // Unlimited iterations still need a bounded model context. Compact only
-        // between completed tool batches so call/result pairs remain intact.
-        if(context.history.reduce((size,message)=>size+message.content.length+JSON.stringify(message.toolCalls||[]).length,0)>80000 && lastModel){
-          let summary='';
-          const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
-          for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:transcript}],systemPrompt:COMPACTION_SCHEMA_PROMPT,tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:5000}))summary+=chunk.chunk||'';
-          if(!summary.trim())throw new Error('Context compaction returned no summary');
-          context.history=[{role:'user',content:prompt},{role:'assistant',content:`Structured context summary:\n${summary}`}];
-        }
+        // The agent never rewrites its own history into the structured handoff
+        // schema automatically; that only happens through the explicit /compact
+        // command (Core -> LIFE CompactConversation).
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
         // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
         const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
@@ -358,7 +380,7 @@ export class Agent {
         let finalText = '';
         let fullReasoning = '';
         let receivedNativeCalls = false;
-        for await (const chunk of this.mocr.generate({
+        for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
           systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence.`,
