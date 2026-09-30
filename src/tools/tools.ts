@@ -574,6 +574,11 @@ export class ComputerUseTool extends Tool {
     } catch { return false; }
   }
 
+  /** Run a PowerShell script through -EncodedCommand (quoting-safe). */
+  private powershell(script: string, context?: ToolContext, timeout = 30_000) {
+    return this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], context, timeout);
+  }
+
   private async requireCommand(name: string, context: ToolContext | undefined, hint: string): Promise<void> {
     if (!(await this.hasCommand(name, context))) throw new Error(`computeruse needs \`${name}\` on this host (${hint})`);
   }
@@ -588,7 +593,7 @@ export class ComputerUseTool extends Tool {
     if (process.platform === 'win32') {
       const q = (value: string) => "'" + value.replace(/'/g, "''") + "'";
       const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(" + q(png) + ",[System.Drawing.Imaging.ImageFormat]::Png); $mw=1280; if($b.Width -gt $mw){$nh=[int]($b.Height*$mw/$b.Width); $small=New-Object System.Drawing.Bitmap $mw,$nh; $g2=[System.Drawing.Graphics]::FromImage($small); $g2.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g2.DrawImage($bmp,0,0,$mw,$nh); $g2.Dispose(); $small.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg); $small.Dispose()} else {$bmp.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg)}; $g.Dispose(); $bmp.Dispose()";
-      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], context, 40_000);
+      await this.powershell(script, context, 40_000);
       previewPath = jpg; mime = 'image/jpeg';
     } else if (process.platform === 'darwin') {
       await this.run('screencapture', ['-x', png], context);
@@ -655,7 +660,7 @@ export class ComputerUseTool extends Tool {
     let windows: string[];
     if (process.platform === 'win32') {
       const script = "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { \"$($_.ProcessName) :: $($_.MainWindowTitle)\" }";
-      const { stdout } = await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], context);
+      const { stdout } = await this.powershell(script, context);
       windows = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     } else if (process.platform === 'darwin') {
       const script = 'tell application "System Events" to get name of (processes where background only is false)';
@@ -686,7 +691,7 @@ export class ComputerUseTool extends Tool {
     if (!text) throw new Error('text is required');
     if (process.platform === 'win32') {
       const escaped = text.replace(/[+^%~(){}\[\]]/g, (char) => `{${char}}`);
-      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`], context);
+      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`, context);
     } else if (process.platform === 'darwin') {
       await this.run('osascript', ['-e', `tell application "System Events" to keystroke "${appleScriptEscape(text)}"`], context);
     } else if (process.platform === 'linux') {
@@ -702,7 +707,7 @@ export class ComputerUseTool extends Tool {
     const raw = String(args.key ?? '');
     if (!raw) throw new Error('key is required');
     if (process.platform === 'win32') {
-      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`], context);
+      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`, context);
     } else if (process.platform === 'darwin') {
       await this.run('osascript', ['-e', `tell application "System Events" to ${appleScriptForKey(raw)}`], context);
     } else if (process.platform === 'linux') {
@@ -723,7 +728,7 @@ export class ComputerUseTool extends Tool {
     if (process.platform === 'win32') {
       const flags = click ? (button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
       const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + (flags ? flags.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '');
-      await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], context);
+      await this.powershell(script, context);
     } else if (process.platform === 'darwin') {
       await this.requireCommand('cliclick', context, 'brew install cliclick');
       const command = click ? `${button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
