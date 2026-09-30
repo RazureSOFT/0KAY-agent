@@ -237,23 +237,25 @@ export class MocrProvider {
       parent_id: request.taskId || '', session_id: request.sessionId || '', state: 'running' };
     await this.recorder.record(event);
     let text = '';
+    let reasoning = '';
     let lastPublished = 0;
     let publishing: Promise<void> | null = null;
     try {
       for await (const chunk of this.generateStream(request)) {
         text += chunk.chunk || '';
+        if (chunk.thinkingContent) reasoning += chunk.thinkingContent;
         if (chunk.done && chunk.text) text = chunk.text;
         if (!chunk.done && text && !publishing && Date.now() - lastPublished >= 200) {
-          publishing = this.recorder.record({ ...event, result: text }).catch(error=>console.warn('Progress delivery failed:',error.message)).finally(()=>{publishing=null});
+          publishing = this.recorder.record({ ...event, result: text, reasoning }).catch(error=>console.warn('Progress delivery failed:',error.message)).finally(()=>{publishing=null});
           lastPublished = Date.now();
         }
         if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_LENGTH', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) throw new Error(`Model finish: ${chunk.finishReason}`);
-        if (chunk.done) {await publishing;await this.recorder.record({ ...event, state: 'done', result: text });}
+        if (chunk.done) {await publishing;await this.recorder.record({ ...event, state: 'done', result: text, reasoning });}
         yield chunk;
       }
     } catch (error: any) {
       await publishing;
-      await this.recorder.record({ ...event, state: request.signal?.aborted ? 'cancelled' : 'failed', result: text, error: error.message });
+      await this.recorder.record({ ...event, state: request.signal?.aborted ? 'cancelled' : 'failed', result: text, error: error.message, reasoning });
       throw error;
     }
   }

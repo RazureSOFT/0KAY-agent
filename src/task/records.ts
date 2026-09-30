@@ -14,7 +14,7 @@ export class TaskRecorder {
         catch (error: any) { if (error.code !== 'ENOENT') throw error; this.pending = []; }
       }
         if (event) {
-          event={...event};for(const key of ['prompt','result','error','args']) if(typeof event[key]==='string' && event[key].length>200000) event[key]=event[key].slice(0,200000)+'\n[record truncated]';
+          event={...event};for(const key of ['prompt','result','error','args','reasoning']) if(typeof event[key]==='string' && event[key].length>200000) event[key]=event[key].slice(0,200000)+'\n[record truncated]';
         this.pending!.push(event);
       }
       await this.save();
