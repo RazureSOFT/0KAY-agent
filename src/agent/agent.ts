@@ -335,9 +335,9 @@ export class Agent {
       case 'medium':
         return 'Thinking budget: medium. Think the problem through at a normal depth before answering.';
       case 'high':
-        return 'Thinking budget: high. Reason thoroughly: break the problem down, weigh alternatives, check edge cases, and verify before answering.';
+        return 'Thinking budget: high. Reason thoroughly before answering: break the problem down, weigh alternatives, check edge cases, and verify your conclusion. In your reasoning, work through at least 4 distinct steps.';
       default:
-        return 'Thinking budget: maximum. Reason as deeply as possible: explore multiple angles, consider counter-examples and alternative approaches, and validate the conclusion before answering.';
+        return 'Thinking budget: maximum. Reason as deeply as possible before answering: explore multiple angles, consider counter-examples and alternative approaches, and validate the conclusion. In your reasoning, work through at least 6 distinct steps.';
     }
   }
 
