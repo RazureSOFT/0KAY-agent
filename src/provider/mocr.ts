@@ -98,6 +98,16 @@ const loaderOptions: protoLoader.Options = {
 let cachedStub: any = null
 let cachedAddress = ''
 
+/** Pull a context-window number out of a provider model object, if present. */
+function extractContextLength(value: any): number {
+  if (!value || typeof value !== 'object') return 0;
+  for (const key of ['context_length', 'context_window', 'max_context_length', 'max_input_tokens', 'input_token_limit', 'n_ctx', 'max_model_len']) {
+    const n = Number(value[key]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
 function getStub(address: string): any {
   if (cachedStub && cachedAddress === address) return cachedStub
   const def = protoLoader.loadSync(path.join(PROTO_DIR, 'mocr/v1/mocr.proto'), loaderOptions)
@@ -114,6 +124,7 @@ function getStub(address: string): any {
 export class MocrProvider {
   private config: MocrConfig;
   private selectedProviders = new Map<string, string>();
+  private contextLengths = new Map<string, number>();
   recorder = taskRecorder;
 
   constructor(config: MocrConfig) {
@@ -143,6 +154,46 @@ export class MocrProvider {
     const resolvedModel = modelId || chosen.default_model || data.default_model ||
       (chosen.models || []).map((m: any) => (typeof m === 'string' ? m : m.id || m.model_id)).filter(Boolean)[0] || '';
     return { provider: chosen.provider || '', baseUrl: chosen.base_url || '', apiKey: chosen.api_key || '', format: chosen.format || '', model: resolvedModel };
+  }
+
+  /**
+   * Best-effort context window (in tokens) for a model, read from the provider's
+   * `/models/{model}` (then the `/models` list). Cached; 0 when unknown.
+   */
+  async modelContextLength(modelId: string, signal?: AbortSignal): Promise<number> {
+    if (!modelId) return 0;
+    const cached = this.contextLengths.get(modelId);
+    if (cached !== undefined) return cached;
+    let length = 0;
+    try {
+      const creds = await this.resolveCredentials(modelId, '', signal);
+      const endpoint = String(creds.baseUrl || '').replace(/\/$/, '');
+      if (endpoint) {
+        const headers: Record<string, string> = { 'content-type': 'application/json' };
+        if (creds.apiKey) headers.Authorization = `Bearer ${creds.apiKey}`;
+        const timeout = signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000);
+        length = await this.contextLengthFrom(`${endpoint}/models/${encodeURIComponent(modelId)}`, headers, timeout);
+        if (!length) length = await this.contextLengthFrom(`${endpoint}/models`, headers, timeout, modelId);
+      }
+    } catch { /* best effort */ }
+    if (length > 0) this.contextLengths.set(modelId, length);
+    return length;
+  }
+
+  private async contextLengthFrom(url: string, headers: Record<string, string>, signal: AbortSignal, matchId = ''): Promise<number> {
+    try {
+      const response = await fetch(url, { headers, signal });
+      if (!response.ok) return 0;
+      const data: any = await response.json();
+      if (matchId) {
+        const list: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+        const target = matchId.toLowerCase();
+        const hit = list.find((m: any) => String(m?.id || '').toLowerCase() === target)
+          || list.find((m: any) => { const id = String(m?.id || '').toLowerCase(); return id && (id.includes(target) || target.includes(id)); });
+        return extractContextLength(hit) || extractContextLength(data);
+      }
+      return extractContextLength(data) || extractContextLength(data?.data);
+    } catch { return 0; }
   }
 
   /**

@@ -70,6 +70,8 @@ export interface AgentSettings {
   enable_web_tools?: boolean;
   enable_computer_use?: boolean;
   vision_model?: string;
+  /** Manual context window in tokens (0 = auto from the provider). */
+  context_window?: number;
   enable_mcp_tool?: boolean;
   enable_task_tool?: boolean;
   mcp_servers_json?: string;
@@ -120,6 +122,7 @@ export class Agent {
       enable_web_tools: true,
       enable_computer_use: false,
       vision_model: '',
+      context_window: 0,
       enable_mcp_tool: true,
       enable_task_tool: true,
       mcp_servers_json: '[]',
@@ -168,6 +171,7 @@ export class Agent {
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
     if (typeof partial.vision_model === 'string') this.settings.vision_model = partial.vision_model.trim();
+    if (typeof partial.context_window === 'number' && partial.context_window >= 0) this.settings.context_window = Math.floor(partial.context_window);
     if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
     if (typeof partial.enable_task_tool === 'boolean') this.settings.enable_task_tool = partial.enable_task_tool;
     if (typeof partial.mcp_servers_json === 'string' && partial.mcp_servers_json.trim() !== this.settings.mcp_servers_json) {
@@ -316,6 +320,33 @@ export class Agent {
     }
   }
 
+  /** Rough token estimate: ~4 chars per token plus a flat cost per image part. */
+  private estimateTokens(messages: Message[]): number {
+    let chars = 0;
+    let images = 0;
+    for (const message of messages) {
+      chars += message.content.length + JSON.stringify(message.toolCalls || []).length;
+      for (const part of message.parts || []) {
+        if (part.type === 'image') images += 1;
+        else chars += (part.text || '').length;
+      }
+    }
+    return Math.ceil(chars / 4) + images * 850;
+  }
+
+  private looksContextOverflow(error: any): boolean {
+    return /context length|context_length|maximum context|max context|too long|token limit|too many tokens|reduce the length|exceeds? the maximum|上下文|超出/i.test(String(error?.message || error));
+  }
+
+  /** Replace the run history with the structured compaction handoff summary. */
+  private async compactHistory(context: AgentContext, modelId: string, sessionId: string): Promise<void> {
+    let summary = '';
+    const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
+    for await (const chunk of this.mocr.generate({ modelId, messages: [{ role: 'user', content: transcript }], systemPrompt: COMPACTION_SCHEMA_PROMPT, tools: [], toolChoice: 'none', signal: context.signal, taskId: context.taskId, sessionId, maxTokens: 5000 })) summary += chunk.chunk || '';
+    if (!summary.trim()) throw new Error('Context compaction returned no summary');
+    context.history = [{ role: 'user', content: context.prompt }, { role: 'assistant', content: `Structured context summary:\n${summary}` }];
+  }
+
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
     // /{skill_name} [request] → force-apply that skill and use the rest as the task.
@@ -352,12 +383,10 @@ export class Agent {
 
       let result = '';
       let lastModel = this.settings.model_id;
+      let lastPromptTokens = 0;
 
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
-        // The agent never rewrites its own history into the structured handoff
-        // schema automatically; that only happens through the explicit /compact
-        // command (Core -> LIFE CompactConversation).
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
         // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
         const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
@@ -376,10 +405,24 @@ export class Agent {
         }
         lastModel = modelId;
 
+        // Automatic context compaction: only when the context is nearly full.
+        // The window is read from the provider's /models endpoint (context_length)
+        // and cached; a configured context_window overrides it. When neither is
+        // known, a provider overflow error below compacts reactively.
+        let contextLimit = this.settings.context_window || 0;
+        if (!contextLimit && typeof (this.mocr as any).modelContextLength === 'function') {
+          contextLimit = await this.mocr.modelContextLength(modelId, context.signal).catch(() => 0);
+        }
+        if (contextLimit > 0 && (lastPromptTokens || this.estimateTokens(context.history)) > contextLimit * 0.85) {
+          await this.compactHistory(context, modelId, context.sessionId);
+          lastPromptTokens = 0;
+        }
+
         let fullResponse = '';
         let finalText = '';
         let fullReasoning = '';
         let receivedNativeCalls = false;
+        try {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
@@ -399,6 +442,9 @@ export class Agent {
           }
           if (chunk.thinkingContent) {
             fullReasoning += chunk.thinkingContent;
+          }
+          if (chunk.usage && Number(chunk.usage.promptTokens) > 0) {
+            lastPromptTokens = Number(chunk.usage.promptTokens);
           }
           if (chunk.done) {
             if (chunk.finishReason === 'FINISH_REASON_ERROR' || chunk.finishReason === 'FINISH_REASON_LENGTH' || chunk.finishReason === 'FINISH_REASON_CONTENT_FILTER') throw new Error(`Model generation stopped: ${chunk.finishReason}`);
@@ -432,6 +478,14 @@ export class Agent {
             }
             break;
           }
+        }
+        } catch (error: any) {
+          if (this.looksContextOverflow(error) && context.history.length > 2) {
+            await this.compactHistory(context, modelId, context.sessionId);
+            lastPromptTokens = 0;
+            continue;
+          }
+          throw error;
         }
 
         if (result) break;

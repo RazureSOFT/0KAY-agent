@@ -387,6 +387,7 @@ test('attachment metadata becomes inlined text and multimodal image parts', asyn
     assert.equal(images[0].mimeType, 'image/png');
     assert.match(images[0].imageUrl || '', /^data:image\/png;base64,/); // image handed straight to the model
   } finally {
+    server.closeAllConnections?.();
     server.close();
   }
 });
@@ -415,3 +416,27 @@ test('vision fallback retries on the configured vision model when images are rej
   }, /support image/);
   assert.deepEqual(calls, ['text-x']);
 });
+
+test('agent parses a provider context window and detects overflow', async () => {
+  const agent = new Agent();
+  assert.equal((agent as any).looksContextOverflow(new Error('This model maximum context length is 32768 tokens')), true);
+  assert.equal((agent as any).looksContextOverflow(new Error('connection timeout')), false);
+  assert.equal((agent as any).estimateTokens([{ role: 'user', content: 'x'.repeat(400), parts: [{ type: 'image' }] }]), 101 + 850);
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'm1', context_length: 131072 }, { id: 'm2' }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address() as { port: number };
+  try {
+    const list = await (agent as any).mocr.contextLengthFrom(`http://127.0.0.1:${address.port}/models`, {}, new AbortController().signal, 'm1');
+    assert.equal(list, 131072);
+    const single = await (agent as any).mocr.contextLengthFrom(`http://127.0.0.1:${address.port}/models/m1`, {}, new AbortController().signal);
+    assert.equal(single, 0);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+

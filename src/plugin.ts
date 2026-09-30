@@ -206,6 +206,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '当前模型不支持图片时，用这个模型重试本轮（留空则不回退）',
           },
           {
+            key: 'context_window',
+            type: 'number',
+            label: '上下文窗口（tokens）',
+            defaultValue: '0',
+            help: '上下文快满时自动压缩的窗口；0 = 自动从 provider 的 /models 读取 context_length，读不到则不主动压缩',
+          },
+          {
             key: 'enable_skills',
             type: 'bool',
             label: '技能系统',
@@ -326,6 +333,7 @@ async function pollAgentSettings(): Promise<void> {
       enable_mcp_tool: values.enable_mcp_tool !== false,
         enable_computer_use: values.enable_computer_use === true,
         vision_model: typeof values.vision_model === 'string' ? values.vision_model : '',
+        context_window: Number(values.context_window || 0),
       mcp_servers_json: typeof values.mcp_servers_json === 'string' ? values.mcp_servers_json : '[]',
       enable_skills: values.enable_skills !== false,
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
