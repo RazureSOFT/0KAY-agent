@@ -684,6 +684,7 @@ The bash tool actually runs ${process.platform === 'win32' ? 'Windows cmd.exe: u
 Use write/edit for code files rather than shell echo or fragile command quoting.
 Report progress to the user in assistant text before tool actions. Preserve explanations and final results.
 Choose the smallest implementation satisfying the request. Avoid unnecessary features or repeated probes.
+For multi-step or long-running tasks (coding, research, analysis, anything needing several tool rounds), FIRST call the todowrite tool to lay out a short checklist plan and keep exactly one item in_progress. As soon as an item is finished, update the list with todowrite (mark it completed, or drop it) before starting the next, so the checklist reflects live progress. Skip the checklist for trivial single-step requests.
 Distinguish tool/program errors from expected diagnostic results: an unreachable host or nonzero probe exit code may be the correct test result. Report it honestly rather than rewriting working code to force success.
 
 Available tools:
