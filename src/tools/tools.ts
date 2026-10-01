@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { createHash, randomUUID } from 'crypto';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
-import { egressFetch, callPluginTool } from '../connection.js';
+import { egressFetch, callPluginTool, coreFetch, coreHeaders, coreHttpBase } from '../connection.js';
 
 const exec = promisify(execCallback);
 const MAX_OUTPUT = 120_000;
@@ -391,7 +391,7 @@ export class WebFetchTool extends Tool {
 
 export class WebSearchTool extends Tool {
   get name(): string { return 'websearch'; }
-  get description(): string { return 'Search the web through configured SearXNG and return titles, URLs, and snippets.'; }
+  get description(): string { return 'Search the web through Core and return titles, URLs, and snippets.'; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['query'], properties: {
       query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
@@ -400,17 +400,20 @@ export class WebSearchTool extends Tool {
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     try {
       if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
-      const base = (process.env.SEARXNG_URL || 'http://127.0.0.1:8888').replace(/\/$/, '');
-      const endpoint = new URL(`${base}/search`);
+      const endpoint = new URL(`${coreHttpBase()}/api/search`);
       endpoint.searchParams.set('q', args.query);
-      endpoint.searchParams.set('format', 'json');
-      const timeout = AbortSignal.timeout(30000);
-      const response = await egressFetch(endpoint.toString(), { headers: { Accept: 'application/json' }, signal: context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout }, 30000);
-      if (!response.ok) throw new Error(`SearXNG returned ${response.status}`);
-      const body: any = await response.json();
       const limit = clamp(args.numResults, 5, 1, 20);
-      const results = Array.isArray(body.results) ? body.results.slice(0, limit).map((item: any) => ({ title: item.title || '', url: item.url || '', snippet: item.content || '' })) : [];
-      return success({ query: args.query, engine: body?.answers?.length ? 'searxng' : 'searxng', results });
+      endpoint.searchParams.set('n', String(limit));
+      const timeout = AbortSignal.timeout(30000);
+      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
+      // Core owns the built-in search (no separate SearXNG service/port).
+      const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
+      if (!response.ok) throw new Error(`search returned ${response.status}`);
+      const body: any = await response.json();
+      const results = Array.isArray(body.results)
+        ? body.results.slice(0, limit).map((item: any) => ({ title: item.title || '', url: item.url || '', snippet: item.snippet || item.content || '' }))
+        : [];
+      return success({ query: args.query, engine: body?.engine || 'core', results });
     } catch (error) { return failure(error); }
   }
 }
