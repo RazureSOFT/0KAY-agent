@@ -107,6 +107,31 @@ const BUILTIN: AgentSkill[] = [
     tags: ['general'],
     source: 'builtin',
   },
+  {
+    name: 'science',
+    description: 'Self-directed research that produces figures and a .docx paper.',
+    content: [
+      'Objective: run a self-directed investigation on the request and deliver a figures-backed paper as a .docx file.',
+      '',
+      'Workflow:',
+      '1. Scope: restate the question; list objectives, hypotheses and success criteria.',
+      '2. Evidence: use websearch and webfetch to gather sources; record title, url and year for each.',
+      '3. Workspace: create ./research/<slug>/ and keep everything there; write raw data as CSV.',
+      '4. Analysis: write Python and run it with the bash tool (Windows: python script.py). Prefer numpy/pandas; fall back to the stdlib (csv, statistics, math).',
+      '5. Figures: render charts with matplotlib (do not use seaborn) at dpi=200 into figures/figN.png; label axes with units and add a legend where useful.',
+      '6. Paper: write paper.md containing Title, Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion and References.',
+      '7. DOCX: write make_docx.py using python-docx to build paper.docx with headings, paragraphs, tables and the figures embedded (python-docx Inches for width); run it. If python-docx is missing run: python -m pip install python-docx.',
+      '8. Verify paper.docx exists, then report its absolute path, the figure list and the source list.',
+      '',
+      'Rules:',
+      '- Never fabricate data or citations. Label any illustrative or synthetic data explicitly.',
+      '- Every figure must come from a script you actually ran; mention the script path.',
+      '- Keep the scripts, CSV data and figures so the result is reproducible.',
+      '- If Python or a library is unavailable, say so and still deliver paper.md plus whatever figures were produced.',
+    ].join('\n'),
+    tags: ['science', 'research', 'paper', 'docx'],
+    source: 'builtin',
+  },
 ]
 
 export class SkillRegistry {

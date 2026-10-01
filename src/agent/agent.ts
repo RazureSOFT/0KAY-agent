@@ -460,6 +460,8 @@ export class Agent {
         const rest = (slash[2] || '').trim();
         prompt = rest || `Follow the "${forceSkill}" skill to produce the standard output for this request.`;
       }
+      // A mode named after a skill activates it (e.g. agent_type "science").
+      if (!forceSkill && type && type !== 'general' && this.skills.get(type)) forceSkill = type;
     }
     this.taskManager.createTask(taskId, prompt, type);
     return this.taskManager.executeTask(taskId, async () => {
