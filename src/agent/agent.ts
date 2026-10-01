@@ -701,6 +701,24 @@ After tool results arrive, continue until the task is complete. Return a concise
 plain-text final answer when no further tools are needed.`;
   }
 
+  /** Approximate context composition (tokens) for the usage indicator. */
+  private contextBreakdown(cwd: string, conversationTokens: number, window: number) {
+    const tools = this.tools.listTools()
+    const toolDescriptions = tools.map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`).join('\n')
+    const skillBlock = this.settings.enable_skills ? `\n\n${this.skills.contextBlock('', undefined)}` : ''
+    let mcpChars = 0
+    try { mcpChars = this.mcp ? JSON.stringify(this.mcp.listTools()).length : 0 } catch { mcpChars = 0 }
+    const full = this.getSystemPrompt('', cwd, '')
+    const baseChars = Math.max(0, full.length - toolDescriptions.length - skillBlock.length)
+    const toTokens = (chars: number) => Math.round(chars / 4)
+    const system = toTokens(baseChars)
+    const toolTokens = toTokens(toolDescriptions.length)
+    const skillTokens = toTokens(skillBlock.length)
+    const mcpTokens = toTokens(mcpChars)
+    const conversation = Math.max(0, Math.round(conversationTokens))
+    return { window, system, tools: toolTokens, skills: skillTokens, mcp: mcpTokens, conversation, used: system + toolTokens + skillTokens + mcpTokens + conversation }
+  }
+
   private async executeToolCall(toolCall: ToolCall, context: AgentContext, agentType: string, depth: number) {
     context.signal.throwIfAborted();
     let args: Record<string, any> = {};
@@ -839,6 +857,13 @@ plain-text final answer when no further tools are needed.`;
       if (typeof parsed.allow !== 'boolean') return {success:false,result:'',error:'allow must be boolean'};
       const ok=this.approvals.decide(String(parsed.id || ''),parsed.allow);
       return {success:ok,result:JSON.stringify({ok}),error:ok?'':'Approval expired or not found'};
+    }
+    if (tool === 'context_usage') {
+      try {
+        const cwd = typeof parsed.cwd === 'string' && parsed.cwd ? parsed.cwd : process.cwd()
+        const breakdown = this.contextBreakdown(cwd, Number(parsed.conversation_tokens) || 0, Number(parsed.window) || 0)
+        return { success: true, result: JSON.stringify(breakdown), error: '' }
+      } catch (error: any) { return { success: false, result: '', error: error?.message || 'context_usage failed' } }
     }
     if (tool === 'host_status') {
       const sample = () => os.cpus().reduce((sum, cpu) => ({ idle: sum.idle + cpu.times.idle, total: sum.total + Object.values(cpu.times).reduce((a,b) => a+b,0) }), {idle:0,total:0});
