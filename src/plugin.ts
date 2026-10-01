@@ -268,7 +268,10 @@ async function registerWithCore(proto: any): Promise<string | null> {
         return
       }
 
-      client.Register(request, coreMetadata(), { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
+      const registrationMetadata = coreMetadata()
+      const registrationToken = process.env.CORE_PLUGIN_REGISTRATION_TOKEN?.trim()
+      if (registrationToken) registrationMetadata.set('x-0kay-registration-token', registrationToken)
+      client.Register(request, registrationMetadata, { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
         if (err) {
           console.error('[Agent] Register failed:', err.message)
           resolve(null)
