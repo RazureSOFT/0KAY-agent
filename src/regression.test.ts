@@ -10,6 +10,7 @@ import { ApprovalManager } from './task/approvals.js';
 import { QuestionManager } from './task/questions.js';
 import { classifyFailure } from './provider/failure.js';
 import { resolveRetryOptions, retryDelayMs, streamIdleTimeoutMs, shouldRetry } from './provider/retry.js';
+import { ContextLedger } from './context/ledger.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -474,4 +475,24 @@ test('retry policy and idle timeout bounds are env-tunable', () => {
   assert.equal(shouldRetry(classifyFailure({ code: 14 }), 0, opts, true), false);
   assert.equal(shouldRetry(classifyFailure(new Error('401')), 0, opts, false), false);
   assert.equal(shouldRetry(classifyFailure({ code: 14 }), 2, opts, false), false);
+});
+
+test('context ledger compresses, restores and searches', () => {
+  const history: any[] = [
+    { role: 'user', content: 'alpha' },
+    { role: 'assistant', content: 'beta' },
+    { role: 'user', content: 'remember needle-42' },
+  ];
+  const ledger = new ContextLedger(() => history);
+  const block = ledger.compress(0, 1, 'folded alpha and beta; no open threads');
+  assert.ok(block && block.id === 'blk1');
+  assert.equal(history.length, 2);
+  assert.match(String(history[0].content), /\[compressed blk1\]/);
+  assert.equal(history[1].content, 'remember needle-42');
+  assert.ok(ledger.search('folded').some((hit) => hit.where === 'summary'));
+  assert.ok(ledger.search('needle-42').length >= 1);
+  assert.equal((ledger.status() as any).compressed_blocks.length, 1);
+  assert.equal(ledger.decompress('blk1'), true);
+  assert.equal(history.length, 3);
+  assert.equal(ledger.decompress('blk1'), false);
 });

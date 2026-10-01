@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import * as path from 'path';
 import { stat, readdir, mkdir } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
+import { ContextLedger } from '../context/ledger.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
 import { execFile } from 'child_process';
@@ -30,7 +31,7 @@ export interface AgentConfig {
 
 /** Comma-separated tools that execute without approval prompts (bash intentionally excluded). */
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill';
+  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,compress,decompress,search_context,acp_status';
 
 /**
  * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
@@ -95,6 +96,8 @@ export interface AgentContext {
   sessionId: string;
   cwd: string;
   options: Record<string, string>;
+  /** Model-driven context compression ledger (billion-context style). */
+  ledger?: ContextLedger;
 }
 
 export class Agent {
@@ -479,6 +482,9 @@ export class Agent {
         cwd,
         options: forceSkill ? { ...options, force_skill: forceSkill } : options,
       };
+      // Model-driven context compression: the model folds ranges via the
+      // compress/decompress/search_context/acp_status tools as context grows.
+      context.ledger = new ContextLedger(() => context.history);
 
       let result = '';
       let lastModel = this.settings.model_id;
@@ -554,7 +560,8 @@ export class Agent {
             fullReasoning += chunk.thinkingContent;
           }
           if (chunk.usage && Number(chunk.usage.promptTokens) > 0) {
-            lastPromptTokens = Number(chunk.usage.promptTokens);
+              lastPromptTokens = Number(chunk.usage.promptTokens);
+              if (context.ledger) context.ledger.lastPromptTokens = lastPromptTokens;
           }
           if (chunk.done) {
             if (chunk.finishReason === 'FINISH_REASON_ERROR' || chunk.finishReason === 'FINISH_REASON_LENGTH' || chunk.finishReason === 'FINISH_REASON_CONTENT_FILTER') throw new Error(`Model generation stopped: ${chunk.finishReason}`);
@@ -711,6 +718,8 @@ plain-text final answer when no further tools are needed.`;
       agentType,
       todo: context.todo,
       mcp: this.mcp,
+      history: context.history,
+      ledger: context.ledger,
       signal: context.signal,
       runSubAgent: depth >= 2
         ? undefined
