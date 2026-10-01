@@ -45,6 +45,7 @@ export interface McpClientLike {
 export interface ToolContext {
   cwd: string;
   taskId: string;
+  sessionId?: string;
   agentType: string;
   todo: TodoItem[];
   runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
@@ -859,7 +860,7 @@ export class PluginTool extends Tool {
   }
   get dangerous(): boolean { return !!this.def.dangerous; }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    const result = await callPluginTool(this.def.name, args || {}, context?.taskId || '', `agent:${context?.agentType || 'general'}`);
+    const result = await callPluginTool(this.def.name, args || {}, context?.sessionId || context?.taskId || '', `agent:${context?.agentType || 'general'}`);
     if (result.success) return success(result.result);
     return failure(result.error || 'plugin tool failed');
   }

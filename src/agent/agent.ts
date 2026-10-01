@@ -718,6 +718,7 @@ plain-text final answer when no further tools are needed.`;
     return this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
       cwd: context.cwd,
       taskId: context.taskId,
+      sessionId: context.sessionId,
       agentType,
       todo: context.todo,
       mcp: this.mcp,
