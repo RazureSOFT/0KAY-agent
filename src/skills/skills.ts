@@ -223,7 +223,9 @@ export class SkillRegistry {
   contextBlock(text = '', forceName?: string): string {
     const all = this.list()
     if (!all.length) return 'No agent skills loaded.'
-    const lines = ['Available agent skills (follow when relevant):']
+    const lines = [
+      'Available agent skills. A skill is an on-demand playbook: when one fits the task, you may choose to call the "skill" tool with {"name":"<skill>"} to load its full instructions and then follow them. This selection is yours to make; skip skills that do not apply.',
+    ]
     for (const s of all) lines.push(`- ${s.name}: ${s.description}`)
     const forced = forceName ? this.get(forceName) : undefined
     const match = forced || this.match(text)
