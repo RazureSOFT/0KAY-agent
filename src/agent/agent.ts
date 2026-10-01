@@ -13,6 +13,10 @@ import { stat, readdir, mkdir } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 import { taskRecorder } from '../task/records.js';
 import { coreFetch, coreHeaders, listPluginTools } from '../connection.js';
 
@@ -480,6 +484,12 @@ export class Agent {
       let lastModel = this.settings.model_id;
       let lastPromptTokens = 0;
 
+      // Workspace snapshot (git state) so the model knows the repo it is in.
+      try {
+        const note = await this.workspaceContext(cwd);
+        if (note) context.options.workspace_note = note;
+      } catch { /* not a repo or git unavailable */ }
+
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
@@ -525,7 +535,7 @@ export class Agent {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`,
+          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}` + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : ''),
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,
@@ -620,6 +630,32 @@ export class Agent {
       }
       return result;
     }, depth > 0);
+  }
+
+  /**
+   * Compact git state for the workspace, injected into the system prompt so the
+   * model knows the branch, pending changes and recent history (ZCode-style).
+   */
+  private async workspaceContext(cwd: string): Promise<string> {
+    const git = async (args: string[]): Promise<string> => {
+      try {
+        const { stdout } = await execFileAsync('git', args, { cwd, timeout: 4000, maxBuffer: 256 * 1024, windowsHide: true });
+        return String(stdout || '').trim();
+      } catch {
+        return '';
+      }
+    };
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (!branch) return '';
+    const [status, log, diff] = await Promise.all([
+      git(['status', '--porcelain']),
+      git(['log', '--oneline', '-5']),
+      git(['diff', '--stat', 'HEAD']),
+    ]);
+    const lines = [`git branch: ${branch}`, `changed files: ${status ? status.split('\n').filter(Boolean).length : 0}`];
+    if (log) lines.push('recent commits:\n' + log);
+    if (diff) lines.push('uncommitted diff stat:\n' + diff.split('\n').slice(0, 20).join('\n'));
+    return lines.join('\n');
   }
 
   private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = ''): string {
