@@ -207,6 +207,7 @@ export class Agent {
     this.applyToolToggles();
     void this.refreshPluginTools();
     void this.refreshMcpServers();
+    void this.refreshPluginSkills();
   }
 
   getSettings(): Readonly<Required<AgentSettings>> {
@@ -261,23 +262,52 @@ export class Agent {
   }
 
   /**
-   * Load the shared MCP server list from Core (Settings → MCP) and configure
-   * the MCP manager. Falls back to the agent-local mcp_servers_json value.
+   * Load the shared MCP server list from Core (Settings → MCP) plus any
+   * plugin-contributed servers and configure the MCP manager. A user-configured
+   * server wins over a plugin one with the same id.
    */
   private async refreshMcpServers(): Promise<void> {
+    const servers: McpServerConfig[] = [];
     try {
       const res = await coreFetch(`${CORE_HTTP}/api/settings/mcp`, { headers: coreHeaders(), signal: AbortSignal.timeout(8000) });
-      if (!res.ok) return;
-      const data: any = await res.json();
-      const raw = data?.values?.servers;
-      if (typeof raw !== 'string' || !raw.trim()) return;
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return;
-      this.mcp.configure(parsed as McpServerConfig[]);
+      if (res.ok) {
+        const data: any = await res.json();
+        const raw = data?.values?.servers;
+        if (typeof raw === 'string' && raw.trim()) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) servers.push(...(parsed as McpServerConfig[]));
+        }
+      }
+    } catch { /* keep whatever we have */ }
+    try {
+      const res = await coreFetch(`${CORE_HTTP}/api/plugins/capabilities`, { headers: coreHeaders(), signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const caps: any = await res.json();
+        const seen = new Set(servers.map((server) => server.id));
+        for (const entry of caps?.mcp_servers || []) {
+          const config = entry?.config as McpServerConfig | undefined;
+          if (config?.id && !seen.has(config.id)) { servers.push(config); seen.add(config.id); }
+        }
+      }
+    } catch { /* keep whatever we have */ }
+    if (servers.length) {
+      this.mcp.configure(servers);
       void this.mcp.refresh().catch((error) => console.warn('[Agent] MCP refresh failed:', error.message));
-    } catch {
-      // Keep the existing MCP configuration.
     }
+  }
+
+  /** Load skill directories contributed by installed plugins. */
+  private async refreshPluginSkills(): Promise<void> {
+    if (!this.settings.enable_skills) return;
+    try {
+      const res = await coreFetch(`${CORE_HTTP}/api/plugins/capabilities`, { headers: coreHeaders(), signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return;
+      const caps: any = await res.json();
+      for (const skill of caps?.skills || []) {
+        if (!skill?.path) continue;
+        try { this.skills.loadDir(skill.path); } catch { /* ignore a bad skill dir */ }
+      }
+    } catch { /* ignore */ }
   }
 
   /**
