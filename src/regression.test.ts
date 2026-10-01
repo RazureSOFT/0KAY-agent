@@ -7,7 +7,9 @@ import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
 import { ShellTool, ComputerUseTool, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
 import { ApprovalManager } from './task/approvals.js';
-import {QuestionManager} from './task/questions.js';
+import { QuestionManager } from './task/questions.js';
+import { classifyFailure } from './provider/failure.js';
+import { resolveRetryOptions, retryDelayMs, streamIdleTimeoutMs, shouldRetry } from './provider/retry.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -438,4 +440,38 @@ test('thinking intensity maps to distinct prompt directives', () => {
   assert.match(d('high', 0.75), /high/);
   assert.match(d('max', 1), /maximum/);
   assert.notEqual(d('low', 0.2), d('max', 1));
+});
+
+test('model failures classify into retryable reasons', () => {
+  assert.equal(classifyFailure({ code: 14, message: 'unavailable' }).reason, 'network');
+  assert.equal(classifyFailure({ code: 14 }).retryable, true);
+  assert.equal(classifyFailure({ code: 8 }).reason, 'rate-limited');
+  assert.equal(classifyFailure(new Error('HTTP 429 rate limited')).reason, 'rate-limited');
+  assert.equal(classifyFailure(new Error('This model maximum context length is 32768 tokens')).reason, 'context-exceeded');
+  assert.equal(classifyFailure(new Error('401 authentication failed')).retryable, false);
+  assert.equal(classifyFailure(new Error('ECONNREFUSED 127.0.0.1')).reason, 'network');
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal(classifyFailure(new Error('boom'), aborted.signal).reason, 'cancelled');
+  assert.equal(classifyFailure(Object.assign(new Error('x'), { code: 'MODEL_STREAM_IDLE_TIMEOUT' })).reason, 'idle-timeout');
+  assert.equal(classifyFailure(new Error('retry-after: 3')).retryAfterMs, 3000);
+});
+
+test('retry policy and idle timeout bounds are env-tunable', () => {
+  const opts = resolveRetryOptions({
+    OKAY_AGENT_MODEL_RETRY_MAX_RETRIES: '2',
+    OKAY_AGENT_MODEL_RETRY_BASE_DELAY_MS: '1000',
+    OKAY_AGENT_MODEL_RETRY_JITTER: '0',
+  });
+  assert.equal(opts.maxAttempts, 3);
+  assert.equal(retryDelayMs(0, opts), 1000);
+  assert.equal(retryDelayMs(1, opts), 2000);
+  assert.equal(retryDelayMs(0, opts, 5000), 5000);
+  assert.equal(streamIdleTimeoutMs(0, { OKAY_AGENT_STREAM_IDLE_MS: '90000' }), 90000);
+  assert.equal(streamIdleTimeoutMs(2, { OKAY_AGENT_STREAM_IDLE_MS: '90000' }), 150000);
+
+  assert.equal(shouldRetry(classifyFailure({ code: 14 }), 0, opts, false), true);
+  assert.equal(shouldRetry(classifyFailure({ code: 14 }), 0, opts, true), false);
+  assert.equal(shouldRetry(classifyFailure(new Error('401')), 0, opts, false), false);
+  assert.equal(shouldRetry(classifyFailure({ code: 14 }), 2, opts, false), false);
 });

@@ -8,6 +8,7 @@ import * as path from 'path'
 import { fileURLToPath } from 'url'
 import { taskRecorder } from '../task/records.js'
 import {coreHeaders,coreCredentials,coreOptions,coreMetadata,coreFetch,egressFetch} from '../connection.js'
+import {classifyFailure,resolveRetryOptions,retryDelayMs,streamIdleTimeoutMs,sleep,shouldRetry,nextWithIdleTimeout,ModelEmptyCompletionError} from './retry.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -266,9 +267,31 @@ export class MocrProvider {
   }
 
   private async *generateStream(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
+    const creds = request.baseUrl && request.apiKey ? request : await this.resolveCredentials(request.modelId, request.provider || this.selectedProviders.get(request.modelId), request.signal);
+    const options = resolveRetryOptions();
+    for (let attempt = 0; ; attempt++) {
+      let emitted = false;
+      try {
+        yield* this.attemptGenerate(request, creds, streamIdleTimeoutMs(attempt), () => { emitted = true; });
+        return;
+      } catch (error) {
+        const failure = classifyFailure(error, request.signal);
+        if (!shouldRetry(failure, attempt, options, emitted)) throw error;
+        const delay = retryDelayMs(attempt, options, failure.retryAfterMs);
+        console.warn(`[Agent] model attempt ${attempt + 1} failed (${failure.reason}); retrying in ${delay}ms`);
+        await sleep(delay, request.signal);
+      }
+    }
+  }
+
+  private async *attemptGenerate(
+    request: GenerateRequest,
+    creds: { provider?: string; baseUrl?: string; apiKey?: string },
+    idleMs: number,
+    onEmit: () => void,
+  ): AsyncGenerator<GenerateResponse> {
     const stub = getStub(this.config.grpcAddress);
     request.signal?.throwIfAborted();
-    const creds = request.baseUrl && request.apiKey ? request : await this.resolveCredentials(request.modelId, request.provider || this.selectedProviders.get(request.modelId), request.signal);
 
     const payload: any = {
       modelId: request.modelId,
@@ -324,10 +347,15 @@ export class MocrProvider {
     const cancel = () => stream.cancel();
     request.signal?.addEventListener('abort', cancel, { once: true });
     if (request.signal?.aborted) cancel();
+    const iterator = stream[Symbol.asyncIterator]();
 
     try {
       let completed = false;
-      for await (const resp of stream) {
+      let sawPayload = false;
+      for (;;) {
+        const result = await nextWithIdleTimeout(iterator, idleMs, cancel);
+        if (result.done) break;
+        const resp: any = result.value;
         const out: GenerateResponse = {
           chunk: resp.chunk || undefined,
           done: !!resp.done,
@@ -351,7 +379,12 @@ export class MocrProvider {
             totalTokens: Number(resp.usage.totalTokens || 0),
           }
         }
-        yield out
+        const hasPayload = !!(out.chunk || out.thinkingContent || (out.toolCalls && out.toolCalls.length) || (out.done && out.text));
+        if (hasPayload) { sawPayload = true; onEmit(); }
+        // A done frame with no text/tool calls is worth one clean retry rather
+        // than surfacing an empty answer (mirrors ZCode's empty-completion retry).
+        if (resp.done && !sawPayload) throw new ModelEmptyCompletionError();
+        yield out;
         if (resp.done) { completed = true; break; }
       }
       if (!completed) throw new Error('Model stream ended without completion');
