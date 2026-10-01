@@ -82,6 +82,24 @@ function limitOutput(value: string): { text: string; truncated: boolean } {
   return { text: `${value.slice(0, MAX_OUTPUT)}\n\n[output truncated]`, truncated: true };
 }
 
+// Above this many characters a command's output is spilled to a file and only a
+// preview is returned, so the model can read the rest in chunks (ZCode-style).
+const SPILL_THRESHOLD = Number(process.env.OKAY_AGENT_OUTPUT_SPILL_BYTES || 30_000);
+
+async function spillOutput(value: string, taskId: string, label: string): Promise<{ text: string; truncated: boolean; fullPath?: string }> {
+  if (value.length <= SPILL_THRESHOLD) return { text: value, truncated: false };
+  const capped = limitOutput(value);
+  try {
+    const dir = path.join(os.tmpdir(), '0kay-agent-output');
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${(taskId || 'task').replace(/[^\w.-]+/g, '_')}-${label}.log`);
+    await fs.writeFile(file, value, 'utf8');
+    return { text: `${capped.text}\n\n[full ${label} (${value.length} chars) saved to ${file}]`, truncated: true, fullPath: file };
+  } catch {
+    return capped;
+  }
+}
+
 function resolvePath(input: unknown, cwd: string): string {
   if (typeof input !== 'string' || !input.trim()) throw new Error('path is required');
   return path.resolve(cwd, input);
@@ -325,7 +343,7 @@ export class ShellTool extends Tool {
       try {
         const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
           const command = process.platform === 'win32' ? `chcp 65001 >nul & ${args.command}` : args.command;
-          const child = execCallback(command, { cwd, maxBuffer: MAX_OUTPUT, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }, (error, stdout, stderr) => {
+          const child = execCallback(command, { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }, (error, stdout, stderr) => {
             clearTimeout(timer);
             context.signal?.removeEventListener('abort', cancel);
             if (error) reject(Object.assign(error, { stdout, stderr }));
@@ -340,12 +358,12 @@ export class ShellTool extends Tool {
           context.signal?.addEventListener('abort', cancel, { once: true });
           if (context.signal?.aborted) cancel();
         });
-        const stdout = limitOutput(result.stdout || '');
-        const stderr = limitOutput(result.stderr || '');
-        return success({ cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated });
+        const stdout = await spillOutput(result.stdout || '', context.taskId, 'stdout');
+        const stderr = await spillOutput(result.stderr || '', context.taskId, 'stderr');
+        return success({ cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
       } catch (error: any) {
-        const stdout = limitOutput(String(error.stdout || ''));
-        const stderr = limitOutput(String(error.stderr || error.message || 'command failed'));
+        const stdout = await spillOutput(String(error.stdout || ''), context.taskId, 'stdout');
+        const stderr = await spillOutput(String(error.stderr || error.message || 'command failed'), context.taskId, 'stderr');
         return { success: false, data: { cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
       }
     } catch (error) { return failure(error); }
