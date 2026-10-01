@@ -251,7 +251,7 @@ export class MocrProvider {
         text += chunk.chunk || '';
         if (chunk.thinkingContent) reasoning += chunk.thinkingContent;
         if (chunk.done && chunk.text) text = chunk.text;
-        if (!chunk.done && text && !publishing && Date.now() - lastPublished >= 200) {
+        if (!chunk.done && (text || reasoning) && !publishing && Date.now() - lastPublished >= 200) {
           publishing = this.recorder.record({ ...event, result: text, reasoning }).catch(error=>console.warn('Progress delivery failed:',error.message)).finally(()=>{publishing=null});
           lastPublished = Date.now();
         }
