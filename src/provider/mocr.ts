@@ -31,6 +31,8 @@ export interface GenerateRequest {
   toolChoice?: 'auto' | 'none' | 'required' | string;
   signal?: AbortSignal;
   taskId?: string;
+  /** Unique id for this logical generation (reused across retries). */
+  requestId?: string;
   sessionId?: string;
 }
 
@@ -144,9 +146,18 @@ export class MocrProvider {
     const defaultProvider = list.find(p => p.id === data.default_provider_id);
     let chosen: any;
     if (modelId) {
-      const matches = list.filter(p => (!provider || p.provider === provider || p.id === provider) &&
-        (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) && !(p.disabled_models || []).includes(modelId));
-      chosen = matches.find(p => p.id === data.default_provider_id) || matches[0];
+      // The provider hint from MOCR is the preset name (e.g. "custom"), while
+      // this endpoint normalizes `provider` to the effective wire protocol
+      // (e.g. "openai"), so the id/model must decide. Match by model, and use
+      // the hint only to break ties.
+      const byModel = list.filter(p =>
+        (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) &&
+        !(p.disabled_models || []).includes(modelId));
+      if (provider) {
+        const byProvider = byModel.filter(p => p.provider === provider || p.id === provider);
+        chosen = byProvider.find(p => p.id === data.default_provider_id) || byProvider[0];
+      }
+      if (!chosen) chosen = byModel.find(p => p.id === data.default_provider_id) || byModel[0];
       if (!chosen) throw new Error(`No enabled provider configured for model ${modelId}`);
     } else {
       chosen = defaultProvider || list[0];
@@ -269,10 +280,17 @@ export class MocrProvider {
   private async *generateStream(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
     const creds = request.baseUrl && request.apiKey ? request : await this.resolveCredentials(request.modelId, request.provider || this.selectedProviders.get(request.modelId), request.signal);
     const options = resolveRetryOptions();
+    // One request-id per logical generation, reused across retries so a retry
+    // cannot double-count. It must be unique per call: mocr keys its usage
+    // outbox by request-id, so reusing a task id for every turn of a task would
+    // overwrite earlier turns and massively under-count usage.
+    const scoped: GenerateRequest = request.requestId
+      ? request
+      : { ...request, requestId: `${request.taskId || 'agent-model'}:${crypto.randomUUID()}` };
     for (let attempt = 0; ; attempt++) {
       let emitted = false;
       try {
-        yield* this.attemptGenerate(request, creds, streamIdleTimeoutMs(attempt), () => { emitted = true; });
+        yield* this.attemptGenerate(scoped, creds, streamIdleTimeoutMs(attempt), () => { emitted = true; });
         return;
       } catch (error) {
         const failure = classifyFailure(error, request.signal);
@@ -340,7 +358,8 @@ export class MocrProvider {
 
     const metadata=coreMetadata();
     if(request.sessionId) metadata.set('x-0kay-session-id', request.sessionId);
-    if(request.taskId) metadata.set('x-0kay-request-id', request.taskId);
+    const requestId = request.requestId || request.taskId;
+    if(requestId) metadata.set('x-0kay-request-id', requestId);
     const difficulty=request.difficultyHint ?? 0.5;
     metadata.set('x-0kay-thinking-level',!request.thinking?'off':difficulty<=0.25?'low':difficulty<0.7?'medium':difficulty<1?'high':'max');
     const stream = stub.Generate(payload, metadata, { deadline: Date.now() + 300_000 });

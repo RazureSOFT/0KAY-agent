@@ -27,3 +27,7 @@ github_check.py
 /rdap.json
 /repos.json
 /repos/
+
+# Local working documents (not project artifacts)
+/GitHub数据统计.xlsx
+/习惯、认知控制与记忆的多系统计算模型.docx

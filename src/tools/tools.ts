@@ -4,6 +4,8 @@
  */
 
 import { exec as execCallback, execFile } from 'child_process';
+import { existsSync } from 'fs';
+import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -12,8 +14,12 @@ import { createHash, randomUUID } from 'crypto';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { egressFetch, callPluginTool, coreFetch, coreHeaders, coreHttpBase } from '../connection.js';
 import type { ContextLedger } from '../context/ledger.js';
+import { buildDocx, buildPptx, type DocBlock, type SlideSpec } from './office.js';
+import { browserController } from './browser.js';
 
 const exec = promisify(execCallback);
+// ESM has no __dirname; used to locate the sibling `life/src` package.
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const MAX_OUTPUT = 120_000;
 const MAX_FILE_BYTES = 2_000_000;
 
@@ -331,23 +337,74 @@ export class GrepTool extends Tool {
   }
 }
 
+interface ShellRequest {
+  command: string;
+  cwd?: string;
+  timeout?: number;
+  /** Distinguishes spill files when several commands run in parallel. */
+  label: string;
+}
+
 export class ShellTool extends Tool {
   get name(): string { return 'bash'; }
-  get description(): string { return `Run a command using ${process.platform === 'win32' ? 'Windows cmd.exe (NOT bash or PowerShell). Use dir/cd and &&, not pwd/ls or semicolons.' : '/bin/sh' } Use cwd and timeout when needed.`; }
+  get description(): string {
+    return `Run shell command(s) using ${process.platform === 'win32' ? 'Windows cmd.exe (NOT bash or PowerShell). Use dir/cd and &&, not pwd/ls or semicolons.' : '/bin/sh'}. Pass one command in command, or several independent ones in commands to run them all in parallel and get one result per command (e.g. build + test + lint at once). Use cwd and timeout (ms) when needed.`;
+  }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
-    return { type: 'object', required: ['command'], properties: {
-      command: { type: 'string' }, cwd: { type: 'string' }, timeout: { type: 'integer', minimum: 1000, maximum: 300000 },
+    return { type: 'object', properties: {
+      command: { type: 'string', description: 'A single command to run.' },
+      commands: { type: 'array', minItems: 1, description: 'Independent commands to run in parallel. Each entry is a string, or an object {command, cwd?, timeout?}.', items: { anyOf: [
+        { type: 'string' },
+        { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string' }, timeout: { type: 'integer', minimum: 1000, maximum: 300000 } }, required: ['command'] },
+      ] } },
+      cwd: { type: 'string' }, timeout: { type: 'integer', minimum: 1000, maximum: 300000 },
     }};
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
-      if (typeof args.command !== 'string' || !args.command.trim()) throw new Error('command is required');
-      const cwd = args.cwd ? resolvePath(args.cwd, context.cwd) : context.cwd;
-      const timeout = clamp(args.timeout, 30_000, 1_000, 300_000);
+      const requests: ShellRequest[] = [];
+      if (Array.isArray(args.commands) && args.commands.length) {
+        args.commands.forEach((entry: any, index: number) => {
+          const spec = typeof entry === 'string' ? { command: entry } : (entry || {});
+          const command = String(spec.command ?? '');
+          if (!command.trim()) throw new Error(`commands[${index}].command is required`);
+          requests.push({
+            command,
+            cwd: spec.cwd != null ? String(spec.cwd) : undefined,
+            timeout: spec.timeout != null ? Number(spec.timeout) : undefined,
+            label: String(index + 1),
+          });
+        });
+      } else {
+        if (typeof args.command !== 'string' || !args.command.trim()) throw new Error('command is required (or pass commands:[] to run several in parallel)');
+        requests.push({
+          command: args.command,
+          cwd: args.cwd != null ? String(args.cwd) : undefined,
+          timeout: args.timeout != null ? Number(args.timeout) : undefined,
+          label: '',
+        });
+      }
+      const results = await Promise.all(requests.map((request) => this.runOne(request, args, context)));
+      if (results.length === 1) return results[0];
+      const failed = results.filter((result) => !result.success).length;
+      return {
+        success: failed === 0,
+        data: { parallel: results.length, failed, results: results.map((result) => result.data) },
+        error: failed ? `${failed} of ${results.length} parallel commands failed (see results[].stderr)` : undefined,
+      };
+    } catch (error) { return failure(error); }
+  }
+
+  private async runOne(request: ShellRequest, args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    try {
+      const cwd = request.cwd ? resolvePath(request.cwd, context.cwd) : context.cwd;
+      const timeout = clamp(request.timeout ?? args.timeout, 30_000, 1_000, 300_000);
+      const stdoutLabel = request.label ? `stdout-${request.label}` : 'stdout';
+      const stderrLabel = request.label ? `stderr-${request.label}` : 'stderr';
       try {
         const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-          const command = process.platform === 'win32' ? `chcp 65001 >nul & ${args.command}` : args.command;
+          const command = process.platform === 'win32' ? `chcp 65001 >nul & ${request.command}` : request.command;
           const child = execCallback(command, { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }, (error, stdout, stderr) => {
             clearTimeout(timer);
             context.signal?.removeEventListener('abort', cancel);
@@ -357,19 +414,23 @@ export class ShellTool extends Tool {
           const cancel = () => {
             if (process.platform === 'win32' && child.pid) {
               execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
-            } else child.kill('SIGTERM');
+            } else {
+              child.kill('SIGTERM');
+              // Escalate in case the child ignores SIGTERM.
+              setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
+            }
           };
           const timer = setTimeout(cancel, timeout);
           context.signal?.addEventListener('abort', cancel, { once: true });
           if (context.signal?.aborted) cancel();
         });
-        const stdout = await spillOutput(result.stdout || '', context.taskId, 'stdout');
-        const stderr = await spillOutput(result.stderr || '', context.taskId, 'stderr');
-        return success({ cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
+        const stdout = await spillOutput(result.stdout || '', context.taskId, stdoutLabel);
+        const stderr = await spillOutput(result.stderr || '', context.taskId, stderrLabel);
+        return success({ command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
       } catch (error: any) {
-        const stdout = await spillOutput(String(error.stdout || ''), context.taskId, 'stdout');
-        const stderr = await spillOutput(String(error.stderr || error.message || 'command failed'), context.taskId, 'stderr');
-        return { success: false, data: { cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
+        const stdout = await spillOutput(String(error.stdout || ''), context.taskId, stdoutLabel);
+        const stderr = await spillOutput(String(error.stderr || error.message || 'command failed'), context.taskId, stderrLabel);
+        return { success: false, data: { command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
       }
     } catch (error) { return failure(error); }
   }
@@ -437,6 +498,64 @@ export class WebSearchTool extends Tool {
         ? body.results.slice(0, limit).map((item: any) => ({ title: item.title || '', url: item.url || '', snippet: item.snippet || item.content || '' }))
         : [];
       return success({ query: args.query, engine: body?.engine || 'core', results });
+    } catch (error) { return failure(error); }
+  }
+}
+
+/** Shared parser for Core's {results:[{title,url,snippet,engine}]} envelope. */
+function readSearchResults(body: any, limit: number): Array<Record<string, string>> {
+  if (!Array.isArray(body?.results)) return [];
+  return body.results.slice(0, limit).map((item: any) => ({
+    title: item.title || '', url: item.url || '', snippet: item.snippet || '', source: item.engine || '',
+  }));
+}
+
+/** Academic paper search (arXiv / Crossref / OpenAlex), separate from websearch. */
+export class PaperSearchTool extends Tool {
+  get name(): string { return 'papersearch'; }
+  get description(): string { return 'Search academic papers (arXiv, Crossref, OpenAlex). Returns title, authors, year, venue, URL and an abstract snippet so results can be cited.'; }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['query'], properties: {
+      query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
+    }};
+  }
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
+    try {
+      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
+      const limit = clamp(args.numResults, 6, 1, 20);
+      const endpoint = new URL(`${coreHttpBase()}/api/search/papers`);
+      endpoint.searchParams.set('q', args.query);
+      endpoint.searchParams.set('n', String(limit));
+      const timeout = AbortSignal.timeout(30000);
+      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
+      const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
+      if (!response.ok) throw new Error(`paper search returned ${response.status}`);
+      return success({ query: args.query, results: readSearchResults(await response.json(), limit) });
+    } catch (error) { return failure(error); }
+  }
+}
+
+/** API documentation search (MDN / MS Learn / Stack Overflow), separate from websearch. */
+export class ApiDocSearchTool extends Tool {
+  get name(): string { return 'apidocsearch'; }
+  get description(): string { return 'Search API documentation (MDN, Microsoft Learn, Stack Overflow, official doc sites). Use for library/API signatures, usage and examples.'; }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['query'], properties: {
+      query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
+    }};
+  }
+  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
+    try {
+      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
+      const limit = clamp(args.numResults, 6, 1, 20);
+      const endpoint = new URL(`${coreHttpBase()}/api/search/apidocs`);
+      endpoint.searchParams.set('q', args.query);
+      endpoint.searchParams.set('n', String(limit));
+      const timeout = AbortSignal.timeout(30000);
+      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
+      const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
+      if (!response.ok) throw new Error(`api docs search returned ${response.status}`);
+      return success({ query: args.query, results: readSearchResults(await response.json(), limit) });
     } catch (error) { return failure(error); }
   }
 }
@@ -771,6 +890,230 @@ export class ComputerUseTool extends Tool {
   }
 }
 
+/** Turn lightweight Markdown into structured doc blocks. */
+function parseDocBlocks(text: string): DocBlock[] {
+  const blocks: DocBlock[] = [];
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) continue;
+    if (line.startsWith('### ')) blocks.push({ type: 'subheading', text: line.slice(4) });
+    else if (line.startsWith('## ')) blocks.push({ type: 'heading', text: line.slice(3) });
+    else if (line.startsWith('# ')) blocks.push({ type: 'heading', text: line.slice(2) });
+    else if (/^\s*[-*•]\s+/.test(line)) blocks.push({ type: 'bullet', text: line.replace(/^\s*[-*•]\s+/, '') });
+    else blocks.push({ type: 'paragraph', text: line });
+  }
+  return blocks;
+}
+
+/** Write a .docx (default), .md or .txt document. */
+export class DocumentTool extends Tool {
+  get name(): string { return 'document'; }
+  get description(): string { return 'Create a Word document (.docx) or a Markdown/text file. Provide a title and the body as Markdown (headings #, ##, bullets -, paragraphs); it is converted to a real .docx by default.'; }
+  get dangerous(): boolean { return true; }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['path'], properties: {
+      path: { type: 'string', description: 'Output file path, e.g. report.docx or notes.md.' },
+      title: { type: 'string' },
+      content: { type: 'string', description: 'Body as Markdown.' },
+      blocks: { type: 'array', items: { type: 'object', required: ['text'], properties: { type: { type: 'string', enum: ['title', 'heading', 'subheading', 'paragraph', 'bullet'] }, text: { type: 'string' } } } },
+      format: { type: 'string', enum: ['docx', 'md', 'txt'], description: 'Defaults to the file extension.' },
+    }};
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    try {
+      const filePath = resolvePath(args.path, context.cwd);
+      const ext = path.extname(filePath).toLowerCase().replace('.', '');
+      const format = String(args.format || ext || 'docx').toLowerCase();
+      const blocks: DocBlock[] = Array.isArray(args.blocks) && args.blocks.length
+        ? args.blocks.map((b: any) => ({ type: b?.type || 'paragraph', text: String(b?.text ?? '') }))
+        : parseDocBlocks(String(args.content ?? ''));
+      const title = String(args.title ?? '').trim();
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      if (format === 'md' || format === 'txt') {
+        const lines: string[] = [];
+        if (title) lines.push(`# ${title}`);
+        for (const block of blocks) {
+          if (block.type === 'heading') lines.push(`## ${block.text}`);
+          else if (block.type === 'subheading') lines.push(`### ${block.text}`);
+          else if (block.type === 'bullet') lines.push(`- ${block.text}`);
+          else lines.push(block.text);
+        }
+        const text = lines.join('\n') + '\n';
+        await fs.writeFile(filePath, text, 'utf8');
+        return success({ path: filePath, format, bytes: Buffer.byteLength(text), blocks: blocks.length });
+      }
+      const buffer = buildDocx({ title, blocks });
+      await fs.writeFile(filePath, buffer);
+      return success({ path: filePath, format: 'docx', bytes: buffer.length, blocks: blocks.length });
+    } catch (error) { return failure(error); }
+  }
+}
+
+/** Write a PowerPoint deck (.pptx). */
+export class SlidesTool extends Tool {
+  get name(): string { return 'slides'; }
+  get description(): string { return 'Create a PowerPoint presentation (.pptx) from a title and a list of slides (each with a title and bullet points).'; }
+  get dangerous(): boolean { return true; }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['path', 'slides'], properties: {
+      path: { type: 'string', description: 'Output .pptx path.' },
+      title: { type: 'string', description: 'Deck title (used only if the first slide has no title).' },
+      slides: { type: 'array', minItems: 1, items: { type: 'object', properties: {
+        title: { type: 'string' }, bullets: { type: 'array', items: { type: 'string' } },
+      } } },
+    }};
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    try {
+      if (!Array.isArray(args.slides) || args.slides.length === 0) throw new Error('slides must be a non-empty array');
+      const filePath = resolvePath(args.path, context.cwd);
+      const slides: SlideSpec[] = args.slides.map((s: any) => ({
+        title: String(s?.title ?? ''),
+        bullets: Array.isArray(s?.bullets) ? s.bullets.map((b: any) => String(b)) : [],
+      }));
+      const buffer = buildPptx({ title: String(args.title ?? ''), slides });
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, buffer);
+      return success({ path: filePath, format: 'pptx', bytes: buffer.length, slides: slides.length });
+    } catch (error) { return failure(error); }
+  }
+}
+
+/** Drive a real browser over the Chrome DevTools Protocol. */
+export class BrowserTool extends Tool {
+  get name(): string { return 'browser'; }
+  get description(): string { return 'Automate a real browser: goto/open a URL, screenshot, read text/html, click, type, press keys (combos like ctrl+a, shift+tab), run JavaScript, wait for a selector, go back/forward/reload, or start/stop the browser. Call action "status" for the live state.'; }
+  get dangerous(): boolean { return true; }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['action'], properties: {
+      action: { type: 'string', enum: ['status', 'start', 'goto', 'open', 'screenshot', 'frame', 'text', 'html', 'click', 'mouse', 'wheel', 'type', 'press', 'eval', 'wait', 'back', 'forward', 'reload', 'tabs', 'newtab', 'activate', 'closetab', 'stop', 'close'] },
+      id: { type: 'string', description: 'Tab id for activate/closetab.' },
+      url: { type: 'string' }, selector: { type: 'string' }, text: { type: 'string' }, key: { type: 'string' }, expression: { type: 'string' },
+      x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] },
+      fullPage: { type: 'boolean' }, timeout: { type: 'integer' },
+    }};
+  }
+  async execute(args: Record<string, any>, _context: ToolContext): Promise<ToolResult> {
+    try {
+      const command = String(args.action || '').toLowerCase();
+      if (!command) throw new Error('action is required');
+      const result = await browserController.action(command, args);
+      return success(result);
+    } catch (error) { return failure(error); }
+  }
+}
+
+/** Locate the `life/src` package dir that hosts `life.tools.research`. */
+export function resolveResearchSrc(): string {
+  const candidates: string[] = [];
+  if (process.env.LIFE_SRC) candidates.push(process.env.LIFE_SRC);
+  if (process.env.KAY_ROOT) candidates.push(path.join(process.env.KAY_ROOT, 'life', 'src'));
+  for (const start of [MODULE_DIR, process.cwd()]) {
+    let dir = start;
+    for (let i = 0; i < 8; i++) {
+      candidates.push(path.join(dir, 'life', 'src'));
+      candidates.push(dir);
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(path.join(candidate, 'life', 'tools', 'research', '__main__.py'))) return candidate;
+    } catch { /* keep looking */ }
+  }
+  throw new Error('life.tools.research not found — set LIFE_SRC to the life/src directory');
+}
+
+/** Generate publication artifacts with the standard `life.tools.research` toolkit. */
+export class ResearchTool extends Tool {
+  get name(): string { return 'research'; }
+  get description(): string {
+    return [
+      'Produce publication artifacts with the standard `life.tools.research` toolkit (deterministic, CJK fonts ready).',
+      'action="figure": spec={kind:"line|bar|grouped_bar|scatter|heatmap", path?, ...chart kwargs} -> PNG.',
+      'action="table": spec={header:[...], rows:[[...]], caption?, label?, stem?} -> three-line .html/.tex/.docx.',
+      'action="paper": spec={markdown?|markdown_path?, title?, stem?} -> published .html + .docx.',
+      'action="experiment": spec={script:"exp.py", name?, params?} -> runs the script main()/run() and records runs/<ts>/ {meta,stdout,result}.',
+      'Files are written under `out` (default the task workdir); the result lists the produced paths.',
+    ].join('\n');
+  }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['action'], properties: {
+      action: { type: 'string', enum: ['figure', 'table', 'paper', 'experiment'] },
+      spec: { type: 'object', description: 'Action-specific arguments (see the tool description).' },
+      out: { type: 'string', description: 'Output directory (default: the task working directory).' },
+      kind: { type: 'string', enum: ['line', 'bar', 'grouped_bar', 'scatter', 'heatmap'], description: 'Figure kind (figure action).' },
+      path: { type: 'string', description: 'Output image path (figure action).' },
+    }};
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    try {
+      const action = String(args.action || '').toLowerCase();
+      if (!['figure', 'table', 'paper', 'experiment'].includes(action)) throw new Error('action must be figure, table, paper or experiment');
+      const outDir = path.resolve(context.cwd, typeof args.out === 'string' && args.out.trim() ? args.out : '.');
+      await fs.mkdir(outDir, { recursive: true });
+      const src = resolveResearchSrc();
+      const python = process.env.RESEARCH_PYTHON || process.env.PYTHON || 'python';
+      const env = { ...process.env, PYTHONPATH: [src, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter), PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+      const spec: Record<string, any> = { ...(args.spec && typeof args.spec === 'object' ? args.spec : {}) };
+      const tmp = path.join(os.tmpdir(), `0kay-research-${randomUUID()}.json`);
+      try {
+      const run = async (cliArgs: string[]): Promise<string> => {
+        const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          const child = execFile(python, ['-m', 'life.tools.research', ...cliArgs], { cwd: context.cwd, env, maxBuffer: 10 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+            context.signal?.removeEventListener('abort', cancel);
+            if (error) reject(Object.assign(error, { stdout, stderr }));
+            else resolve({ stdout: stdout || '', stderr: stderr || '' });
+          });
+          const cancel = () => child.kill('SIGTERM');
+          context.signal?.addEventListener('abort', cancel, { once: true });
+          if (context.signal?.aborted) cancel();
+        });
+        return `${result.stdout}${result.stderr}`.trim();
+      };
+
+      if (action === 'figure') {
+        if (!spec.kind && args.kind) spec.kind = args.kind;
+        if (!spec.path && args.path) spec.path = args.path;
+        if (!spec.path) spec.path = path.join(outDir, `${spec.kind || 'figure'}.png`);
+        if (!path.isAbsolute(spec.path)) spec.path = path.resolve(outDir, spec.path);
+        await fs.writeFile(tmp, JSON.stringify(spec));
+        const output = await run(['plot', tmp, '-o', outDir]);
+        return success({ action, file: spec.path, output });
+      }
+      if (action === 'table') {
+        spec.stem = spec.stem || 'table';
+        await fs.writeFile(tmp, JSON.stringify(spec));
+        const output = await run(['table', tmp, '-o', outDir]);
+        const stem = String(spec.stem);
+        return success({ action, files: [path.join(outDir, `${stem}.html`), path.join(outDir, `${stem}.tex`), path.join(outDir, `${stem}.docx`)], output });
+      }
+      if (action === 'paper') {
+        let markdownPath = spec.markdown_path || spec.path;
+        if (!markdownPath && typeof spec.markdown === 'string') {
+          markdownPath = path.join(outDir, `${spec.stem || 'paper'}.md`);
+          await fs.writeFile(markdownPath, spec.markdown, 'utf8');
+        }
+        if (!markdownPath) throw new Error('paper needs markdown or markdown_path');
+        if (!path.isAbsolute(markdownPath)) markdownPath = path.resolve(context.cwd, markdownPath);
+        const cliArgs = ['paper', markdownPath, '-o', outDir];
+        if (spec.title) cliArgs.push('--title', String(spec.title));
+        if (spec.stem) cliArgs.push('--stem', String(spec.stem));
+        const output = await run(cliArgs);
+        return success({ action, out: outDir, output });
+      }
+      await fs.writeFile(tmp, JSON.stringify(spec));
+      const output = await run(['experiment', tmp, '-o', outDir]);
+      return success({ action, output });
+      } finally {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+      }
+    } catch (error) { return failure(error); }
+  }
+}
+
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
   register(tool: Tool): void { this.tools.set(tool.name, tool); }
@@ -871,7 +1214,8 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
-    new WebFetchTool(), new WebSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
+    new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
+    new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new AcpStatusTool(),
   ]) registry.register(tool);
   return registry;

@@ -9,7 +9,7 @@ import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
 import { randomUUID } from 'crypto';
 import * as path from 'path';
-import { stat, readdir, mkdir } from 'fs/promises';
+import { stat, readdir, mkdir, readFile, writeFile, mkdtemp, rm } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
 import { ContextLedger } from '../context/ledger.js';
 import { QuestionManager } from '../task/questions.js';
@@ -20,6 +20,7 @@ import { promisify } from 'util';
 const execFileAsync = promisify(execFile);
 import { taskRecorder } from '../task/records.js';
 import { coreFetch, coreHeaders, listPluginTools } from '../connection.js';
+import { browserController } from '../tools/browser.js';
 
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
@@ -29,9 +30,31 @@ export interface AgentConfig {
   maxIterations: number;
 }
 
+/**
+ * Agent type that fans a problem out to several independent explorer sub-agents
+ * before solving it, then synthesizes the best approach. See exploreSolutions.
+ */
+export const EXPLORE_AGENT_TYPE = 'code_explore';
+export const EXPLORE_FANOUT = 5;
+/** Explorers that miss this deadline are cancelled; the rest still feed the digest. */
+export const EXPLORE_TIMEOUT_MS = 180_000;
+
+/** Explorer sub-agents may only call these tools; everything else is rejected. */
+const EXPLORE_READ_ONLY_TOOLS = new Set([
+  'read', 'glob', 'grep', 'webfetch', 'websearch', 'papersearch', 'apidocsearch',
+  'todowrite', 'compress', 'decompress', 'search_context', 'acp_status',
+]);
+
+/** Read a positive integer env override, clamped to [min, max]; out-of-range falls back. */
+function envCount(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed) || parsed < min) return fallback;
+  return Math.min(max, Math.floor(parsed));
+}
+
 /** Comma-separated tools that execute without approval prompts (bash intentionally excluded). */
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,compress,decompress,search_context,acp_status';
+  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status';
 
 /**
  * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
@@ -74,6 +97,14 @@ export interface AgentSettings {
   enable_filesystem_tool?: boolean;
   enable_web_tools?: boolean;
   enable_computer_use?: boolean;
+  /** Browser automation via the Chrome DevTools Protocol. */
+  enable_browser_tool?: boolean;
+  /** Word/Markdown document generation. */
+  enable_document_tool?: boolean;
+  /** PowerPoint presentation generation. */
+  enable_slides_tool?: boolean;
+  /** Allow the WebUI terminal to run shell commands on this host. */
+  enable_terminal?: boolean;
   vision_model?: string;
   /** Manual context window in tokens (0 = auto from the provider). */
   context_window?: number;
@@ -132,6 +163,10 @@ export class Agent {
       enable_filesystem_tool: true,
       enable_web_tools: true,
       enable_computer_use: false,
+      enable_browser_tool: false,
+      enable_document_tool: true,
+      enable_slides_tool: true,
+      enable_terminal: false,
       vision_model: '',
       context_window: 0,
       enable_mcp_tool: true,
@@ -182,6 +217,10 @@ export class Agent {
     }
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
+    if (typeof partial.enable_browser_tool === 'boolean') this.settings.enable_browser_tool = partial.enable_browser_tool;
+    if (typeof partial.enable_document_tool === 'boolean') this.settings.enable_document_tool = partial.enable_document_tool;
+    if (typeof partial.enable_slides_tool === 'boolean') this.settings.enable_slides_tool = partial.enable_slides_tool;
+    if (typeof partial.enable_terminal === 'boolean') this.settings.enable_terminal = partial.enable_terminal;
     if (typeof partial.vision_model === 'string') this.settings.vision_model = partial.vision_model.trim();
     if (typeof partial.context_window === 'number' && partial.context_window >= 0) this.settings.context_window = Math.floor(partial.context_window);
     if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
@@ -245,8 +284,11 @@ export class Agent {
     if (!this.settings.enable_shell_tool) {
       this.tools.unregister('bash');
     }
-    if (!this.settings.enable_web_tools) for (const name of ['webfetch', 'websearch']) this.tools.unregister(name);
+    if (!this.settings.enable_web_tools) for (const name of ['webfetch', 'websearch', 'papersearch', 'apidocsearch']) this.tools.unregister(name);
     if (!this.settings.enable_computer_use) this.tools.unregister('computeruse');
+    if (!this.settings.enable_browser_tool) this.tools.unregister('browser');
+    if (!this.settings.enable_document_tool) this.tools.unregister('document');
+    if (!this.settings.enable_slides_tool) this.tools.unregister('slides');
     if (!this.settings.enable_mcp_tool) this.tools.unregister('mcp');
     if (!this.settings.enable_task_tool) this.tools.unregister('task');
     if (!this.settings.enable_skills) this.tools.unregister('skill');
@@ -498,6 +540,14 @@ export class Agent {
         if (note) context.options.workspace_note = note;
       } catch { /* not a repo or git unavailable */ }
 
+      // Explore mode: fan the problem out to independent explorer sub-agents,
+      // then hand their proposals to the main loop to choose the best.
+      if (type === EXPLORE_AGENT_TYPE && depth === 0 && options.skip_explore !== '1') {
+        const baseType = options.base_agent_type || 'code';
+        const proposals = await this.exploreSolutions(context, taskId, context.prompt, baseType);
+        context.history.push({ role: 'user', content: this.explorationDigest(proposals) });
+      }
+
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
@@ -642,6 +692,61 @@ export class Agent {
   }
 
   /**
+   * Fan a problem out to several independent explorer sub-agents (default
+   * EXPLORE_FANOUT, override with OKAY_EXPLORE_FANOUT), each with a different
+   * objective, and collect their proposals concurrently. Explorers run
+   * read-only: editing, execution and further sub-agents are disabled for them.
+   */
+  private async exploreSolutions(context: AgentContext, taskId: string, prompt: string, baseType: string): Promise<Array<{ angle: string; result: string }>> {
+    const angles = [
+      'Prefer the simplest correct change with the smallest diff.',
+      'Prefer robustness: enumerate edge cases and failure modes.',
+      'Prefer performance and resource efficiency.',
+      "Prefer consistency with this codebase's existing patterns and idioms.",
+      'Prefer clarity and maintainability; consider a cleaner alternative design.',
+      'Prefer backwards compatibility and the least disruptive migration.',
+      'Prefer security: least privilege, input validation, no new attack surface.',
+      'Prefer testability: how would this change be verified cheaply and confidently?',
+    ];
+    const fanout = envCount('OKAY_EXPLORE_FANOUT', EXPLORE_FANOUT, 1, angles.length);
+    const timeoutMs = envCount('OKAY_EXPLORE_TIMEOUT_MS', EXPLORE_TIMEOUT_MS, 10_000, 600_000);
+    const selected = angles.slice(0, fanout);
+    const proposals: Array<{ angle: string; result: string } | undefined> = new Array(selected.length);
+    let settled = false;
+    const runs = selected.map((angle, index) => {
+      const subTaskId = `${taskId}:explore:${index}`;
+      const subPrompt = `You are explorer #${index + 1} of ${selected.length}. Produce a concrete solution proposal for the problem below: a short plan, the exact changes (file paths and key code) and why it works. ${angle}\nBe efficient: inspect only the files that matter with targeted read/grep — avoid broad globs — and if the problem is not about this repository, answer directly without exploring it. You run strictly read-only (editing and execution tools are disabled); return a focused proposal, not an implementation.\n\nPROBLEM:\n${prompt}`;
+      return this.recorder
+        .run('subagent', `explore #${index + 1}`, taskId, context.sessionId,
+          () => this.executeTaskInternal(subTaskId, subPrompt, baseType, 1, context.sessionId,
+            { ...context.options, skip_explore: '1', read_only_tools: '1', no_subagents: '1' }),
+          subTaskId)
+        .then((result) => { if (!settled) proposals[index] = { angle, result: String(result || '') }; })
+        .catch((error: any) => { if (!settled) proposals[index] = { angle, result: `(exploration failed: ${error?.message || error})` }; });
+    });
+    const timer = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+    await Promise.race([Promise.allSettled(runs).then(() => undefined), timer]);
+    settled = true;
+    for (let i = 0; i < selected.length; i++) {
+      if (!proposals[i]) {
+        this.taskManager.cancelTask(`${taskId}:explore:${i}`);
+        proposals[i] = { angle: selected[i], result: '(exploration timed out)' };
+      }
+    }
+    return proposals.map((proposal) => proposal as { angle: string; result: string });
+  }
+
+  /** Turn the explorer proposals into the instruction that seeds the main loop. */
+  private explorationDigest(proposals: Array<{ angle: string; result: string }>): string {
+    const blocks = proposals.map((proposal, index) => {
+      const text = (proposal.result || '').trim();
+      const clipped = text.length > 4000 ? `${text.slice(0, 4000)}\n…(truncated)` : text;
+      return `### Candidate ${index + 1} — ${proposal.angle}\n${clipped || '(no output)'}`;
+    }).join('\n\n');
+    return `${proposals.length} independent sub-agents explored the problem above from different angles. Review every candidate, then choose the best approach (or merge the strongest parts) and implement it. Judge by correctness, simplicity and fit to the existing code — verify against the repository rather than copying blindly. State which candidate you chose and why.\n\n${blocks}`;
+  }
+
+  /**
    * Compact git state for the workspace, injected into the system prompt so the
    * model knows the branch, pending changes and recent history (ZCode-style).
    */
@@ -687,6 +792,8 @@ Choose the smallest implementation satisfying the request. Avoid unnecessary fea
 For multi-step or long-running tasks (coding, research, analysis, anything needing several tool rounds), FIRST call the todowrite tool to lay out a short checklist plan and keep exactly one item in_progress. As soon as an item is finished, update the list with todowrite (mark it completed, or drop it) before starting the next, so the checklist reflects live progress. Skip the checklist for trivial single-step requests.
 Distinguish tool/program errors from expected diagnostic results: an unreachable host or nonzero probe exit code may be the correct test result. Report it honestly rather than rewriting working code to force success.
 
+Verification (required before every final answer): check each factual claim against evidence you actually retrieved (tool results, files, websearch/papersearch/apidocsearch hits). Attach its source — URL, DOI, or file path — for anything stated as fact. If a claim is not backed by evidence, either search to confirm it or label it explicitly as unverified/uncertain; never present a guess as fact. Never invent citations, URLs, DOIs, version numbers, figures, quotes or API signatures. Prefer primary sources (official docs, papers) over blogs for technical claims, and note when sources disagree.
+
 Available tools:
 ${toolDescriptions}
 ${skillBlock}
@@ -698,7 +805,8 @@ function calling, output exactly one fallback JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
 
 After tool results arrive, continue until the task is complete. Return a concise
-plain-text final answer when no further tools are needed.`;
+plain-text final answer when no further tools are needed, with sources for any
+factual claim and unverified items clearly marked.`;
   }
 
   /** Approximate context composition (tokens) for the usage indicator. */
@@ -729,6 +837,9 @@ plain-text final answer when no further tools are needed.`;
     }
     if (toolCall.name === 'finish') return { success: true, data: { output: String(args.output ?? args.result ?? '') } };
     if(toolCall.name==='question')return {success:true,data:{answer:await this.questions.ask(context.taskId,context.sessionId,args,context.signal)}};
+    if (context.options.read_only_tools === '1' && !EXPLORE_READ_ONLY_TOOLS.has(toolCall.name)) {
+      return { success: false, data: null, error: `${toolCall.name} is disabled: explorer sub-agents run strictly read-only` };
+    }
     if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
@@ -743,7 +854,7 @@ plain-text final answer when no further tools are needed.`;
       history: context.history,
       ledger: context.ledger,
       signal: context.signal,
-      runSubAgent: depth >= 2
+      runSubAgent: depth >= 2 || context.options.no_subagents === '1'
         ? undefined
         : async (subPrompt, subType) => {
             const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
@@ -841,6 +952,109 @@ plain-text final answer when no further tools are needed.`;
           directories: entries.filter(entry => entry.isDirectory()).map(entry => ({ name: entry.name, path: path.join(directory, entry.name) })).sort((a,b) => a.name.localeCompare(b.name)) }) };
       } catch (error: any) { return { success: false, result: '', error: error.message }; }
     }
+    if (tool === 'workspace_tree') {
+      try {
+        const directory = path.resolve(parsed.path || process.cwd());
+        const entries = await readdir(directory, { withFileTypes: true });
+        const roots: string[] = [];
+        if (process.platform === 'win32') {
+          for (const letter of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+            const root = `${letter}:\\`;
+            if (await stat(root).then(s => s.isDirectory()).catch(() => false)) roots.push(root);
+          }
+        } else roots.push('/');
+        const items = entries
+          .filter(entry => entry.name !== '.git' && entry.name !== 'node_modules')
+          .map(entry => ({ name: entry.name, path: path.join(directory, entry.name), dir: entry.isDirectory() }))
+          .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+        return { success: true, error: '', result: JSON.stringify({ path: directory, parent: path.dirname(directory), roots, entries: items }) };
+      } catch (error: any) { return { success: false, result: '', error: error.message }; }
+    }
+    if (tool === 'workspace_read') {
+      try {
+        const file = path.resolve(String(parsed.path || ''));
+        const s = await stat(file);
+        if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
+        if (s.size > 1_500_000) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
+        const text = await readFile(file, 'utf8');
+        const lines = text.split(/\r?\n/);
+        const offset = Math.max(1, Number(parsed.offset) || 1);
+        const limit = Math.max(1, Math.min(Number(parsed.limit) || 2000, 5000));
+        const slice = lines.slice(offset - 1, offset - 1 + limit);
+        return { success: true, error: '', result: JSON.stringify({ path: file, totalLines: lines.length, content: slice.join('\n') }) };
+      } catch (error: any) { return { success: false, result: '', error: error.message }; }
+    }
+    if (tool === 'workspace_write') {
+      try {
+        if (!parsed.path) throw new Error('path is required');
+        if (typeof parsed.content !== 'string') throw new Error('content must be a string');
+        const file = path.resolve(String(parsed.path));
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, parsed.content, 'utf8');
+        return { success: true, error: '', result: JSON.stringify({ path: file, bytes: Buffer.byteLength(parsed.content) }) };
+      } catch (error: any) { return { success: false, result: '', error: error?.message || 'workspace_write failed' }; }
+    }
+    if (tool === 'workspace_read_binary') {
+      try {
+        if (!parsed.path) throw new Error('path is required');
+        const file = path.resolve(String(parsed.path));
+        const s = await stat(file);
+        if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
+        if (s.size > 30 * 1024 * 1024) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
+        const buffer = await readFile(file);
+        return { success: true, error: '', result: JSON.stringify({ path: file, size: buffer.length, base64: buffer.toString('base64') }) };
+      } catch (error: any) { return { success: false, result: '', error: error?.message || 'workspace_read_binary failed' }; }
+    }
+    // Convert a document to another format (legacy .doc/.ppt → pdf) using
+    // LibreOffice when it is installed on this host.
+    if (tool === 'workspace_convert') {
+      try {
+        if (!parsed.path) throw new Error('path is required');
+        const file = path.resolve(String(parsed.path));
+        const target = String(parsed.target || 'pdf').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const soffice = await findSoffice();
+        if (!soffice) return { success: false, result: '', error: 'libreoffice-not-found' };
+        const outDir = await mkdtemp(path.join(os.tmpdir(), '0kay-convert-'));
+        const profileDir = await mkdtemp(path.join(os.tmpdir(), '0kay-lo-profile-'));
+        try {
+          // A private user profile per call avoids the "another instance is
+          // already running" failure when conversions overlap.
+          const profileUrl = `file:///${profileDir.replace(/\\/g, '/')}`;
+          await runSofficeSerialized(() => execFileAsync(soffice, ['--headless', '--norestore', '--nolockcheck', `-env:UserInstallation=${profileUrl}`, '--convert-to', target, '--outdir', outDir, file], { timeout: 150000, windowsHide: true, maxBuffer: 1024 * 1024 }));
+          const outPath = path.join(outDir, `${path.basename(file).replace(/\.[^.]+$/, '')}.${target}`);
+          const buffer = await readFile(outPath);
+          return { success: true, error: '', result: JSON.stringify({ path: outPath, mime: target === 'pdf' ? 'application/pdf' : 'application/octet-stream', size: buffer.length, base64: buffer.toString('base64') }) };
+        } finally {
+          await rm(outDir, { recursive: true, force: true }).catch(() => {});
+          await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+        }
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'convert failed' };
+      }
+    }
+    // Best-effort plain-text extraction for legacy Office formats.
+    if (tool === 'workspace_extract_text') {
+      try {
+        if (!parsed.path) throw new Error('path is required');
+        const file = path.resolve(String(parsed.path));
+        const ext = path.extname(file).toLowerCase().replace('.', '');
+        let text = '';
+        if (ext === 'doc' || ext === 'dot' || ext === 'wps') {
+          // @ts-ignore - word-extractor ships no type declarations
+          const WordExtractor = (await import('word-extractor')).default;
+          const document = await new WordExtractor().extract(file);
+          text = [document.getBody?.(), document.getHeaders?.(), document.getFooters?.(), document.getFootnotes?.(), document.getEndnotes?.()]
+            .filter((part: unknown) => typeof part === 'string' && part.trim()).join('\n\n');
+        } else if (ext === 'ppt' || ext === 'pot' || ext === 'pps') {
+          text = await extractPptText(file);
+        } else {
+          throw new Error(`unsupported legacy format: .${ext}`);
+        }
+        return { success: true, error: '', result: JSON.stringify({ path: file, content: text }) };
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'extract failed' };
+      }
+    }
     if (tool === 'workspace_mkdir') {
       try {
         const parent = path.resolve(String(parsed.path || process.cwd()));
@@ -873,6 +1087,53 @@ plain-text final answer when no further tools are needed.`;
       return { success: true, error: '', result: JSON.stringify({ cpu_percent: Math.max(0,Math.min(100,100*(1-(after.idle-before.idle)/Math.max(1,after.total-before.total)))), memory_percent:100*(1-os.freemem()/os.totalmem()), sampled_at:new Date().toISOString() }) };
     }
 
+    if (tool === 'browser_status') {
+      const status = await browserController.probe();
+      return { success: true, error: '', result: JSON.stringify({ ...status, enabled: this.settings.enable_browser_tool }) };
+    }
+    if (tool === 'browser_view') {
+      const status = await browserController.probe();
+      if (!status.running) {
+        return { success: true, error: '', result: JSON.stringify({ running: false, enabled: this.settings.enable_browser_tool, available: status.available, image: '' }) };
+      }
+      try {
+        const shot = await browserController.action('screenshot', { format: 'jpeg' });
+        const current = browserController.getStatus();
+        return { success: true, error: '', result: JSON.stringify({ running: true, enabled: this.settings.enable_browser_tool, url: current.url, title: current.title, canGoBack: current.canGoBack, canGoForward: current.canGoForward, tabs: current.tabs, viewportWidth: current.viewportWidth, viewportHeight: current.viewportHeight, mime: shot.mime, image: shot.base64 }) };
+      } catch (error: any) {
+        return { success: true, error: '', result: JSON.stringify({ running: true, url: status.url, image: '', error: error?.message || String(error) }) };
+      }
+    }
+    if (tool === 'browser_frame') {
+      const status = await browserController.probe();
+      if (!status.running) return { success: true, error: '', result: JSON.stringify({ running: false, image: '' }) };
+      try {
+        const shot = await browserController.action('frame', {});
+        return { success: true, error: '', result: JSON.stringify({ running: true, image: shot.image || '', mime: shot.mime || 'image/jpeg', at: shot.at || 0 }) };
+      } catch (error: any) {
+        return { success: true, error: '', result: JSON.stringify({ running: true, image: '', error: error?.message || String(error) }) };
+      }
+    }
+
+    // Terminal console: the WebUI operator runs a shell command on this host
+    // directly. The call is user-initiated, so it bypasses the approval gate.
+    // Output is captured as raw bytes and re-decoded, because Windows cmd built-
+    // ins emit the OEM code page even when the console code page is UTF-8.
+    if (tool === 'terminal_exec') {
+      try {
+        if (!this.settings.enable_terminal) throw new Error('terminal-disabled: enable it in the agent plugin settings');
+        const command = String(parsed.command || '');
+        if (!command.trim()) throw new Error('command is required');
+        const cwd = path.resolve(parsed.cwd ? String(parsed.cwd) : process.cwd());
+        const timeoutMs = Math.max(1000, Math.min(Number(parsed.timeout) || 120000, 300000));
+        const label = await getOemLabel();
+        const { stdout, stderr, exitCode } = await runTerminalCommand(command, cwd, timeoutMs, label);
+        return { success: true, error: '', result: JSON.stringify({ cwd, stdout, stderr, exitCode }) };
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'terminal_exec failed' };
+      }
+    }
+
     if (tool === 'finish') {
       return { success: true, result: String(parsed.output ?? parsed.result ?? args ?? ''), error: '' }
     }
@@ -882,7 +1143,7 @@ plain-text final answer when no further tools are needed.`;
     // permission (RunDirect) and the enable_computer_use setting, so LIFE's
     // autonomous loop can drive the mouse/keyboard without a second prompt.
     // Interactive agent tasks still prompt for non-read-only actions below.
-    if (!this.autoApproved(tool) && tool !== 'computeruse') {
+    if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser') {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }
@@ -906,6 +1167,139 @@ plain-text final answer when no further tools are needed.`;
   }
 }
 
+// --- legacy Office helpers ----------------------------------------------------
+let sofficePromise: Promise<string> | null = null;
+function findSoffice(): Promise<string> {
+  if (!sofficePromise) {
+    sofficePromise = (async () => {
+      const explicit = process.env.OKAY_SOFFICE_PATH;
+      if (explicit && await stat(explicit).then((s) => s.isFile()).catch(() => false)) return explicit;
+      const candidates = [
+        path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'LibreOffice', 'program', 'soffice.exe'),
+        path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'LibreOffice', 'program', 'soffice.exe'),
+        process.env['LocalAppData'] ? path.join(process.env['LocalAppData'], 'Programs', 'LibreOffice', 'program', 'soffice.exe') : '',
+        '/usr/bin/soffice', '/usr/bin/libreoffice', '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        if (await stat(candidate).then((s) => s.isFile()).catch(() => false)) return candidate;
+      }
+      try {
+        const { stdout } = await execFileAsync('where', ['soffice']);
+        const found = String(stdout).split(/\r?\n/)[0].trim();
+        if (found) return found;
+      } catch { /* not on PATH */ }
+      return '';
+    })();
+  }
+  // A failed lookup is not cached: installing LibreOffice takes effect on the
+  // next conversion attempt without an agent restart.
+  return sofficePromise.then((found) => { if (!found) sofficePromise = null; return found; });
+}
+
+// LibreOffice cannot run two instances against the same profile; serialize
+// conversions so overlapping previews don't fail.
+let sofficeChain: Promise<unknown> = Promise.resolve();
+function runSofficeSerialized<T>(task: () => Promise<T>): Promise<T> {
+  const run = sofficeChain.then(task, task);
+  sofficeChain = run.catch(() => {});
+  return run;
+}
+
+/** Pull text out of a legacy .ppt/.pot/.pps OLE stream (best effort, no layout). */
+async function extractPptText(file: string): Promise<string> {
+  // @ts-ignore - cfb ships no type declarations
+  const cfbModule: any = await import('cfb');
+  const CFB = cfbModule.default || cfbModule;
+  const container = CFB.read(await readFile(file), { type: 'buffer' });
+  const stream = CFB.find(container, 'PowerPoint Document');
+  if (!stream?.content) return '';
+  const data: Buffer = Buffer.isBuffer(stream.content) ? stream.content : Buffer.from(stream.content);
+  const out: string[] = [];
+  const walk = (start: number, end: number) => {
+    let i = start;
+    while (i + 8 <= end) {
+      const verInstance = data.readUInt16LE(i);
+      const recType = data.readUInt16LE(i + 2);
+      const recLen = data.readUInt32LE(i + 4);
+      const body = i + 8;
+      if (body + recLen > end) break;
+      if ((verInstance & 0x000f) === 0x0f) walk(body, body + recLen);
+      else if (recType === 0x0fa0) out.push(data.subarray(body, body + recLen).toString('utf16le'));
+      else if (recType === 0x0fa8) out.push(data.subarray(body, body + recLen).toString('latin1'));
+      i = body + recLen;
+      if (recLen === 0 && recType === 0) i++;
+    }
+  };
+  walk(0, data.length);
+  return out.map((value) => value.replace(/\r/g, '')).join('\n').trim();
+}
+
 function sessionIdOrEmpty(): string {
   return `direct:${Date.now()}`;
+}
+
+// --- terminal command runner (UTF-8 aware) ------------------------------------
+// Windows cmd built-ins (`dir`, error messages, …) write the OEM code page to a
+// pipe even after `chcp 65001`, so captured bytes are decoded as UTF-8 and, when
+// that yields replacement characters, re-decoded with the system OEM code page.
+const CODEPAGE_LABELS: Record<number, string> = {
+  874: 'windows-874', 932: 'shift_jis', 936: 'gbk', 949: 'euc-kr', 950: 'big5',
+  1250: 'windows-1250', 1251: 'windows-1251', 1252: 'windows-1252',
+  1253: 'windows-1253', 1254: 'windows-1254', 1255: 'windows-1255',
+  1256: 'windows-1256', 1257: 'windows-1257', 1258: 'windows-1258', 65001: 'utf-8',
+};
+let oemLabelPromise: Promise<string> | null = null;
+function getOemLabel(): Promise<string> {
+  if (!oemLabelPromise) {
+    oemLabelPromise = new Promise((resolve) => {
+      if (process.platform !== 'win32') return resolve('utf-8');
+      execFile('reg', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage', '/v', 'OEMCP'], { windowsHide: true }, (error, stdout) => {
+        if (error) return resolve('utf-8');
+        const match = /OEMCP\s+REG_SZ\s+(\d+)/.exec(String(stdout));
+        resolve(CODEPAGE_LABELS[Number(match?.[1])] || 'utf-8');
+      });
+    });
+  }
+  return oemLabelPromise;
+}
+function decodeTerminalOutput(value: Buffer | string | undefined, label: string): string {
+  if (!value) return '';
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+  if (!buffer.length) return '';
+  const utf8 = buffer.toString('utf8');
+  if (!utf8.includes('\uFFFD') || label === 'utf-8') return utf8;
+  try { return new TextDecoder(label).decode(buffer); } catch { return utf8; }
+}
+function runTerminalCommand(command: string, cwd: string, timeoutMs: number, label: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const isWin = process.platform === 'win32';
+  const file = isWin ? 'cmd.exe' : '/bin/sh';
+  const args = isWin ? ['/d', '/s', '/c', `chcp 65001 >nul & ${command}`] : ['-c', command];
+  return new Promise((resolve) => {
+    let child: any;
+    let settled = false;
+    const finish = (error: any, stdout: Buffer, stderr: Buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: decodeTerminalOutput(stdout, label),
+        stderr: decodeTerminalOutput(stderr, label) || (error ? String(error.message || '') : ''),
+        exitCode: error ? (Number(error.code) || 1) : 0,
+      });
+    };
+    child = execFile(file, args, {
+      cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, encoding: 'buffer',
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    } as any, (error: any, stdout: any, stderr: any) => finish(error, stdout, stderr));
+    const timer = setTimeout(() => {
+      try {
+        if (isWin && child?.pid) execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
+        else {
+          child?.kill('SIGTERM');
+          // Escalate in case the child ignores SIGTERM.
+          setTimeout(() => { try { child?.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
+        }
+      } catch { /* ignore */ }
+    }, timeoutMs);
+  });
 }

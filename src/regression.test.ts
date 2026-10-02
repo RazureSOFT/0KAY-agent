@@ -5,7 +5,11 @@ import * as loader from '@grpc/proto-loader';
 import * as http from 'node:http';
 import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
-import { ShellTool, ComputerUseTool, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
+import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
+import { buildDocx, buildPptx } from './tools/office.js';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { ApprovalManager } from './task/approvals.js';
 import { QuestionManager } from './task/questions.js';
 import { classifyFailure } from './provider/failure.js';
@@ -495,4 +499,81 @@ test('context ledger compresses, restores and searches', () => {
   assert.equal(ledger.decompress('blk1'), true);
   assert.equal(history.length, 3);
   assert.equal(ledger.decompress('blk1'), false);
+});
+
+test('bash runs independent commands in parallel', async () => {
+  const tool = new ShellTool();
+  const context: any = { cwd: process.cwd(), taskId: 't', agentType: 'general', todo: [] };
+  const wait = process.platform === 'win32' ? 'ping -n 2 127.0.0.1 >nul' : 'sleep 0.5';
+  const started = Date.now();
+  const res = await tool.execute({ commands: [wait, wait, wait] }, context);
+  const elapsed = Date.now() - started;
+  assert.ok(res.success, JSON.stringify(res.data || res.error));
+  assert.equal(res.data.parallel, 3);
+  assert.equal(res.data.failed, 0);
+  assert.ok(res.data.results.every((r: any) => r.exitCode === 0), JSON.stringify(res.data.results));
+  const threshold = process.platform === 'win32' ? 2500 : 1000;
+  assert.ok(elapsed < threshold, `parallel commands should overlap (took ${elapsed}ms)`);
+});
+
+test('bash parallel results carry per-command failures', async () => {
+  const tool = new ShellTool();
+  const context: any = { cwd: process.cwd(), taskId: 't', agentType: 'general', todo: [] };
+  const res = await tool.execute({ commands: ['exit 3', 'echo hi'] }, context);
+  assert.equal(res.success, false);
+  assert.equal(res.data.failed, 1);
+  assert.equal(res.data.results[0].exitCode, 3);
+  assert.equal(res.data.results[1].exitCode, 0);
+});
+
+test('office builders emit valid OOXML packages', () => {
+  const docx = buildDocx({ title: 'T', blocks: [{ type: 'heading', text: 'H' }, { type: 'bullet', text: 'B' }] });
+  assert.equal(docx.subarray(0, 2).toString('latin1'), 'PK');
+  const docxText = docx.toString('latin1');
+  assert.ok(docxText.includes('[Content_Types].xml'));
+  assert.ok(docxText.includes('word/document.xml'));
+  const pptx = buildPptx({ title: 'Deck', slides: [{ title: 'S1', bullets: ['a', 'b'] }, { title: 'S2', bullets: [] }] });
+  assert.equal(pptx.subarray(0, 2).toString('latin1'), 'PK');
+  const pptxText = pptx.toString('latin1');
+  assert.ok(pptxText.includes('ppt/presentation.xml'));
+  assert.ok(pptxText.includes('ppt/slides/slide1.xml'));
+  assert.ok(pptxText.includes('ppt/slides/slide2.xml'));
+});
+
+test('document and slides tools write files', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-doc-'));
+  const context: any = { cwd: dir, taskId: 't', agentType: 'general', todo: [] };
+  const doc = await new DocumentTool().execute({ path: 'out/report.docx', title: 'Report', content: '# Section\n- one\n- two' }, context);
+  assert.ok(doc.success, doc.error);
+  assert.ok((await fs.stat(path.join(dir, 'out/report.docx'))).size > 0);
+  const ppt = await new SlidesTool().execute({ path: 'deck.pptx', slides: [{ title: 'A', bullets: ['x'] }] }, context);
+  assert.ok(ppt.success, ppt.error);
+  assert.ok((await fs.stat(path.join(dir, 'deck.pptx'))).size > 0);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+const RESEARCH_AVAILABLE = (() => { try { resolveResearchSrc(); return true; } catch { return false; } })();
+
+test('research tool generates a figure and a table', { skip: RESEARCH_AVAILABLE ? false : 'life.tools.research not found on this host (set LIFE_SRC)' }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-research-'));
+  const context: any = { cwd: dir, taskId: 't', agentType: 'general', todo: [] };
+  const fig = await new ResearchTool().execute({ action: 'figure', kind: 'line', path: 'figs/curve.png', spec: { x: [0, 1, 2], series: { loss: [0.9, 0.5, 0.2] }, title: 'loss' } }, context);
+  assert.ok(fig.success, fig.error);
+  assert.ok((await fs.stat(path.join(dir, 'figs/curve.png'))).size > 0);
+  const tbl = await new ResearchTool().execute({ action: 'table', spec: { header: ['方法', '准确率'], rows: [['基线', '0.61']], caption: '表1' } }, context);
+  assert.ok(tbl.success, tbl.error);
+  assert.ok((await fs.stat(path.join(dir, 'table.docx'))).size > 0);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('research tool rejects an unknown action', async () => {
+  const res = await new ResearchTool().execute({ action: 'nope' }, { cwd: process.cwd(), taskId: 't', agentType: 'general', todo: [] } as any);
+  assert.equal(res.success, false);
+});
+
+test('browser tool reports status without launching', async () => {
+  const res = await new BrowserTool().execute({ action: 'status' }, { cwd: process.cwd(), taskId: 't', agentType: 'general', todo: [] } as any);
+  assert.ok(res.success, res.error);
+  assert.equal(typeof res.data.running, 'boolean');
+  assert.equal(typeof res.data.available, 'boolean');
 });

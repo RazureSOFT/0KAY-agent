@@ -14,7 +14,9 @@
   "dependencies": {
     "@0kay/mcp": "file:../mcp",
     "@grpc/grpc-js": "^1.10.0",
-    "@grpc/proto-loader": "^0.7.0"
+    "@grpc/proto-loader": "^0.7.0",
+    "cfb": "^1.2.2",
+    "word-extractor": "^1.0.4"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
