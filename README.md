@@ -1,8 +1,36 @@
 # 0KAY-agent
 
-Task execution plugin for the 0KAY platform. The agent connects to 0KAY Core
-over gRPC, registers as the `agent` plugin, and executes dispatched tasks with
-tools, approvals, task records and MCP/LLM integration.
+> Part of **[0KAY](https://github.com/RazureSOFT/0KAY)** — a self-hosted AI
+> companion that remembers you, with a real agent underneath.
+
+This repository is the **Agent**: the task-execution plugin of the 0KAY platform.
+When you ask the companion to actually *do* something — inspect a repository,
+edit files, run commands, browse the web, or drive the desktop — this process
+runs the task and its tools, and reports back to Core.
+
+It connects to 0KAY Core over gRPC, registers as the `agent` plugin, and executes
+dispatched tasks with a tool registry, an approval gate, task records, and
+MCP/LLM integration.
+
+## What it does
+
+- **Executes multi-step tasks** with filesystem, shell, web and desktop tools,
+  updating a live todo checklist as it goes.
+- **Routes every model call through mocr** (`ChooseModels` + streaming), so model
+  choice and credentials stay in one place.
+- **Waits for approval** in `normal` mode: privileged tool calls (and the
+  `question` tool) pause until you decide. `full_access` runs without prompting.
+- **Returns diffs**, not just text, for `edit`/`apply_patch`, so the WebUI can
+  show exactly what changed.
+- **Extends via skills and MCP**: built-in `code` / `research` / `general`
+  skills plus `skills/*.md`, and any MCP server Core exposes.
+
+## Who it's for
+
+This is a component of 0KAY, not a standalone app — you normally get it by
+installing the platform (or via `0kay-pm`), not by running it on its own. Read
+the [main README](https://github.com/RazureSOFT/0KAY) first to understand the
+big picture.
 
 ## Requirements
 
