@@ -1102,7 +1102,15 @@ export class ResearchTool extends Tool {
         if (spec.title) cliArgs.push('--title', String(spec.title));
         if (spec.stem) cliArgs.push('--stem', String(spec.stem));
         const output = await run(cliArgs);
-        return success({ action, out: outDir, output });
+        // Surface the produced paths so the WebUI can open the .docx directly;
+        // `build_paper` prints "<kind>: <path>" for html and docx.
+        const files: string[] = [];
+        for (const line of output.split(/\r?\n/)) {
+          const match = /^(?:html|docx):\s*(.+)$/i.exec(line.trim());
+          if (match) files.push(match[1].trim());
+        }
+        const docx = files.find((file) => file.toLowerCase().endsWith('.docx')) || path.join(outDir, `${spec.stem || 'paper'}.docx`);
+        return success({ action, out: outDir, file: docx, files: files.length ? files : [docx], output });
       }
       await fs.writeFile(tmp, JSON.stringify(spec));
       const output = await run(['experiment', tmp, '-o', outDir]);
