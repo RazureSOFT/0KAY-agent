@@ -5,7 +5,7 @@ import * as loader from '@grpc/proto-loader';
 import * as http from 'node:http';
 import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
-import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
+import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression, windowsKeyExpression } from './tools/tools.js';
 import { buildDocx, buildPptx } from './tools/office.js';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -15,8 +15,35 @@ import { QuestionManager } from './task/questions.js';
 import { classifyFailure } from './provider/failure.js';
 import { resolveRetryOptions, retryDelayMs, streamIdleTimeoutMs, shouldRetry } from './provider/retry.js';
 import { ContextLedger } from './context/ledger.js';
+import { authorized, setPluginIdentity } from './connection.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('inbound authentication rejects missing credentials and accepts issued identity only', () => {
+  const keys = ['CORE_PAIR_TOKEN', 'CORE_API_TOKEN', 'AGENT_GRPC_TOKEN'];
+  const saved = keys.map(key => process.env[key]);
+  try {
+    keys.forEach(key => delete process.env[key]);
+    setPluginIdentity('', '');
+    assert.equal(authorized({ metadata: { get: () => [] } }), false);
+    setPluginIdentity('agent', 'test-agent-identity');
+    assert.equal(authorized({ metadata: { get: () => ['Bearer wrong'] } }), false);
+    assert.equal(authorized({ metadata: { get: () => ['Bearer test-agent-identity'] } }), true);
+  } finally {
+    setPluginIdentity('', '');
+    keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+  }
+});
+
+test('computeruse is disabled by default and screenshot output becomes visual model input', async () => {
+  const agent = new Agent();
+  assert.equal((await agent.runDirect('computeruse', '{"action":"screenshot"}')).success, false);
+  const images: any[] = [];
+  const value = (agent as any).desktopResult('computeruse', { success: true, data: { base64: 'FAKE', mime: 'image/png', width: 1920, height: 1080 } }, images);
+  assert.equal(value.data.base64, undefined);
+  assert.equal(images[1].imageUrl, 'data:image/png;base64,FAKE');
+  assert.match(images[0].text, /1920x1080/);
+});
 
 test('concurrency queues tasks; cancelling queued and running tasks preserves terminal state', async () => {
   const agent = new Agent();
@@ -179,6 +206,82 @@ test('workspace browser and host sampling return real executor information', asy
   const usage=JSON.parse(host.result);
   assert.ok(usage.cpu_percent>=0 && usage.cpu_percent<=100);
   assert.ok(usage.memory_percent>=0 && usage.memory_percent<=100);
+});
+
+test('workspace_admin manages dsh-style workspaces and tasks resolve them', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-workspaces-'));
+  process.env.AGENT_DATA_DIR = path.join(dir, 'data');
+  try {
+    const agent = new Agent();
+    agent.applySettings({ model_id: 'mock' });
+    (agent as any).recorder.run = async (_k: any, _p: any, _id: any, _s: any, operation: any) => operation();
+    const created = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'create', path: dir, title: 'Demo App' }))).result);
+    assert.ok(created.workspace.id);
+    assert.equal(created.workspace.title, 'Demo App');
+    assert.equal(created.workspace.path, await fs.realpath(dir));
+    const listed = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'list' }))).result);
+    assert.equal(listed.workspaces.length, 1);
+    assert.equal(listed.workspaces[0].exists, true);
+    // Legacy `projects_admin` alias still resolves by title (case-insensitive).
+    const used = JSON.parse((await agent.runDirect('projects_admin', JSON.stringify({ action: 'use', name: 'demo app' }))).result);
+    assert.equal(used.path, await fs.realpath(dir));
+    const persisted = JSON.parse(await fs.readFile(path.join(dir, 'data', 'workspaces.json'), 'utf8'));
+    assert.equal(persisted.state.initialized, true);
+    assert.equal(persisted.state.workspaceIds.length, 1);
+    // realpath is the identity rule: a symlink to the same directory reuses the record.
+    const link = path.join(os.tmpdir(), `0kay-ws-link-${Date.now()}`);
+    await fs.symlink(dir, link, 'junction');
+    try {
+      const alias = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'create', path: link, title: 'Alias' }))).result);
+      assert.equal(alias.workspace.id, created.workspace.id);
+      assert.equal(alias.workspace.title, 'Demo App', 'create for an existing path keeps the title');
+      const byPath = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'path', path: link }))).result);
+      assert.equal(byPath.workspace.id, created.workspace.id);
+      const notOwned = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'path', path: process.cwd() }))).result);
+      assert.equal(notOwned.workspace, null);
+    } finally {
+      await fs.rm(link, { recursive: true, force: true });
+    }
+    // Session accounting: attach validates canonical cwd equals the workspace path.
+    await agent.runDirect('workspace_admin', JSON.stringify({ action: 'attach', name: 'Demo App', session: 'sess-1', cwd: dir }));
+    const attached = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'get', name: 'Demo App' }))).result);
+    assert.deepEqual(attached.workspace.sessionIds, ['sess-1']);
+    const badAttach = await agent.runDirect('workspace_admin', JSON.stringify({ action: 'attach', name: 'Demo App', session: 'sess-bad', cwd: os.tmpdir() }));
+    assert.equal(badAttach.success, false);
+    // Archive is a registry-global set; unknown sessions are rejected.
+    const archived = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'archive', session: 'sess-1' }))).result);
+    assert.deepEqual(archived.archived, ['sess-1']);
+    const badArchive = await agent.runDirect('workspace_admin', JSON.stringify({ action: 'archive', session: 'nope' }));
+    assert.equal(badArchive.success, false);
+    // Rename keeps the registration; reorder is DOM insertBefore semantics.
+    await agent.runDirect('workspace_admin', JSON.stringify({ action: 'rename', name: 'Demo App', to: 'Demo' }));
+    const second = path.join(dir, 'second');
+    await fs.mkdir(second);
+    await agent.runDirect('workspace_admin', JSON.stringify({ action: 'create', path: second, title: 'Second' }));
+    const reordered = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'reorder', name: 'Second', before: 'Demo' }))).result);
+    assert.deepEqual(reordered.order, ['Second', 'Demo']);
+    const status = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'status', name: 'Demo' }))).result);
+    assert.equal(status.status, 'ok');
+    // A task started with a workspace title runs inside it and attaches its session.
+    let request: any;
+    (agent as any).mocr = {
+      async *generate(value: any) { if (value.toolChoice !== 'none') request = value; yield { chunk: 'ok', done: true }; },
+    };
+    await agent.executeTask('ws-task', 'test', 'general', { project: 'Demo', session_id: 'sess-2' });
+    assert.ok(request.systemPrompt.includes(await fs.realpath(dir)), 'system prompt should point at the workspace directory');
+    await assert.rejects(agent.executeTask('ws-missing', 'test', 'general', { project: 'nope' }), /unknown project/);
+    const afterTask = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'get', name: 'Demo' }))).result);
+    assert.ok(afterTask.workspace.sessionIds.includes('sess-2'), 'task session should attach to its workspace');
+    const rejected = await agent.runDirect('workspace_admin', JSON.stringify({ action: 'create', path: path.join(dir, 'missing') }));
+    assert.equal(rejected.success, false);
+    await agent.runDirect('workspace_admin', JSON.stringify({ action: 'delete', name: 'Demo' }));
+    await agent.runDirect('workspace_admin', JSON.stringify({ action: 'delete', name: 'Second' }));
+    const after = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'list' }))).result);
+    assert.equal(after.workspaces.length, 0);
+  } finally {
+    delete process.env.AGENT_DATA_DIR;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('permissions wait, deny and cancel without executing tools', async()=>{
@@ -357,13 +460,20 @@ test('skills_admin saves, lists and deletes skills; slash force-applies a skill'
 test('computeruse exposes every action and rejects unknown ones', async () => {
   const tool = new ComputerUseTool();
   const actions = [...tool.parameters.properties.action.enum].sort();
-  assert.deepEqual(actions, ['click', 'key', 'listwindows', 'move', 'screenshot', 'type']);
+  assert.deepEqual(actions, ['click', 'doubleclick', 'key', 'listwindows', 'move', 'screenshot', 'scroll', 'type']);
   const bad = await tool.execute({ action: 'nope' });
   assert.equal(bad.success, false);
   assert.match(String(bad.error), /invalid computer action/);
+  for (const delta of [0, 21, -21, 0.5, '1']) {
+    assert.equal((await tool.execute({ action: 'scroll', delta })).success, false);
+  }
 });
 
 test('hotkeys map to portable macOS and Linux backends', () => {
+  assert.equal(windowsKeyExpression('ctrl+a'), '^a');
+  assert.equal(windowsKeyExpression('alt+tab'), '%{TAB}');
+  assert.equal(windowsKeyExpression('enter'), '{ENTER}');
+  assert.throws(() => windowsKeyExpression('invalid+enter'), /unsupported modifier/);
   assert.equal(appleScriptForKey('cmd+shift+t'), 'keystroke "t" using {command down, shift down}');
   assert.equal(appleScriptForKey('return'), 'key code 36');
   assert.equal(appleScriptForKey('a'), 'keystroke "a"');

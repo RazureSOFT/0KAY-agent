@@ -111,6 +111,13 @@ function extractContextLength(value: any): number {
   return 0;
 }
 
+function modelMetadata(): grpc.Metadata {
+  const metadata = new grpc.Metadata();
+  const token = process.env.MOCR_GRPC_TOKEN || process.env.CORE_API_TOKEN || process.env.CORE_PAIR_TOKEN;
+  if (token) metadata.set('authorization', `Bearer ${token}`);
+  return metadata;
+}
+
 function getStub(address: string): any {
   if (cachedStub && cachedAddress === address) return cachedStub
   const def = protoLoader.loadSync(path.join(PROTO_DIR, 'mocr/v1/mocr.proto'), loaderOptions)
@@ -356,7 +363,7 @@ export class MocrProvider {
       })),
     };
 
-    const metadata=coreMetadata();
+    const metadata=modelMetadata();
     if(request.sessionId) metadata.set('x-0kay-session-id', request.sessionId);
     const requestId = request.requestId || request.taskId;
     if(requestId) metadata.set('x-0kay-request-id', requestId);
@@ -435,7 +442,7 @@ export class MocrProvider {
               requireThinking,
             },
           },
-          coreMetadata(), { deadline: Date.now() + 15000 },
+          modelMetadata(), { deadline: Date.now() + 15000 },
           (err: any, r: any) => { signal?.removeEventListener('abort', cancel); err ? reject(err) : resolve(r); },
         )
         const cancel = () => call.cancel();

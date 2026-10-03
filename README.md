@@ -90,6 +90,22 @@ Environment variables (all optional; defaults shown):
 `0kay-pm` writes these to `runtime-env.json` during installation (including
 pairing results) and passes them to the process on start.
 
+### Named workspaces (projects)
+
+Save a directory once under a memorable name, then start tasks by name instead
+of pasting a raw path every time — useful for recurring work on the same
+repository or document folder.
+
+- Manage through the `projects_admin` direct tool:
+  `{action:'save', name, path}` (path must be an existing directory),
+  `{action:'list'}` (each entry carries an `exists` flag),
+  `{action:'delete', name}`, `{action:'use', name}` (resolves and returns the
+  directory; name matching is case-insensitive).
+- Start a task with metadata `{"project": "<name>"}` and the agent runs in
+  that directory; an explicit `workdir` still wins. `last_used_at` is updated
+  automatically so UIs can sort by recency.
+- Stored in `data/agent/projects.json` (honours `AGENT_DATA_DIR`).
+
 ## Test
 
 ```powershell

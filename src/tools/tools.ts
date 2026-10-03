@@ -676,6 +676,21 @@ export function linuxKeyExpression(raw: string): string {
     .map((part) => LINUX_KEYS[part.toLowerCase()] ?? part).join('+');
 }
 
+export function windowsKeyExpression(raw: string): string {
+  // Preserve explicit SendKeys syntax while supporting the canonical hotkeys
+  // used by the other backends (ctrl+a, alt+tab, enter).
+  if (/^[+^%{]/.test(raw)) return raw;
+  const parts = raw.toLowerCase().split('+').map(value => value.trim());
+  const key = parts.pop() || '';
+  const modifiers: Record<string, string> = { ctrl: '^', control: '^', alt: '%', shift: '+' };
+  const prefix = parts.map(part => { if (!modifiers[part]) throw new Error(`unsupported modifier: ${part}`); return modifiers[part]; }).join('');
+  const keys: Record<string, string> = { enter: 'ENTER', return: 'ENTER', tab: 'TAB', escape: 'ESC', esc: 'ESC', backspace: 'BACKSPACE', delete: 'DELETE', left: 'LEFT', right: 'RIGHT', up: 'UP', down: 'DOWN', home: 'HOME', end: 'END', pageup: 'PGUP', pagedown: 'PGDN', space: 'SPACE' };
+  if (keys[key]) return prefix + (key === 'space' ? ' ' : `{${keys[key]}}`);
+  if (/^f(?:[1-9]|1[0-6])$/.test(key)) return prefix + `{${key.toUpperCase()}}`;
+  if (key.length === 1) return prefix + key;
+  throw new Error(`unsupported key: ${raw}`);
+}
+
 /**
  * Operate the host desktop (screenshot, list windows, mouse, keyboard).
  *
@@ -684,16 +699,24 @@ export function linuxKeyExpression(raw: string): string {
  * Any missing backend is reported as a clear, actionable error.
  */
 export class ComputerUseTool extends Tool {
+  private tail: Promise<unknown> = Promise.resolve();
   get name(): string { return 'computeruse'; }
   get description(): string { return 'Operate the Agent host computer: screenshot, list open windows, move/click the mouse, type text, or press keys. Supports Windows, macOS and Linux hosts. Requires explicit computer-use permission.'; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action'], properties: {
-      action: { type: 'string', enum: ['screenshot', 'listwindows', 'move', 'click', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' },
+      action: { type: 'string', enum: ['screenshot', 'listwindows', 'move', 'click', 'doubleclick', 'scroll', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' }, delta: { type: 'integer', minimum: -20, maximum: 20, description: 'Scroll notches: positive down, negative up' },
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
+    // 桌面状态只有一个，批量工具调用不能让截图、移动、键盘互相抢占。
+    const run = this.tail.then(() => this.executeDesktop(args, context));
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+  private async executeDesktop(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     try {
+      context?.signal?.throwIfAborted();
       const action = String(args.action || '');
       switch (action) {
         case 'listwindows': return success(await this.listWindows(context));
@@ -702,6 +725,9 @@ export class ComputerUseTool extends Tool {
         case 'key': return success(await this.pressKey(args, context));
         case 'move': return success(await this.pointer(args, false, context));
         case 'click': return success(await this.pointer(args, true, context));
+        case 'doubleclick':
+          return success(await this.pointer({ ...args, double: true }, true, context));
+        case 'scroll': return success(await this.scroll(args, context));
         default: throw new Error('invalid computer action');
       }
     } catch (error) { return failure(error); }
@@ -731,7 +757,7 @@ export class ComputerUseTool extends Tool {
 
   // --- screenshot -----------------------------------------------------------
   private async screenshot(context?: ToolContext) {
-    const stamp = Date.now();
+    const stamp = `${Date.now()}-${randomUUID()}`;
     const png = path.join(os.tmpdir(), `0kay-screen-${stamp}.png`);
     const jpg = path.join(os.tmpdir(), `0kay-screen-${stamp}.jpg`);
     let previewPath = png;
@@ -762,6 +788,7 @@ export class ComputerUseTool extends Tool {
       height: pngBytes.length > 24 ? pngBytes.readUInt32BE(20) : undefined,
       mime,
       base64: previewBytes.toString('base64'),
+      coordinateSpace: 'original screen pixels (width/height), not resized preview pixels',
     };
   }
 
@@ -853,7 +880,8 @@ export class ComputerUseTool extends Tool {
     const raw = String(args.key ?? '');
     if (!raw) throw new Error('key is required');
     if (process.platform === 'win32') {
-      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${raw.replace(/'/g, "''")}')`, context);
+      const expression = windowsKeyExpression(raw);
+      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${expression.replace(/'/g, "''")}')`, context);
     } else if (process.platform === 'darwin') {
       await this.run('osascript', ['-e', `tell application "System Events" to ${appleScriptForKey(raw)}`], context);
     } else if (process.platform === 'linux') {
@@ -866,6 +894,21 @@ export class ComputerUseTool extends Tool {
   }
 
   // --- pointer --------------------------------------------------------------
+  private async scroll(args: Record<string, any>, context?: ToolContext) {
+    const delta = args.delta;
+    if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 20) throw new Error('delta must be a nonzero integer between -20 and 20');
+    if (process.platform === 'win32') {
+      await this.powershell("Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Wheel { [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,UIntPtr e); }\n'@; [Wheel]::mouse_event(0x0800,0,0," + (-120 * delta) + ',[UIntPtr]::Zero)', context);
+    } else if (process.platform === 'linux') {
+      await this.requireCommand('xdotool', context, 'install xdotool');
+      await this.run('xdotool', ['click', '--repeat', String(Math.abs(delta)), '--delay', '30', delta > 0 ? '5' : '4'], context);
+    } else if (process.platform === 'darwin') {
+      await this.requireCommand('osascript', context, 'macOS automation permission required');
+      await this.run('osascript', ['-l', 'JavaScript', '-e', `ObjC.import('CoreGraphics'); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateScrollWheelEvent(null, 1, 1, ${-delta}));`], context);
+    } else throw new Error(`computeruse is not supported on ${process.platform}`);
+    return { action: 'scroll', delta };
+  }
+
   private async pointer(args: Record<string, any>, click: boolean, context?: ToolContext) {
     const x = clamp(args.x, -1, 0, 100000);
     const y = clamp(args.y, -1, 0, 100000);
@@ -873,15 +916,16 @@ export class ComputerUseTool extends Tool {
     const button = args.button === 'right' ? 'right' : 'left';
     if (process.platform === 'win32') {
       const flags = click ? (button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
-      const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + (flags ? flags.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '');
+      const clickScript = flags ? flags.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '';
+      const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + clickScript + (args.double ? '; Start-Sleep -Milliseconds 60; ' + clickScript : '');
       await this.powershell(script, context);
     } else if (process.platform === 'darwin') {
       await this.requireCommand('cliclick', context, 'brew install cliclick');
-      const command = click ? `${button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
+      const command = click ? `${args.double ? 'dc' : button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
       await this.run('cliclick', [command], context);
     } else if (process.platform === 'linux') {
       await this.requireCommand('xdotool', context, 'install xdotool');
-      const args2 = click ? ['mousemove', String(x), String(y), 'click', button === 'right' ? '3' : '1'] : ['mousemove', String(x), String(y)];
+      const args2 = click ? ['mousemove', String(x), String(y), 'click', '--repeat', args.double ? '2' : '1', '--delay', '60', button === 'right' ? '3' : '1'] : ['mousemove', String(x), String(y)];
       await this.run('xdotool', args2, context);
     } else {
       throw new Error(`computeruse is not supported on ${process.platform}`);

@@ -21,6 +21,7 @@ const execFileAsync = promisify(execFile);
 import { taskRecorder } from '../task/records.js';
 import { coreFetch, coreHeaders, listPluginTools } from '../connection.js';
 import { browserController } from '../tools/browser.js';
+import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
@@ -143,6 +144,8 @@ export class Agent {
   private approvals = new ApprovalManager();
   private questions = new QuestionManager();
   private handoffs = new Map<string,string>();
+  /** dsh-style workspace registry: durable workspaces that own session accounts. */
+  private workspaces = new WorkspaceRegistry();
   /** Names of plugin-contributed tools currently registered (for refresh). */
   private pluginToolNames = new Set<string>();
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
@@ -507,8 +510,20 @@ export class Agent {
     }
     this.taskManager.createTask(taskId, prompt, type);
     return this.taskManager.executeTask(taskId, async () => {
-      const cwd = options.workdir ? path.resolve(options.workdir) : process.cwd();
+      // Workspace selection: explicit workdir wins, else a saved project name
+      // (options.project), else the agent's own cwd.
+      let workdir = options.workdir;
+      const workspaceSelector = options.workspace || options.project;
+      if (!workdir && workspaceSelector) workdir = await this.resolveWorkspacePath(String(workspaceSelector));
+      const cwd = workdir ? path.resolve(workdir) : process.cwd();
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
+      // Best-effort dsh-style accounting: attach this session to the workspace
+      // that owns cwd, so the sidebar can group sessions under directories.
+      const sessionId = String(options.session_id || '');
+      if (sessionId) {
+        const owner = await this.workspaces.resolveByPath(cwd).catch(() => undefined);
+        if (owner) await owner.attachSession(sessionId, cwd).catch(() => { /* membership is best-effort */ });
+      }
       const signal = this.taskManager.signal(taskId);
       let initialParts: MessagePart[] | undefined;
       if (options.attachments) {
@@ -628,6 +643,7 @@ export class Agent {
                 reasoningContent: fullReasoning || undefined,
               });
               const settled = await Promise.allSettled(nativeCalls.map(toolCall => this.executeToolCall(toolCall, context, type, depth)));
+              const desktopImages: MessagePart[] = [];
               for (let idx = 0; idx < nativeCalls.length; idx++) {
                 const toolCall = nativeCalls[idx];
                 const item = settled[idx];
@@ -640,9 +656,10 @@ export class Agent {
                 context.history.push({
                   role: 'tool',
                   toolCallId: toolCall.id,
-                  content: JSON.stringify(toolResult),
+                  content: JSON.stringify(this.desktopResult(toolCall.name, toolResult, desktopImages)),
                 });
               }
+              if (desktopImages.length) context.history.push({ role: 'user', content: '', parts: desktopImages });
               if (result) break;
             }
             break;
@@ -663,7 +680,9 @@ export class Agent {
         if (toolCall) {
           const toolResult = await this.executeToolCall({ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }, context, type, depth);
           context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }], reasoningContent: fullReasoning || undefined });
-          context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(toolResult) });
+          const desktopImages: MessagePart[] = [];
+          context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(this.desktopResult(toolCall.name, toolResult, desktopImages)) });
+          if (desktopImages.length) context.history.push({ role: 'user', content: '', parts: desktopImages });
 
           if (toolResult.success && toolCall.name === 'finish') {
             result = toolResult.data?.output || 'Task completed';
@@ -827,6 +846,15 @@ factual claim and unverified items clearly marked.`;
     return { window, system, tools: toolTokens, skills: skillTokens, mcp: mcpTokens, conversation, used: system + toolTokens + skillTokens + mcpTokens + conversation }
   }
 
+  private desktopResult(tool: string, result: any, images: MessagePart[]) {
+    if (tool !== 'computeruse' || !result.success || !result.data?.base64) return result;
+    const { base64, ...data } = result.data;
+    // 截图作为视觉输入传给下一轮模型，不能把 base64 当普通文本塞满上下文。
+    images.push({ type: 'text', text: `Desktop screenshot: ${data.width}x${data.height}. Use original screen pixel coordinates.` },
+      { type: 'image', imageUrl: `data:${data.mime};base64,${base64}`, mimeType: data.mime });
+    return { ...result, data: { ...data, image: 'attached as visual input' } };
+  }
+
   private async executeToolCall(toolCall: ToolCall, context: AgentContext, agentType: string, depth: number) {
     context.signal.throwIfAborted();
     let args: Record<string, any> = {};
@@ -902,7 +930,155 @@ factual claim and unverified items clearly marked.`;
   /**
    * Run a single tool immediately without an LLM loop (Core.RunDirect).
    */
+  /**
+   * Open the host's native OS folder picker and return the chosen path. Windows
+   * uses an STA PowerShell FolderBrowserDialog; macOS uses `choose folder`.
+   * Cancelling returns `{cancelled:true}` rather than an error.
+   */
+  private async pickFolder(description: string): Promise<{ success: boolean; result: string; error: string }> {
+    try {
+      if (process.platform === 'win32') {
+        const safe = String(description || 'Select a folder').replace(/'/g, "''")
+        const script = [
+          'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
+          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+          `$d.Description = '${safe}'`,
+          '$d.ShowNewFolderButton = $true',
+          'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }',
+        ].join('; ')
+        const encoded = Buffer.from(script, 'utf16le').toString('base64')
+        const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-STA', '-EncodedCommand', encoded], { timeout: 300000, windowsHide: true })
+        const chosen = String(stdout || '').trim()
+        return chosen
+          ? { success: true, result: JSON.stringify({ path: chosen }), error: '' }
+          : { success: false, result: JSON.stringify({ cancelled: true }), error: '' }
+      }
+      if (process.platform === 'darwin') {
+        const { stdout } = await execFileAsync('osascript', ['-e', 'POSIX path of (choose folder)'], { timeout: 300000 })
+        const chosen = String(stdout || '').trim().replace(/\/$/, '')
+        return chosen
+          ? { success: true, result: JSON.stringify({ path: chosen }), error: '' }
+          : { success: false, result: JSON.stringify({ cancelled: true }), error: '' }
+      }
+      return { success: false, result: '', error: 'native folder picker is only available on Windows and macOS hosts' }
+    } catch (error: any) {
+      // A cancelled dialog exits non-zero on some platforms; treat it as cancel.
+      return { success: false, result: JSON.stringify({ cancelled: true }), error: '' }
+    }
+  }
+
+  /** Resolve a workspace selector (id or title) to its directory. */
+  private async resolveWorkspacePath(selector: string): Promise<string> {
+    const workspace = await this.workspaces.resolve(selector);
+    if (!workspace) throw new Error(`unknown project '${selector}'`);
+    return workspace.path;
+  }
+
+  /** Serializable view of a workspace for tools and the UI. */
+  private workspaceView(workspace: Workspace, exists?: boolean): Record<string, unknown> {
+    return {
+      id: workspace.id,
+      title: workspace.title,
+      path: workspace.path,
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+      sessionIds: [...workspace.sessionIds],
+      ...(exists === undefined ? {} : { exists }),
+    };
+  }
+
+  /** dsh-style workspace operations (create/get/list/resolve/delete/reorder/…). */
+  private async handleWorkspaceAdmin(parsed: any): Promise<any> {
+    await this.workspaces.init();
+    const action = String(parsed.action || 'list').toLowerCase();
+    const selector = String(parsed.id || parsed.name || parsed.workspace || parsed.project || '');
+    const view = async (workspace: Workspace) => this.workspaceView(workspace, (await workspace.status()) === 'ok');
+    switch (action) {
+      case 'list': {
+        return { workspaces: await Promise.all(this.workspaces.list().map(view)) };
+      }
+      case 'create':
+      case 'save': {
+        const workspace = await this.workspaces.create(String(parsed.path || ''), String(parsed.title || parsed.name || ''));
+        return { workspace: await view(workspace) };
+      }
+      case 'get': {
+        const workspace = parsed.id ? this.workspaces.get(String(parsed.id)) : await this.workspaces.resolve(selector);
+        return { workspace: workspace ? await view(workspace) : null };
+      }
+      case 'resolve':
+      case 'path': {
+        const workspace = parsed.path != null
+          ? await this.workspaces.resolveByPath(String(parsed.path))
+          : await this.workspaces.resolve(selector);
+        return { workspace: workspace ? await view(workspace) : null };
+      }
+      case 'use': {
+        return { name: selector, path: await this.resolveWorkspacePath(selector) };
+      }
+      case 'delete': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`project '${selector}' not found`);
+        return { deleted: await this.workspaces.delete(workspace.id) };
+      }
+      case 'rename': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`unknown project '${selector}'`);
+        await workspace.setTitle(String(parsed.to || parsed.title || parsed.new_name || ''));
+        return { workspace: await view(workspace) };
+      }
+      case 'reorder':
+      case 'move': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`unknown project '${selector}'`);
+        const beforeSelector = parsed.before == null || parsed.before === '' ? undefined : String(parsed.before);
+        const before = beforeSelector ? await this.workspaces.resolve(beforeSelector) : undefined;
+        if (beforeSelector && !before) throw new Error(`unknown project '${beforeSelector}'`);
+        const order = await this.workspaces.insertBefore(workspace.id, before?.id);
+        return { order: order.map((id) => this.workspaces.get(id)?.title || id) };
+      }
+      case 'attach': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`unknown project '${selector}'`);
+        await workspace.attachSession(String(parsed.session || parsed.session_id || ''), parsed.cwd == null ? undefined : String(parsed.cwd));
+        return { workspace: await view(workspace) };
+      }
+      case 'detach': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`unknown project '${selector}'`);
+        await workspace.detachSession(String(parsed.session || parsed.session_id || ''));
+        return { workspace: await view(workspace) };
+      }
+      case 'move-session':
+      case 'move_session': {
+        const targetSelector = String(parsed.to || parsed.workspace || '');
+        const workspace = await this.workspaces.resolve(targetSelector);
+        if (!workspace) throw new Error(`unknown project '${targetSelector}'`);
+        await this.workspaces.moveSession(String(parsed.session || parsed.session_id || ''), workspace.id);
+        return { workspace: await view(workspace) };
+      }
+      case 'status': {
+        const workspace = await this.workspaces.resolve(selector);
+        if (!workspace) throw new Error(`unknown project '${selector}'`);
+        return { status: await workspace.status() };
+      }
+      case 'archive': {
+        await this.workspaces.archiveSession(String(parsed.session || parsed.session_id || ''));
+        return { archived: [...this.workspaces.archivedSessionIds] };
+      }
+      case 'unarchive': {
+        await this.workspaces.unarchiveSession(String(parsed.session || parsed.session_id || ''));
+        return { archived: [...this.workspaces.archivedSessionIds] };
+      }
+      default:
+        throw new Error(`unknown workspace_admin action: ${action}`);
+    }
+  }
+
   async runDirect(tool: string, args: string): Promise<{ success: boolean; result: string; error: string }> {
+    if (tool === 'computeruse' && !this.settings.enable_computer_use) {
+      return { success: false, result: '', error: 'computer-use-disabled: enable it in Agent settings' };
+    }
     let parsed: Record<string, any> = {}
     if (args && args.trim()) {
       try {
@@ -914,6 +1090,19 @@ factual claim and unverified items clearly marked.`;
 
     if(tool==='question_list')return {success:true,result:JSON.stringify(this.questions.list()),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
+    // Workspace registry (dsh-style) with legacy `projects_admin` aliases.
+    // Workspaces own an ordered account of sessions and carry a display title;
+    // see src/workspace/registry.ts.
+    if (tool === 'workspace_admin' || tool === 'projects_admin') {
+      try {
+        return { success: true, result: JSON.stringify(await this.handleWorkspaceAdmin(parsed)), error: '' };
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'workspace_admin failed' };
+      }
+    }
+    if (tool === 'workspace_pick') {
+      return this.pickFolder(String(parsed.title || parsed.description || 'Select a folder'));
+    }
     if (tool === 'skills_admin') {
       try {
         const dir = this.settings.skills_dir || this.skills.writableDir();

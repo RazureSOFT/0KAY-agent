@@ -21,7 +21,12 @@ export function coreHeaders():Record<string,string>{
  const fallback=process.env.CORE_PAIR_TOKEN||process.env.CORE_API_TOKEN;
  return fallback?{Authorization:`Bearer ${fallback}`}:{}
 }
-export function authorized(call:{metadata:{get:(key:string)=>unknown[]}}):boolean{const token=process.env.CORE_PAIR_TOKEN||process.env.CORE_API_TOKEN;if(!token)return true;const actual=Buffer.from(String(call.metadata.get('authorization')[0]||'')),expected=Buffer.from(`Bearer ${token}`);return actual.length===expected.length&&timingSafeEqual(actual,expected)}
+export function authorized(call:{metadata:{get:(key:string)=>unknown[]}}):boolean{
+ const tokens=[pluginToken,process.env.AGENT_GRPC_TOKEN,process.env.CORE_PAIR_TOKEN,process.env.CORE_API_TOKEN].filter((v):v is string=>!!v);
+ const actual=Buffer.from(String(call.metadata.get('authorization')[0]||''));
+ // 注册是出站操作，入站在凭据就绪前必须拒绝，不能用空令牌放行。
+ return tokens.some(token=>{const expected=Buffer.from(`Bearer ${token}`);return actual.length===expected.length&&timingSafeEqual(actual,expected)});
+}
 export async function coreFetch(url:string,options:RequestInit={}):Promise<Response>{
  if(!process.env.CORE_TLS_CA||!url.startsWith('https:'))return fetch(url,options)
  return new Promise((resolve,reject)=>{
