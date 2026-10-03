@@ -5,7 +5,8 @@ import * as loader from '@grpc/proto-loader';
 import * as http from 'node:http';
 import { Agent } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
-import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression, windowsKeyExpression } from './tools/tools.js';
+import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
+import { posixInput } from './tools/posix_native.js';
 import { buildDocx, buildPptx } from './tools/office.js';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -43,6 +44,23 @@ test('computeruse is disabled by default and screenshot output becomes visual mo
   assert.equal(value.data.base64, undefined);
   assert.equal(images[1].imageUrl, 'data:image/png;base64,FAKE');
   assert.match(images[0].text, /1920x1080/);
+});
+
+test('computeruse live view is gated and reports status without capturing', async () => {
+  const agent = new Agent();
+  const status = JSON.parse((await agent.runDirect('computeruse_status', '{}')).result);
+  assert.equal(status.enabled, false);
+  assert.equal(status.supported, ['win32', 'darwin', 'linux'].includes(process.platform));
+  // While disabled the frame tool must not capture the screen.
+  const frame = JSON.parse((await agent.runDirect('computeruse_frame', '{}')).result);
+  assert.equal(frame.running, false);
+  assert.equal(frame.enabled, false);
+  assert.equal(frame.image, '');
+});
+
+test('posix native input backend initialises without throwing', () => {
+  const native = posixInput();
+  assert.ok(native === null || typeof native.click === 'function');
 });
 
 test('concurrency queues tasks; cancelling queued and running tasks preserves terminal state', async () => {
@@ -460,20 +478,18 @@ test('skills_admin saves, lists and deletes skills; slash force-applies a skill'
 test('computeruse exposes every action and rejects unknown ones', async () => {
   const tool = new ComputerUseTool();
   const actions = [...tool.parameters.properties.action.enum].sort();
-  assert.deepEqual(actions, ['click', 'doubleclick', 'key', 'listwindows', 'move', 'screenshot', 'scroll', 'type']);
+  assert.deepEqual(actions, ['click', 'doubleclick', 'drag', 'key', 'listwindows', 'move', 'screenshot', 'scroll', 'type']);
   const bad = await tool.execute({ action: 'nope' });
   assert.equal(bad.success, false);
   assert.match(String(bad.error), /invalid computer action/);
   for (const delta of [0, 21, -21, 0.5, '1']) {
     assert.equal((await tool.execute({ action: 'scroll', delta })).success, false);
   }
+  // Drag without an end point is rejected before any native input is sent.
+  assert.equal((await tool.execute({ action: 'drag', x: 10, y: 10 })).success, false);
 });
 
 test('hotkeys map to portable macOS and Linux backends', () => {
-  assert.equal(windowsKeyExpression('ctrl+a'), '^a');
-  assert.equal(windowsKeyExpression('alt+tab'), '%{TAB}');
-  assert.equal(windowsKeyExpression('enter'), '{ENTER}');
-  assert.throws(() => windowsKeyExpression('invalid+enter'), /unsupported modifier/);
   assert.equal(appleScriptForKey('cmd+shift+t'), 'keystroke "t" using {command down, shift down}');
   assert.equal(appleScriptForKey('return'), 'key code 36');
   assert.equal(appleScriptForKey('a'), 'keystroke "a"');

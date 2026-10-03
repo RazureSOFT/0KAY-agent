@@ -93,7 +93,7 @@ export class TaskManager {
 
   private wake(): void {
     const waiting = this.waiters.splice(0);
-    for (const resolve of waiting) resolve();
+    if (waiting.length > 0) waiting[0]();
   }
 
   async executeTask(id: string, executor: (task: Task) => Promise<string>, nested = false): Promise<string> {

@@ -26,6 +26,26 @@ import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
 
+/** Allowed roots for workspace writes. Defaults to the process cwd, the user's
+ *  home and the temp dir; override with a comma-separated AGENT_WORKSPACE_ROOTS
+ *  to lock the WebUI file browser further (e.g. a single project dir). */
+const ALLOWED_WORKSPACE_ROOTS = (() => {
+  const configured = (process.env.AGENT_WORKSPACE_ROOTS || '')
+    .split(',')
+    .map((root) => root.trim())
+    .filter(Boolean);
+  const roots = configured.length > 0
+    ? configured
+    : [process.cwd(), os.homedir(), os.tmpdir()];
+  return roots.map((root) => path.resolve(root));
+})();
+
+function isPathAllowed(resolved: string): boolean {
+  return ALLOWED_WORKSPACE_ROOTS.some(
+    (root) => resolved === root || resolved.startsWith(root + path.sep)
+  );
+}
+
 export interface AgentConfig {
   mocrAddress: string;
   maxIterations: number;
@@ -130,6 +150,28 @@ export interface AgentContext {
   options: Record<string, string>;
   /** Model-driven context compression ledger (billion-context style). */
   ledger?: ContextLedger;
+}
+
+/** Rough token estimate: ~4 ASCII chars/token, ~1 token per non-ASCII char
+ *  (CJK is roughly one token per character, so chars/4 badly under-counts it). */
+export function estimateTextTokens(text: string): number {
+  let ascii = 0, wide = 0;
+  for (const ch of text) { (ch.codePointAt(0) ?? 0) < 128 ? ascii++ : wide++; }
+  return Math.round(ascii / 4 + wide);
+}
+
+/** Last real prompt-token count the model reported, per session (for the usage
+ *  indicator). Cleared on process exit; falls back to a text estimate. */
+const sessionPromptTokens = new Map<string, number>();
+const MAX_SESSION_PROMPT_TOKENS = 1000;
+/** Hard safety ceiling for the agent loop (see the deprecation note in runLoop). */
+const MAX_LOOP_ITERATIONS = 500;
+function trackSessionPromptTokens(sessionId: string, tokens: number): void {
+  sessionPromptTokens.set(sessionId, tokens);
+  if (sessionPromptTokens.size > MAX_SESSION_PROMPT_TOKENS) {
+    const oldest = sessionPromptTokens.keys().next().value;
+    if (oldest) sessionPromptTokens.delete(oldest);
+  }
 }
 
 export class Agent {
@@ -469,16 +511,16 @@ export class Agent {
 
   /** Rough token estimate: ~4 chars per token plus a flat cost per image part. */
   private estimateTokens(messages: Message[]): number {
-    let chars = 0;
+    let text = '';
     let images = 0;
     for (const message of messages) {
-      chars += message.content.length + JSON.stringify(message.toolCalls || []).length;
+      text += message.content + JSON.stringify(message.toolCalls || []);
       for (const part of message.parts || []) {
         if (part.type === 'image') images += 1;
-        else chars += (part.text || '').length;
+        else text += part.text || '';
       }
     }
-    return Math.ceil(chars / 4) + images * 850;
+    return estimateTextTokens(text) + images * 850;
   }
 
   private looksContextOverflow(error: any): boolean {
@@ -565,6 +607,12 @@ export class Agent {
 
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
+        // `max_iterations` is deprecated: the model-driven context ledger now
+        // governs when to stop. A high safety ceiling still guarantees the loop
+        // cannot run forever on a model that never calls finish.
+        if (i >= MAX_LOOP_ITERATIONS) {
+          throw new Error(`Agent loop exceeded ${MAX_LOOP_ITERATIONS} iterations without finishing`);
+        }
         // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
         // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
         const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
@@ -628,6 +676,7 @@ export class Agent {
           }
           if (chunk.usage && Number(chunk.usage.promptTokens) > 0) {
               lastPromptTokens = Number(chunk.usage.promptTokens);
+            if (context.sessionId) sessionPromptTokens.set(context.sessionId, lastPromptTokens);
               if (context.ledger) context.ledger.lastPromptTokens = lastPromptTokens;
           }
           if (chunk.done) {
@@ -704,6 +753,10 @@ export class Agent {
           for await(const chunk of this.mocr.generate({modelId:lastModel,messages:[{role:'user',content:result}],systemPrompt:'Extract the completed task handoff. Return JSON only: {"artifacts":[{"path":"","usage":""}],"outcome":"","limitations":""}. Use only explicit facts from the final result; never invent file paths or success. Keep under 1200 characters.',tools:[],toolChoice:'none',signal:context.signal,taskId,sessionId,maxTokens:600})) handoff+=chunk.chunk||'';
           const parsed=JSON.parse(handoff.replace(/^```(?:json)?\s*|\s*```$/g,''));
           this.handoffs.set(taskId,JSON.stringify(parsed));
+          if (this.handoffs.size > 100) {
+            const oldest = this.handoffs.keys().next().value;
+            if (oldest) this.handoffs.delete(oldest);
+          }
         }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'任务已结束，产物信息提取失败，请查看 Agent 会话。'}))}
       }
       return result;
@@ -830,18 +883,16 @@ factual claim and unverified items clearly marked.`;
 
   /** Approximate context composition (tokens) for the usage indicator. */
   private contextBreakdown(cwd: string, conversationTokens: number, window: number) {
-    const tools = this.tools.listTools()
-    const toolDescriptions = tools.map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`).join('\n')
+    const toolList = this.tools.listTools()
+    const toolDescriptions = toolList.map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`).join('\n')
     const skillBlock = this.settings.enable_skills ? `\n\n${this.skills.contextBlock('', undefined)}` : ''
-    let mcpChars = 0
-    try { mcpChars = this.mcp ? JSON.stringify(this.mcp.listTools()).length : 0 } catch { mcpChars = 0 }
+    let mcpText = ''
+    try { mcpText = this.mcp ? JSON.stringify(this.mcp.listTools()) : '' } catch { mcpText = '' }
     const full = this.getSystemPrompt('', cwd, '')
-    const baseChars = Math.max(0, full.length - toolDescriptions.length - skillBlock.length)
-    const toTokens = (chars: number) => Math.round(chars / 4)
-    const system = toTokens(baseChars)
-    const toolTokens = toTokens(toolDescriptions.length)
-    const skillTokens = toTokens(skillBlock.length)
-    const mcpTokens = toTokens(mcpChars)
+    const system = Math.max(0, estimateTextTokens(full) - estimateTextTokens(toolDescriptions) - estimateTextTokens(skillBlock))
+    const toolTokens = estimateTextTokens(toolDescriptions)
+    const skillTokens = estimateTextTokens(skillBlock)
+    const mcpTokens = estimateTextTokens(mcpText)
     const conversation = Math.max(0, Math.round(conversationTokens))
     return { window, system, tools: toolTokens, skills: skillTokens, mcp: mcpTokens, conversation, used: system + toolTokens + skillTokens + mcpTokens + conversation }
   }
@@ -1178,6 +1229,7 @@ factual claim and unverified items clearly marked.`;
         if (!parsed.path) throw new Error('path is required');
         if (typeof parsed.content !== 'string') throw new Error('content must be a string');
         const file = path.resolve(String(parsed.path));
+        if (!isPathAllowed(file)) throw new Error('path not allowed: outside workspace roots');
         await mkdir(path.dirname(file), { recursive: true });
         await writeFile(file, parsed.content, 'utf8');
         return { success: true, error: '', result: JSON.stringify({ path: file, bytes: Buffer.byteLength(parsed.content) }) };
@@ -1265,7 +1317,9 @@ factual claim and unverified items clearly marked.`;
       try {
         const cwd = typeof parsed.cwd === 'string' && parsed.cwd ? parsed.cwd : process.cwd()
         const breakdown = this.contextBreakdown(cwd, Number(parsed.conversation_tokens) || 0, Number(parsed.window) || 0)
-        return { success: true, result: JSON.stringify(breakdown), error: '' }
+        const sessionId = String(parsed.session_id || '')
+        const lastPrompt = sessionId ? (sessionPromptTokens.get(sessionId) || 0) : 0
+        return { success: true, result: JSON.stringify({ ...breakdown, last_prompt_tokens: lastPrompt }), error: '' }
       } catch (error: any) { return { success: false, result: '', error: error?.message || 'context_usage failed' } }
     }
     if (tool === 'host_status') {
@@ -1304,6 +1358,41 @@ factual claim and unverified items clearly marked.`;
       }
     }
 
+    // Live desktop frame for the WebUI's "AI is using the computer" window. It is
+    // a read-only capture (no input), gated by the computer-use setting, and reuses
+    // the registered tool so it shares the desktop action queue.
+    if (tool === 'computeruse_status') {
+      return { success: true, error: '', result: JSON.stringify({ enabled: !!this.settings.enable_computer_use, supported: ['win32', 'darwin', 'linux'].includes(process.platform) }) };
+    }
+    if (tool === 'computeruse_frame') {
+      if (!this.settings.enable_computer_use) {
+        return { success: true, error: '', result: JSON.stringify({ running: false, enabled: false, image: '' }) };
+      }
+      const capture = this.tools.get('computeruse') as any;
+      if (!capture || typeof capture.streamFrame !== 'function') {
+        return { success: true, error: '', result: JSON.stringify({ running: false, enabled: true, image: '', error: 'capture unavailable' }) };
+      }
+      try {
+        const isWin = process.platform === 'win32';
+        const after = Number(parsed.after) || 0;
+        const frame = await capture.streamFrame(isWin ? undefined : {
+          cwd: process.cwd(),
+          taskId: sessionIdOrEmpty(),
+          agentType: this.settings.default_agent_type,
+          todo: [],
+          mcp: this.mcp,
+        }, after);
+        if (frame?.image) {
+          return { success: true, error: '', result: JSON.stringify({ running: true, enabled: true, image: frame.image, mime: frame.mime || 'image/jpeg', width: frame.width, height: frame.height, at: frame.at }) };
+        }
+        // Unchanged frame (no pixels re-sent) or the worker is warming up.
+        const alive = typeof capture.streamAlive === 'function' ? capture.streamAlive() : false;
+        return { success: true, error: '', result: JSON.stringify({ running: alive, enabled: true, image: '', at: frame?.at, warming: alive }) };
+      } catch (error: any) {
+        return { success: true, error: '', result: JSON.stringify({ running: false, enabled: true, image: '', error: error?.message || String(error) }) };
+      }
+    }
+
     // Terminal console: the WebUI operator runs a shell command on this host
     // directly. The call is user-initiated, so it bypasses the approval gate.
     // Output is captured as raw bytes and re-decoded, because Windows cmd built-
@@ -1316,6 +1405,9 @@ factual claim and unverified items clearly marked.`;
         const cwd = path.resolve(parsed.cwd ? String(parsed.cwd) : process.cwd());
         const timeoutMs = Math.max(1000, Math.min(Number(parsed.timeout) || 120000, 300000));
         const label = await getOemLabel();
+        const directId = sessionIdOrEmpty();
+        try { await this.approvals.request(directId, 'direct', tool, parsed, cwd); }
+        catch (error: any) { return { success: false, result: '', error: error.message }; }
         const { stdout, stderr, exitCode } = await runTerminalCommand(command, cwd, timeoutMs, label);
         return { success: true, error: '', result: JSON.stringify({ cwd, stdout, stderr, exitCode }) };
       } catch (error: any) {

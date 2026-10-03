@@ -78,6 +78,12 @@ export interface GenerateResponse {
   role?: string;
   text?: string;
   toolCalls?: ToolCall[];
+  /** Model that actually produced the output (after any auto-switch). */
+  model?: string;
+  /** Model the caller requested. */
+  requestedModel?: string;
+  /** Non-empty when a fallback model produced the output. */
+  fallbackReason?: string;
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -264,6 +270,7 @@ export class MocrProvider {
     let reasoning = '';
     let lastPublished = 0;
     let publishing: Promise<void> | null = null;
+    let modelInfo = '';
     try {
       for await (const chunk of this.generateStream(request)) {
         text += chunk.chunk || '';
@@ -274,7 +281,13 @@ export class MocrProvider {
           lastPublished = Date.now();
         }
         if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_LENGTH', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) throw new Error(`Model finish: ${chunk.finishReason}`);
-        if (chunk.done) {await publishing;await this.recorder.record({ ...event, state: 'done', result: text, reasoning });}
+        if (chunk.done) {
+          if (chunk.model || chunk.requestedModel || chunk.fallbackReason) {
+            modelInfo = JSON.stringify({ model: chunk.model || '', requested: chunk.requestedModel || '', fallback: chunk.fallbackReason || '' });
+          }
+          await publishing;
+          await this.recorder.record({ ...event, state: 'done', result: text, reasoning, args: modelInfo });
+        }
         yield chunk;
       }
     } catch (error: any) {

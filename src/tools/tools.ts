@@ -16,6 +16,8 @@ import { egressFetch, callPluginTool, coreFetch, coreHeaders, coreHttpBase } fro
 import type { ContextLedger } from '../context/ledger.js';
 import { buildDocx, buildPptx, type DocBlock, type SlideSpec } from './office.js';
 import { browserController } from './browser.js';
+import { ensureNative, nativeAvailable } from './win_native.js';
+import { posixInput, type PosixInput } from './posix_native.js';
 
 const exec = promisify(execCallback);
 // ESM has no __dirname; used to locate the sibling `life/src` package.
@@ -676,36 +678,41 @@ export function linuxKeyExpression(raw: string): string {
     .map((part) => LINUX_KEYS[part.toLowerCase()] ?? part).join('+');
 }
 
-export function windowsKeyExpression(raw: string): string {
-  // Preserve explicit SendKeys syntax while supporting the canonical hotkeys
-  // used by the other backends (ctrl+a, alt+tab, enter).
-  if (/^[+^%{]/.test(raw)) return raw;
-  const parts = raw.toLowerCase().split('+').map(value => value.trim());
-  const key = parts.pop() || '';
-  const modifiers: Record<string, string> = { ctrl: '^', control: '^', alt: '%', shift: '+' };
-  const prefix = parts.map(part => { if (!modifiers[part]) throw new Error(`unsupported modifier: ${part}`); return modifiers[part]; }).join('');
-  const keys: Record<string, string> = { enter: 'ENTER', return: 'ENTER', tab: 'TAB', escape: 'ESC', esc: 'ESC', backspace: 'BACKSPACE', delete: 'DELETE', left: 'LEFT', right: 'RIGHT', up: 'UP', down: 'DOWN', home: 'HOME', end: 'END', pageup: 'PGUP', pagedown: 'PGDN', space: 'SPACE' };
-  if (keys[key]) return prefix + (key === 'space' ? ' ' : `{${keys[key]}}`);
-  if (/^f(?:[1-9]|1[0-6])$/.test(key)) return prefix + `{${key.toUpperCase()}}`;
-  if (key.length === 1) return prefix + key;
-  throw new Error(`unsupported key: ${raw}`);
+/**
+ * One live desktop frame for the WebUI's "AI is using the computer" window.
+ * `image` is base64 of a downscaled JPEG preview.
+ */
+export interface DesktopFrame {
+  image: string;
+  mime: string;
+  width: number;
+  height: number;
+  at: number;
 }
+
+/** Preview geometry and cadence for the live-view stream. */
+const STREAM_WIDTH = 1024;
+const STREAM_QUALITY = 50;
+const STREAM_MIN_INTERVAL_MS = 66;
 
 /**
  * Operate the host desktop (screenshot, list windows, mouse, keyboard).
  *
- * Backends: Windows PowerShell (always present), macOS `screencapture` +
- * `osascript` + `cliclick`, Linux `grim`/`scrot`/ImageMagick + `xdotool`.
- * Any missing backend is reported as a clear, actionable error.
+ * Backends: Windows native via `koffi` (user32/gdi32/gdiplus — no PowerShell),
+ * macOS `screencapture` + `osascript` + `cliclick`, Linux
+ * `grim`/`scrot`/ImageMagick + `xdotool`. A missing backend is reported as a
+ * clear, actionable error.
  */
 export class ComputerUseTool extends Tool {
   private tail: Promise<unknown> = Promise.resolve();
+  private streamFrameCache: DesktopFrame | null = null;
+  private streamFrameAt = 0;
   get name(): string { return 'computeruse'; }
   get description(): string { return 'Operate the Agent host computer: screenshot, list open windows, move/click the mouse, type text, or press keys. Supports Windows, macOS and Linux hosts. Requires explicit computer-use permission.'; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action'], properties: {
-      action: { type: 'string', enum: ['screenshot', 'listwindows', 'move', 'click', 'doubleclick', 'scroll', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' }, delta: { type: 'integer', minimum: -20, maximum: 20, description: 'Scroll notches: positive down, negative up' },
+      action: { type: 'string', enum: ['screenshot', 'listwindows', 'move', 'click', 'doubleclick', 'scroll', 'drag', 'type', 'key'] }, x: { type: 'integer' }, y: { type: 'integer' }, x2: { type: 'integer' }, y2: { type: 'integer' }, button: { type: 'string', enum: ['left', 'right'] }, text: { type: 'string' }, key: { type: 'string' }, delta: { type: 'integer', minimum: -20, maximum: 20, description: 'Scroll notches: positive down, negative up' }, duration: { type: 'integer', minimum: 0, maximum: 5000, description: 'Drag duration in ms (drag only)' },
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
@@ -728,6 +735,7 @@ export class ComputerUseTool extends Tool {
         case 'doubleclick':
           return success(await this.pointer({ ...args, double: true }, true, context));
         case 'scroll': return success(await this.scroll(args, context));
+        case 'drag': return success(await this.drag(args, context));
         default: throw new Error('invalid computer action');
       }
     } catch (error) { return failure(error); }
@@ -746,28 +754,67 @@ export class ComputerUseTool extends Tool {
     } catch { return false; }
   }
 
-  /** Run a PowerShell script through -EncodedCommand (quoting-safe). */
-  private powershell(script: string, context?: ToolContext, timeout = 30_000) {
-    return this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], context, timeout);
-  }
-
   private async requireCommand(name: string, context: ToolContext | undefined, hint: string): Promise<void> {
     if (!(await this.hasCommand(name, context))) throw new Error(`computeruse needs \`${name}\` on this host (${hint})`);
   }
 
+  /** Run a native macOS/Linux input action; false when native is unavailable or
+   *  fails, so the caller falls back to the shell tools. */
+  private tryNative(action: (native: PosixInput) => boolean | void): boolean {
+    const native = posixInput();
+    if (!native) return false;
+    try { return action(native) !== false; } catch { return false; }
+  }
+
+  /** Latest live frame for the WebUI stream. Windows captures natively through
+   *  koffi; other platforms capture on demand with their own tools. `after` is
+   *  the last frame timestamp the caller already has, so an unchanged frame is
+   *  returned with an empty `image` instead of re-sending the pixels. */
+  async streamFrame(context?: ToolContext, after = 0): Promise<DesktopFrame | null> {
+    const now = Date.now();
+    if (!this.streamFrameCache || now - this.streamFrameAt >= STREAM_MIN_INTERVAL_MS) {
+      if (process.platform === 'win32') {
+        if (!nativeAvailable()) return null;
+        const shot = ensureNative().capture(STREAM_WIDTH, STREAM_QUALITY);
+        this.streamFrameCache = { image: shot.buffer.toString('base64'), mime: 'image/jpeg', width: shot.width, height: shot.height, at: now };
+      } else {
+        const shot = await this.screenshot(context);
+        this.streamFrameCache = { image: shot.base64, mime: shot.mime, width: shot.width || 0, height: shot.height || 0, at: now };
+      }
+      this.streamFrameAt = now;
+    }
+    const frame = this.streamFrameCache;
+    return frame.at <= after ? { ...frame, image: '' } : frame;
+  }
+
+  /** True while a capture backend is up (lets a warming stream stay open). */
+  streamAlive(): boolean {
+    return process.platform === 'win32' ? nativeAvailable() : true;
+  }
+
   // --- screenshot -----------------------------------------------------------
   private async screenshot(context?: ToolContext) {
+    if (process.platform === 'win32') {
+      const shot = ensureNative().capture(0, 82);
+      const file = path.join(os.tmpdir(), `0kay-screen-${Date.now()}-${randomUUID()}.jpg`);
+      await fs.writeFile(file, shot.buffer);
+      return {
+        path: file,
+        preview: file,
+        sha256: createHash('sha256').update(shot.buffer).digest('hex'),
+        width: shot.width,
+        height: shot.height,
+        mime: 'image/jpeg',
+        base64: shot.buffer.toString('base64'),
+        coordinateSpace: 'original screen pixels (width/height)',
+      };
+    }
     const stamp = `${Date.now()}-${randomUUID()}`;
     const png = path.join(os.tmpdir(), `0kay-screen-${stamp}.png`);
     const jpg = path.join(os.tmpdir(), `0kay-screen-${stamp}.jpg`);
     let previewPath = png;
     let mime = 'image/png';
-    if (process.platform === 'win32') {
-      const q = (value: string) => "'" + value.replace(/'/g, "''") + "'";
-      const script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(" + q(png) + ",[System.Drawing.Imaging.ImageFormat]::Png); $mw=1280; if($b.Width -gt $mw){$nh=[int]($b.Height*$mw/$b.Width); $small=New-Object System.Drawing.Bitmap $mw,$nh; $g2=[System.Drawing.Graphics]::FromImage($small); $g2.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g2.DrawImage($bmp,0,0,$mw,$nh); $g2.Dispose(); $small.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg); $small.Dispose()} else {$bmp.Save(" + q(jpg) + ",[System.Drawing.Imaging.ImageFormat]::Jpeg)}; $g.Dispose(); $bmp.Dispose()";
-      await this.powershell(script, context, 40_000);
-      previewPath = jpg; mime = 'image/jpeg';
-    } else if (process.platform === 'darwin') {
+    if (process.platform === 'darwin') {
       await this.run('screencapture', ['-x', png], context);
       previewPath = (await this.downscaleMac(png, jpg, context)) ? jpg : png;
       mime = previewPath === jpg ? 'image/jpeg' : 'image/png';
@@ -832,9 +879,7 @@ export class ComputerUseTool extends Tool {
   private async listWindows(context?: ToolContext) {
     let windows: string[];
     if (process.platform === 'win32') {
-      const script = "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { \"$($_.ProcessName) :: $($_.MainWindowTitle)\" }";
-      const { stdout } = await this.powershell(script, context);
-      windows = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      windows = ensureNative().listWindows();
     } else if (process.platform === 'darwin') {
       const script = 'tell application "System Events" to get name of (processes where background only is false)';
       const { stdout } = await this.run('osascript', ['-e', script], context);
@@ -863,13 +908,16 @@ export class ComputerUseTool extends Tool {
     const text = String(args.text ?? '');
     if (!text) throw new Error('text is required');
     if (process.platform === 'win32') {
-      const escaped = text.replace(/[+^%~(){}\[\]]/g, (char) => `{${char}}`);
-      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`, context);
+      ensureNative().typeText(text);
     } else if (process.platform === 'darwin') {
-      await this.run('osascript', ['-e', `tell application "System Events" to keystroke "${appleScriptEscape(text)}"`], context);
+      if (!this.tryNative((native) => native.typeText(text))) {
+        await this.run('osascript', ['-e', `tell application "System Events" to keystroke "${appleScriptEscape(text)}"`], context);
+      }
     } else if (process.platform === 'linux') {
-      await this.requireCommand('xdotool', context, 'install xdotool');
-      await this.run('xdotool', ['type', '--', text], context);
+      if (!this.tryNative((native) => native.typeText(text))) {
+        await this.requireCommand('xdotool', context, 'install xdotool');
+        await this.run('xdotool', ['type', '--', text], context);
+      }
     } else {
       throw new Error(`computeruse is not supported on ${process.platform}`);
     }
@@ -880,13 +928,16 @@ export class ComputerUseTool extends Tool {
     const raw = String(args.key ?? '');
     if (!raw) throw new Error('key is required');
     if (process.platform === 'win32') {
-      const expression = windowsKeyExpression(raw);
-      await this.powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${expression.replace(/'/g, "''")}')`, context);
+      ensureNative().pressHotkey(raw);
     } else if (process.platform === 'darwin') {
-      await this.run('osascript', ['-e', `tell application "System Events" to ${appleScriptForKey(raw)}`], context);
+      if (!this.tryNative((native) => native.pressHotkey(raw))) {
+        await this.run('osascript', ['-e', `tell application "System Events" to ${appleScriptForKey(raw)}`], context);
+      }
     } else if (process.platform === 'linux') {
-      await this.requireCommand('xdotool', context, 'install xdotool');
-      await this.run('xdotool', ['key', '--', linuxKeyExpression(raw)], context);
+      if (!this.tryNative((native) => native.pressHotkey(raw))) {
+        await this.requireCommand('xdotool', context, 'install xdotool');
+        await this.run('xdotool', ['key', '--', linuxKeyExpression(raw)], context);
+      }
     } else {
       throw new Error(`computeruse is not supported on ${process.platform}`);
     }
@@ -898,15 +949,44 @@ export class ComputerUseTool extends Tool {
     const delta = args.delta;
     if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 20) throw new Error('delta must be a nonzero integer between -20 and 20');
     if (process.platform === 'win32') {
-      await this.powershell("Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Wheel { [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int x,int y,int d,UIntPtr e); }\n'@; [Wheel]::mouse_event(0x0800,0,0," + (-120 * delta) + ',[UIntPtr]::Zero)', context);
+      ensureNative().scroll(delta);
     } else if (process.platform === 'linux') {
-      await this.requireCommand('xdotool', context, 'install xdotool');
-      await this.run('xdotool', ['click', '--repeat', String(Math.abs(delta)), '--delay', '30', delta > 0 ? '5' : '4'], context);
+      if (!this.tryNative((native) => native.scroll(delta))) {
+        await this.requireCommand('xdotool', context, 'install xdotool');
+        await this.run('xdotool', ['click', '--repeat', String(Math.abs(delta)), '--delay', '30', delta > 0 ? '5' : '4'], context);
+      }
     } else if (process.platform === 'darwin') {
-      await this.requireCommand('osascript', context, 'macOS automation permission required');
-      await this.run('osascript', ['-l', 'JavaScript', '-e', `ObjC.import('CoreGraphics'); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateScrollWheelEvent(null, 1, 1, ${-delta}));`], context);
+      if (!this.tryNative((native) => native.scroll(delta))) {
+        await this.requireCommand('osascript', context, 'macOS automation permission required');
+        await this.run('osascript', ['-l', 'JavaScript', '-e', `ObjC.import('CoreGraphics'); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateScrollWheelEvent(null, 1, 1, ${-delta}));`], context);
+      }
     } else throw new Error(`computeruse is not supported on ${process.platform}`);
     return { action: 'scroll', delta };
+  }
+
+  private async drag(args: Record<string, any>, context?: ToolContext) {
+    const fromX = clamp(args.x, -1, 0, 100000), fromY = clamp(args.y, -1, 0, 100000);
+    const toX = clamp(args.x2, -1, 0, 100000), toY = clamp(args.y2, -1, 0, 100000);
+    if (fromX < 0 || fromY < 0 || toX < 0 || toY < 0) throw new Error('x, y, x2 and y2 are required');
+    const button = args.button === 'right' ? 'right' : 'left';
+    const duration = clamp(args.duration, 300, 0, 5000);
+    if (process.platform === 'win32') {
+      ensureNative().drag(fromX, fromY, toX, toY, button, duration);
+    } else if (process.platform === 'darwin') {
+      if (!this.tryNative((native) => native.drag(fromX, fromY, toX, toY, button, duration))) {
+        await this.requireCommand('cliclick', context, 'brew install cliclick');
+        await this.run('cliclick', [`dd:${fromX},${fromY}`, `dm:${toX},${toY}`, `du:${toX},${toY}`], context);
+      }
+    } else if (process.platform === 'linux') {
+      if (!this.tryNative((native) => native.drag(fromX, fromY, toX, toY, button, duration))) {
+        await this.requireCommand('xdotool', context, 'install xdotool');
+        const code = button === 'right' ? '3' : '1';
+        await this.run('xdotool', ['mousemove', String(fromX), String(fromY), 'mousedown', code], context);
+        await this.run('xdotool', ['mousemove', String(toX), String(toY)], context);
+        await this.run('xdotool', ['mouseup', code], context);
+      }
+    } else throw new Error(`computeruse is not supported on ${process.platform}`);
+    return { action: 'drag', from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, button };
   }
 
   private async pointer(args: Record<string, any>, click: boolean, context?: ToolContext) {
@@ -915,18 +995,21 @@ export class ComputerUseTool extends Tool {
     if (x < 0 || y < 0) throw new Error('x and y are required');
     const button = args.button === 'right' ? 'right' : 'left';
     if (process.platform === 'win32') {
-      const flags = click ? (button === 'right' ? '0x0008;0x0010' : '0x0002;0x0004') : '';
-      const clickScript = flags ? flags.split(';').map((flag) => `[Mouse]::mouse_event(${flag},0,0,0,[UIntPtr]::Zero)`).join(';') : '';
-      const script = "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class Mouse { [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X,int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int f,int dx,int dy,int d,UIntPtr e); }\n'@; [Mouse]::SetCursorPos(" + x + ',' + y + ");" + clickScript + (args.double ? '; Start-Sleep -Milliseconds 60; ' + clickScript : '');
-      await this.powershell(script, context);
+      const native = ensureNative();
+      if (click) native.click(x, y, button, !!args.double);
+      else native.moveMouse(x, y);
     } else if (process.platform === 'darwin') {
-      await this.requireCommand('cliclick', context, 'brew install cliclick');
-      const command = click ? `${args.double ? 'dc' : button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
-      await this.run('cliclick', [command], context);
+      if (!this.tryNative((native) => (click ? native.click(x, y, button, !!args.double) : native.moveMouse(x, y)))) {
+        await this.requireCommand('cliclick', context, 'brew install cliclick');
+        const command = click ? `${args.double ? 'dc' : button === 'right' ? 'rc' : 'c'}:${x},${y}` : `m:${x},${y}`;
+        await this.run('cliclick', [command], context);
+      }
     } else if (process.platform === 'linux') {
-      await this.requireCommand('xdotool', context, 'install xdotool');
-      const args2 = click ? ['mousemove', String(x), String(y), 'click', '--repeat', args.double ? '2' : '1', '--delay', '60', button === 'right' ? '3' : '1'] : ['mousemove', String(x), String(y)];
-      await this.run('xdotool', args2, context);
+      if (!this.tryNative((native) => (click ? native.click(x, y, button, !!args.double) : native.moveMouse(x, y)))) {
+        await this.requireCommand('xdotool', context, 'install xdotool');
+        const args2 = click ? ['mousemove', String(x), String(y), 'click', '--repeat', args.double ? '2' : '1', '--delay', '60', button === 'right' ? '3' : '1'] : ['mousemove', String(x), String(y)];
+        await this.run('xdotool', args2, context);
+      }
     } else {
       throw new Error(`computeruse is not supported on ${process.platform}`);
     }

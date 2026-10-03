@@ -37,6 +37,8 @@ function messageText(message: any): string {
   return `${message.content || ''}${parts}`
 }
 
+const MAX_LEDGER_BLOCKS = 100
+
 export class ContextLedger {
   private blocks: LedgerBlock[] = []
   private counter = 0
@@ -66,6 +68,9 @@ export class ContextLedger {
     }
     history.splice(from, to - from + 1, { role: 'user', content: `${this.marker(id)} ${block.summary}` })
     this.blocks.push(block)
+    if (this.blocks.length > MAX_LEDGER_BLOCKS) {
+      this.blocks.shift()
+    }
     return block
   }
 

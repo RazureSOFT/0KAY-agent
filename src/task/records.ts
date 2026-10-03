@@ -3,6 +3,26 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import {coreHeaders,coreFetch} from '../connection.js';
 
+/**
+ * Drop large base64/image payloads from a tool result before it is recorded.
+ * The ledger is polled by the WebUI (short deadlines), so embedding a full
+ * computeruse screenshot made /api/tasks multi-megabyte and slow. The file
+ * path and geometry are kept; only the inline pixels are removed.
+ */
+function redactRecord(value: any, depth = 0): any {
+  if (depth > 8 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((entry) => redactRecord(entry, depth + 1));
+  const out: Record<string, any> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if ((key === 'base64' || key === 'image') && typeof entry === 'string' && entry.length > 512) {
+      out[key] = `[omitted ${entry.length} chars]`;
+    } else {
+      out[key] = redactRecord(entry, depth + 1);
+    }
+  }
+  return out;
+}
+
 export class TaskRecorder {
   private file = path.join(process.env.AGENT_DATA_DIR || './data/agent', 'task-outbox.json');
   private chain: Promise<void> = Promise.resolve();
@@ -45,7 +65,7 @@ export class TaskRecorder {
     await this.record(event);
     try {
       const result: any = await operation();
-      await this.record({ ...event, state: result?.success === false ? 'failed' : 'done', result: JSON.stringify(result), error: result?.error || '' });
+      await this.record({ ...event, state: result?.success === false ? 'failed' : 'done', result: JSON.stringify(redactRecord(result)), error: result?.error || '' });
       return result;
     } catch (error: any) {
       await this.record({ ...event, state: error.name === 'AbortError' || /cancelled/i.test(error.message) ? 'cancelled' : 'failed', error: error.message });
