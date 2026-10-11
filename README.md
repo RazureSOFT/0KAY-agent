@@ -3,6 +3,8 @@
 > Part of **[0KAY](https://github.com/RazureSOFT/0KAY)** — a self-hosted AI
 > companion that remembers you, with a real agent underneath.
 
+> **Language / 语言**: English · [简体中文](README.zh-CN.md)
+
 This repository is the **Agent**: the task-execution plugin of the 0KAY platform.
 When you ask the companion to actually *do* something — inspect a repository,
 edit files, run commands, browse the web, or drive the desktop — this process
@@ -24,6 +26,9 @@ MCP/LLM integration.
   show exactly what changed.
 - **Extends via skills and MCP**: built-in `code` / `research` / `general`
   skills plus `skills/*.md`, and any MCP server Core exposes.
+- **Plans with a big model, implements with a small one** (optional duet mode):
+  the think model drafts the plan and a self-contained implementation prompt,
+  then the loop runs pinned to the output model.
 
 ## Who it's for
 
@@ -66,6 +71,31 @@ The process registers as plugin `agent` with Core and heartbeats every 10
 seconds, re-registering after a disconnect. The reported plugin version is read
 from `manifest.json`, which is the single source of truth for the release
 version.
+
+## Task kinds: Plan / Agent / Work
+
+The WebUI composer (and `agent_type`) offers three top-level kinds. Only the
+**Agent** kind has second-level options (sub-kinds).
+
+| Kind | `agent_type` | Behavior |
+|---|---|---|
+| **Plan** | `plan` | Planning-only run: read-only research, then a structured plan document. Files are never modified. |
+| **Agent** | sub-kind | Autonomous multi-step execution. Sub-kinds map to skill files and are force-applied: `general`, `code`, `code_explore` (exploration fan-out to independent explorer sub-agents), `research`, `science`. Adding a sub-kind is a new `skills/<name>.md`. |
+| **Work** | `work` | Focused single-pass execution: direct edits, minimal questions, cheap verification. |
+
+## Duet mode (duet_mode)
+
+Settings expose `duet_mode` (a per-task `duet_mode=1|0` option wins). When
+enabled and no model is pinned manually:
+
+1. `ChooseModels` returns the think/output pair.
+2. The **think** model drafts the implementation plan plus a self-contained
+   implementation prompt inside `<implementation_prompt>…</implementation_prompt>`;
+   the plan lands in the transcript as an assistant message.
+3. The loop runs **pinned to the output model** with the plan in history and
+   implements without re-planning.
+
+Planning failures fall back to the normal single-model loop.
 
 ## Configuration
 
