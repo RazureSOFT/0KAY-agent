@@ -17,7 +17,7 @@ Workflow:
    - {"action":"figure","out":"research/<slug>/figures","spec":{"kind":"bar","labels":["A","B","C"],"values":[1,2,3],"title":"...","path":"fig2.png"}}
    Only if a chart cannot be expressed this way, write a matplotlib script and run it with bash (dpi=200, no seaborn), still writing into figures/.
 6. Tables: call the research tool with action="table" and spec {"header":[...],"rows":[[...]],"caption":"...","stem":"table1"} to get .docx/.html/.tex.
-7. Manuscript: write the draft to research/<slug>/<slug>.md (Title, Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion, References). Reference every figure inline as ![图注](figures/figN.png) so it is embedded.
+7. Manuscript: write the draft to research/<slug>/<slug>.md (Title, Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion, References). Reference every figure inline as ![图注](figures/figN.png) so it is embedded. To place 2-3 small figures side by side, write their lines consecutively with no blank line between them — they become 图N(a)/(b) in one row; add {width=30%} to control a share, otherwise the row is split equally.
 8. DOCX: call the research tool with action="paper" and spec {"markdown_path":"research/<slug>/<slug>.md","title":"...","stem":"<slug>"} — it produces <slug>.docx (figures embedded) and <slug>.html.
 9. Verify the .docx exists, then report its absolute path, the figure list and the source list.
 

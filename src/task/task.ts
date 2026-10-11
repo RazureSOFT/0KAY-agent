@@ -92,8 +92,10 @@ export class TaskManager {
   }
 
   private wake(): void {
-    const waiting = this.waiters.splice(0);
-    if (waiting.length > 0) waiting[0]();
+    // Wake exactly one waiter per freed slot; the woken loop re-checks the
+    // concurrency limit and re-queues itself, so nobody is orphaned.
+    const next = this.waiters.shift();
+    if (next) next();
   }
 
   async executeTask(id: string, executor: (task: Task) => Promise<string>, nested = false): Promise<string> {

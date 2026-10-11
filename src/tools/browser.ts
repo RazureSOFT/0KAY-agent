@@ -405,9 +405,24 @@ export class BrowserController {
     return String(await this.evaluate('document.readyState').catch(() => 'complete'));
   }
 
-  async action(command: string, args: Record<string, any>): Promise<any> {
+  /** Reject `promise` as soon as `signal` aborts so a cancelled task does not
+   *  wait on a long CDP call. The underlying work is abandoned, not interrupted. */
+  private raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error('browser action aborted'));
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+        (error: Error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+      );
+    });
+  }
+
+  async action(command: string, args: Record<string, any>, signal?: AbortSignal): Promise<any> {
     try {
-      const result = await this.run(command, args);
+      const run = this.run(command, args);
+      const result = await (signal ? this.raceAbort(run, signal) : run);
       await this.refreshStatus().catch(() => {});
       this.touch({ error: '' });
       return result;

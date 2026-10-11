@@ -402,6 +402,11 @@ export class MocrProvider {
           thinkingContent: resp.thinkingContent || undefined,
           role: resp.role || undefined,
           text: resp.text || undefined,
+          // mocr reports the model actually used (after any auto-switch) and the
+          // requested one; the UI renders "requested unavailable · fell back to X".
+          model: resp.model || undefined,
+          requestedModel: resp.requestedModel || undefined,
+          fallbackReason: resp.fallbackReason || undefined,
           toolCalls: Array.isArray(resp.toolCalls)
             ? resp.toolCalls.map((tool: any) => ({
                 id: tool.id || '',
@@ -466,6 +471,44 @@ export class MocrProvider {
       if (!model?.modelId) throw new Error('No model selected');
       this.selectedProviders.set(model.modelId, model.provider || '');
       return model.modelId;
+  }
+
+  /**
+   * Choose BOTH think (strong) and output (light) models via mocr. Duet mode
+   * uses the pair directly: the think model drafts the plan and the
+   * implementation prompt, the loop then runs pinned to the output model.
+   */
+  async chooseModelPair(
+    prompt: string,
+    requireThinking = false,
+    difficultyHint = 0.5,
+    signal?: AbortSignal,
+  ): Promise<{ thinkModel: string; outputModel: string }> {
+      signal?.throwIfAborted();
+      const stub = getStub(this.config.grpcAddress)
+      const resp: any = await new Promise((resolve, reject) => {
+        const call = stub.ChooseModels(
+          {
+            prompt,
+            context: {
+              difficultyHint: Number.isFinite(difficultyHint) ? difficultyHint : 0.5,
+              maxTokens: 1024,
+              requireThinking,
+            },
+          },
+          modelMetadata(), { deadline: Date.now() + 15000 },
+          (err: any, r: any) => { signal?.removeEventListener('abort', cancel); err ? reject(err) : resolve(r); },
+        )
+        const cancel = () => call.cancel();
+        signal?.addEventListener('abort', cancel, { once: true });
+        if (signal?.aborted) cancel();
+      })
+      const think = resp?.thinkModel?.modelId
+      const output = resp?.outputModel?.modelId
+      if (!think || !output) throw new Error('No model pair selected');
+      this.selectedProviders.set(think, resp?.thinkModel?.provider || '');
+      this.selectedProviders.set(output, resp?.outputModel?.provider || '');
+      return { thinkModel: think, outputModel: output };
   }
 
   private splitIntoChunks(text: string, size: number): string[] {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as grpc from '@grpc/grpc-js';
 import * as loader from '@grpc/proto-loader';
 import * as http from 'node:http';
-import { Agent } from './agent/agent.js';
+import { Agent, formatTodoList } from './agent/agent.js';
 import { MocrProvider } from './provider/mocr.js';
 import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, ResearchTool, resolveResearchSrc, appleScriptForKey, linuxKeyExpression } from './tools/tools.js';
 import { posixInput } from './tools/posix_native.js';
@@ -499,27 +499,36 @@ test('hotkeys map to portable macOS and Linux backends', () => {
 });
 
 test('attachment metadata becomes inlined text and multimodal image parts', async () => {
+  const seen: string[] = [];
   const server = http.createServer((req, res) => {
+    seen.push(req.url || '');
     if (!req.url?.startsWith('/api/files')) { res.writeHead(404); res.end('missing'); return; }
     res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ATTACH-BYTES');
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address() as { port: number };
+  // Attachment URLs resolve against the Core base, so point Core at the mock.
+  const savedCoreHttp = process.env.CORE_HTTP_ADDR;
+  process.env.CORE_HTTP_ADDR = `http://127.0.0.1:${address.port}`;
   try {
     const agent = new Agent();
     const { text, images } = await (agent as any).collectAttachments(JSON.stringify([
-      { name: 'notes.txt', url: `http://127.0.0.1:${address.port}/api/files?file=file_1.txt`, mime: 'text/plain', size: 12 },
-      { name: 'shot.png', url: `http://127.0.0.1:${address.port}/api/files?file=file_2.png`, mime: 'image/png', size: 12 },
-      { name: 'missing.bin', url: `http://127.0.0.1:${address.port}/nope`, mime: 'application/octet-stream', size: 0 },
+      { name: 'notes.txt', url: '/api/files?file=file_1.txt', mime: 'text/plain', size: 12 },
+      { name: 'shot.png', url: '/api/files?file=file_2.png', mime: 'image/png', size: 12 },
+      { name: 'missing.bin', url: '/nope', mime: 'application/octet-stream', size: 0 },
+      { name: 'evil.txt', url: 'http://evil.example.com/file.txt', mime: 'text/plain', size: 0 },
     ]), new AbortController().signal);
     assert.match(text, /notes\.txt/);
     assert.match(text, /```\nATTACH-BYTES\n```/); // text inlined into the prompt
     assert.match(text, /download failed/);
+    assert.match(text, /evil\.txt .*attachment rejected/); // absolute URL outside Core is refused
     assert.equal(images.length, 1);
     assert.equal(images[0].type, 'image');
     assert.equal(images[0].mimeType, 'image/png');
     assert.match(images[0].imageUrl || '', /^data:image\/png;base64,/); // image handed straight to the model
+    assert.ok(seen.every((url) => url === '/nope' || url.startsWith('/api/files')), 'no request may leave the Core host');
   } finally {
+    if (savedCoreHttp === undefined) delete process.env.CORE_HTTP_ADDR; else process.env.CORE_HTTP_ADDR = savedCoreHttp;
     server.closeAllConnections?.();
     server.close();
   }
@@ -702,4 +711,42 @@ test('browser tool reports status without launching', async () => {
   assert.ok(res.success, res.error);
   assert.equal(typeof res.data.running, 'boolean');
   assert.equal(typeof res.data.available, 'boolean');
+});
+
+test('formatTodoList marks statuses and drops cancelled/empty items', () => {
+  const block = formatTodoList([
+    { content: 'alpha', status: 'completed' },
+    { content: 'beta', status: 'in_progress' },
+    { content: 'gamma-cancelled', status: 'cancelled' },
+    { content: '   ', status: 'pending' },
+  ]);
+  assert.ok(block.includes('[x] alpha'));
+  assert.ok(block.includes('[>] beta'));
+  assert.ok(!block.includes('gamma-cancelled'));
+  assert.equal(formatTodoList([]), '');
+});
+
+test('live todo list is injected into the system prompt each iteration', async () => {
+  const agent = new Agent();
+  (agent as any).recorder.run = async (_k: any, _p: any, _id: any, _s: any, operation: any) => operation();
+  agent.applySettings({ model_id: 'mock' });
+  const systemPrompts: string[] = [];
+  let turn = 0;
+  (agent as any).mocr = {
+    async *generate(request: any) {
+      systemPrompts.push(String(request.systemPrompt || ''));
+      turn += 1;
+      if (turn === 1) {
+        yield { done: true, toolCalls: [{ id: 'c1', name: 'todowrite', arguments: JSON.stringify({ todos: [
+          { content: '搭模型', status: 'in_progress' },
+          { content: '出图', status: 'pending' },
+        ] }) }] };
+      } else {
+        yield { chunk: 'finished', done: true, finishReason: 'FINISH_REASON_STOP', text: 'finished' };
+      }
+    },
+  };
+  const result = await agent.executeTask('todo-prompt', 'test', undefined, { permission_mode: 'full_access' });
+  assert.equal(result, 'finished');
+  assert.ok(systemPrompts.some((p) => p.includes('Current todo list') && p.includes('[>] 搭模型') && p.includes('[ ] 出图')));
 });

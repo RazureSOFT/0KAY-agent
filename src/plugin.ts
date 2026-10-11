@@ -11,7 +11,7 @@ import * as os from 'os'
 import * as path from 'path'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { randomUUID } from 'crypto'
-import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetch,setPluginIdentity} from './connection.js'
+import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetch,setPluginIdentity,setExecutorIdentity} from './connection.js'
 import { fileURLToPath } from 'url'
 import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
@@ -182,7 +182,7 @@ async function registerWithCore(proto: any): Promise<string | null> {
             type: 'bool',
             label: '网络工具',
             defaultValue: 'true',
-            help: '允许 webfetch 与 SearXNG websearch',
+            help: '允许 webfetch 与 websearch（Core 内置搜索）',
           },
           {
             key: 'enable_task_tool',
@@ -281,6 +281,20 @@ async function registerWithCore(proto: any): Promise<string | null> {
             label: '免审批工具',
             defaultValue: DEFAULT_AUTO_APPROVE_TOOLS,
             help: '逗号分隔的工具名，直接执行不弹确认；bash 建议保持审批（如需放开：read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,bash）',
+          },
+          {
+            key: 'minimal_mode',
+            type: 'bool',
+            label: '极简模式',
+            defaultValue: 'false',
+            help: '推理与修改过程只用英文、输出极简、按最小改动编辑；仅提问与最终结论使用用户语言',
+          },
+          {
+            key: 'duet_mode',
+            type: 'bool',
+            label: '大小模型协作（duet）',
+            defaultValue: 'false',
+            help: '开启后自动选型：大模型（think）定方案并写出实现提示词，小模型（output）按提示词完成实现；手动指定模型时不生效',
           },
         ],
       },
@@ -397,6 +411,8 @@ async function pollAgentSettings(): Promise<void> {
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
       always_allow_tools:
         typeof values.always_allow_tools === 'string' ? values.always_allow_tools : DEFAULT_AUTO_APPROVE_TOOLS,
+      minimal_mode: values.minimal_mode === true,
+      duet_mode: values.duet_mode === true,
     })
     taskManager.setMaxConcurrentTasks(Number(values.max_concurrent_tasks ?? 5))
   } catch {
@@ -559,6 +575,7 @@ export async function startPlugin(): Promise<void> {
   executorId=process.env.AGENT_EXECUTOR_ID || await readFile(identityPath,'utf8').catch(error=>{if(error.code!=='ENOENT') throw error;return ''})
   if(!executorId.trim()) {executorId=randomUUID();await writeFile(identityPath,executorId,'utf8')}
   executorId=executorId.trim()
+  setExecutorIdentity(executorId)
   console.log('[Agent] Loading protos from', PROTO_DIR)
   const proto = loadProtos()
 

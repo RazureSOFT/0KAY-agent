@@ -31,7 +31,13 @@ export class TaskRecorder {
     const operation = this.chain.then(async () => {
       if (!this.pending) {
         try { this.pending = JSON.parse(await fs.readFile(this.file, 'utf8')); }
-        catch (error: any) { if (error.code !== 'ENOENT') throw error; this.pending = []; }
+        catch (error: any) {
+          if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+          // A torn write (e.g. NUL bytes after a crash) must not wedge the
+          // recorder: the outbox is disposable, so start over and overwrite.
+          if (error.code !== 'ENOENT') console.warn('[Agent] task outbox unreadable, resetting:', error.message);
+          this.pending = [];
+        }
       }
         if (event) {
           event={...event};for(const key of ['prompt','result','error','args','reasoning']) if(typeof event[key]==='string' && event[key].length>200000) event[key]=event[key].slice(0,200000)+'\n[record truncated]';

@@ -18,6 +18,7 @@ import { buildDocx, buildPptx, type DocBlock, type SlideSpec } from './office.js
 import { browserController } from './browser.js';
 import { ensureNative, nativeAvailable } from './win_native.js';
 import { posixInput, type PosixInput } from './posix_native.js';
+import { isPathAllowed } from '../workspace/paths.js';
 
 const exec = promisify(execCallback);
 // ESM has no __dirname; used to locate the sibling `life/src` package.
@@ -90,6 +91,22 @@ function clamp(value: unknown, fallback: number, min: number, max: number): numb
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
+/** Reject `promise` as soon as `signal` aborts (the underlying work is abandoned,
+ *  not interrupted). Resolves/rejects with the original promise otherwise. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+  if (!signal) return promise;
+  const abortError = () => (signal.reason instanceof Error ? signal.reason : new Error(message));
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
+}
+
 function limitOutput(value: string): { text: string; truncated: boolean } {
   if (value.length <= MAX_OUTPUT) return { text: value, truncated: false };
   return { text: `${value.slice(0, MAX_OUTPUT)}\n\n[output truncated]`, truncated: true };
@@ -105,7 +122,8 @@ async function spillOutput(value: string, taskId: string, label: string): Promis
   try {
     const dir = path.join(os.tmpdir(), '0kay-agent-output');
     await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${(taskId || 'task').replace(/[^\w.-]+/g, '_')}-${label}.log`);
+    // A random suffix keeps parallel commands from overwriting each other's spill files.
+    const file = path.join(dir, `${(taskId || 'task').replace(/[^\w.-]+/g, '_')}-${label}-${randomUUID()}.log`);
     await fs.writeFile(file, value, 'utf8');
     return { text: `${capped.text}\n\n[full ${label} (${value.length} chars) saved to ${file}]`, truncated: true, fullPath: file };
   } catch {
@@ -208,6 +226,7 @@ export class WriteTool extends Tool {
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const filePath = resolvePath(args.filePath, context.cwd);
+      if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
       if (typeof args.content !== 'string') throw new Error('content must be a string');
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       const existed = await fs.stat(filePath).then(() => true).catch(() => false);
@@ -230,6 +249,7 @@ export class EditTool extends Tool {
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const filePath = resolvePath(args.filePath, context.cwd);
+      if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
       if (typeof args.oldString !== 'string' || typeof args.newString !== 'string') throw new Error('oldString and newString must be strings');
       if (args.oldString === args.newString) throw new Error('oldString and newString are identical');
       const original = await fs.readFile(filePath, 'utf8');
@@ -261,6 +281,7 @@ export class ApplyPatchTool extends Tool {
       const staged: Array<{ filePath: string; original: string; updated: string }> = [];
       for (const patch of args.patches) {
         const filePath = resolvePath(patch?.filePath, context.cwd);
+        if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
         if (typeof patch.oldString !== 'string' || typeof patch.newString !== 'string' || !patch.oldString) throw new Error(`invalid patch for ${filePath}`);
         const original = [...staged].reverse().find(p => p.filePath === filePath)?.updated ?? await fs.readFile(filePath, 'utf8');
         const count = original.split(patch.oldString).length - 1;
@@ -455,7 +476,7 @@ export class WebFetchTool extends Tool {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      }, redirect: 'follow' }, clamp(args.timeout, 30, 1, 120) * 1000);
+      } }, clamp(args.timeout, 30, 1, 120) * 1000);
       const html = await response.text();
       const format = args.format || 'markdown';
       const content = format === 'html' ? html : html
@@ -624,7 +645,11 @@ export class McpTool extends Tool {
       if (args.action === 'list') return success({ tools: context.mcp.listTools() });
       if (args.action !== 'call') throw new Error('action must be list or call');
       if (typeof args.server !== 'string' || typeof args.tool !== 'string') throw new Error('server and tool are required for a call');
-      return success({ server: args.server, tool: args.tool, result: await context.mcp.callTool(args.server, args.tool, args.args && typeof args.args === 'object' ? args.args : {}) });
+      // The manager's callTool takes no signal, so race the abort to stop waiting
+      // on a hung server when the task is cancelled.
+      const call = context.mcp.callTool(args.server, args.tool, args.args && typeof args.args === 'object' ? args.args : {});
+      const result = await raceAbort(call, context.signal, `MCP call ${args.server}:${args.tool} aborted`);
+      return success({ server: args.server, tool: args.tool, result });
     } catch (error) { return failure(error); }
   }
 }
@@ -1049,6 +1074,7 @@ export class DocumentTool extends Tool {
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const filePath = resolvePath(args.path, context.cwd);
+      if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
       const ext = path.extname(filePath).toLowerCase().replace('.', '');
       const format = String(args.format || ext || 'docx').toLowerCase();
       const blocks: DocBlock[] = Array.isArray(args.blocks) && args.blocks.length
@@ -1094,6 +1120,7 @@ export class SlidesTool extends Tool {
     try {
       if (!Array.isArray(args.slides) || args.slides.length === 0) throw new Error('slides must be a non-empty array');
       const filePath = resolvePath(args.path, context.cwd);
+      if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
       const slides: SlideSpec[] = args.slides.map((s: any) => ({
         title: String(s?.title ?? ''),
         bullets: Array.isArray(s?.bullets) ? s.bullets.map((b: any) => String(b)) : [],
@@ -1120,11 +1147,11 @@ export class BrowserTool extends Tool {
       fullPage: { type: 'boolean' }, timeout: { type: 'integer' },
     }};
   }
-  async execute(args: Record<string, any>, _context: ToolContext): Promise<ToolResult> {
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const command = String(args.action || '').toLowerCase();
       if (!command) throw new Error('action is required');
-      const result = await browserController.action(command, args);
+      const result = await browserController.action(command, args, context.signal);
       return success(result);
     } catch (error) { return failure(error); }
   }
@@ -1180,6 +1207,7 @@ export class ResearchTool extends Tool {
       const action = String(args.action || '').toLowerCase();
       if (!['figure', 'table', 'paper', 'experiment'].includes(action)) throw new Error('action must be figure, table, paper or experiment');
       const outDir = path.resolve(context.cwd, typeof args.out === 'string' && args.out.trim() ? args.out : '.');
+      if (!isPathAllowed(outDir)) throw new Error('path not allowed: outside workspace roots');
       await fs.mkdir(outDir, { recursive: true });
       const src = resolveResearchSrc();
       const python = process.env.RESEARCH_PYTHON || process.env.PYTHON || 'python';
@@ -1206,6 +1234,7 @@ export class ResearchTool extends Tool {
         if (!spec.path && args.path) spec.path = args.path;
         if (!spec.path) spec.path = path.join(outDir, `${spec.kind || 'figure'}.png`);
         if (!path.isAbsolute(spec.path)) spec.path = path.resolve(outDir, spec.path);
+        if (!isPathAllowed(spec.path)) throw new Error('path not allowed: outside workspace roots');
         await fs.writeFile(tmp, JSON.stringify(spec));
         const output = await run(['plot', tmp, '-o', outDir]);
         return success({ action, file: spec.path, output });

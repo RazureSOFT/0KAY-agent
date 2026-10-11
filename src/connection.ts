@@ -9,6 +9,12 @@ let pluginToken='';
 export function setPluginIdentity(name:string,token:string):void{pluginName=name||'';pluginToken=token||''}
 export function pluginIdentity():{name:string;token:string}{return{name:pluginName,token:pluginToken}}
 
+/** Stable executor id (AGENT_EXECUTOR_ID or the persisted executor-id file);
+ *  stamped onto approvals so decisions can be bound to their executor. */
+let executorIdentityValue='';
+export function setExecutorIdentity(id:string):void{executorIdentityValue=id||''}
+export function executorIdentity():string{return executorIdentityValue}
+
 /** Core HTTP base, used for the egress proxy (CORE_HTTP_ADDR/CORE_HTTP). */
 export function coreHttpBase():string{return (process.env.CORE_HTTP_ADDR||process.env.CORE_HTTP||'http://127.0.0.1:8080').replace(/\/$/,'')}
 

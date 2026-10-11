@@ -19,32 +19,13 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 import { taskRecorder } from '../task/records.js';
-import { coreFetch, coreHeaders, listPluginTools } from '../connection.js';
+import { coreFetch, coreHeaders, coreHttpBase, listPluginTools, executorIdentity } from '../connection.js';
 import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
+import { isPathAllowed } from '../workspace/paths.js';
 
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
-
-/** Allowed roots for workspace writes. Defaults to the process cwd, the user's
- *  home and the temp dir; override with a comma-separated AGENT_WORKSPACE_ROOTS
- *  to lock the WebUI file browser further (e.g. a single project dir). */
-const ALLOWED_WORKSPACE_ROOTS = (() => {
-  const configured = (process.env.AGENT_WORKSPACE_ROOTS || '')
-    .split(',')
-    .map((root) => root.trim())
-    .filter(Boolean);
-  const roots = configured.length > 0
-    ? configured
-    : [process.cwd(), os.homedir(), os.tmpdir()];
-  return roots.map((root) => path.resolve(root));
-})();
-
-function isPathAllowed(resolved: string): boolean {
-  return ALLOWED_WORKSPACE_ROOTS.some(
-    (root) => resolved === root || resolved.startsWith(root + path.sep)
-  );
-}
 
 export interface AgentConfig {
   mocrAddress: string;
@@ -73,14 +54,52 @@ function envCount(name: string, fallback: number, min: number, max: number): num
   return Math.min(max, Math.floor(parsed));
 }
 
-/** Comma-separated tools that execute without approval prompts (bash intentionally excluded). */
+/**
+ * Render the live todo list as a compact checklist for the model. Injected into
+ * the system prompt every turn (and into the compaction summary) so the plan
+ * survives context compression instead of being dropped with the raw history.
+ */
+export function formatTodoList(todo?: Array<{ content?: string; status?: string }>): string {
+  const items = (todo || []).filter((item) => item && String(item.content || '').trim() && item.status !== 'cancelled');
+  if (!items.length) return '';
+  const mark = (status?: string) => status === 'completed' ? '[x]' : status === 'in_progress' ? '[>]' : '[ ]';
+  const remaining = items.filter((item) => item.status !== 'completed').length;
+  const lines = items.map((item) => `${mark(item.status)} ${String(item.content).trim()}`);
+  return `Current todo list — ${remaining} item(s) remaining. Keep it current with todowrite and exactly one item in_progress:\n${lines.join('\n')}`;
+}
+
+/**
+ * Comma-separated tools that execute without an approval prompt.
+ *
+ * Every tool that *modifies existing files* is deliberately absent: write, edit
+ * and apply_patch all sit behind the gate, as do bash, computeruse, browser and
+ * the MCP surface. Auto-approving them made the approval gate decorative and
+ * contradicted what the README promises about file edits, while the tools that
+ * remain (read-only inspection, search, todo/skill bookkeeping, context
+ * compression) have no side effect worth interrupting the user for.
+ *
+ * document and slides stay auto-approved: they emit new artifacts rather than
+ * overwriting the user's work, and both are confined to the workspace roots.
+ */
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,write,edit,apply_patch,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status';
+  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status';
 
 /**
  * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
  * COMPACTION_HEADINGS so a compacted run and a compacted chat read the same.
  */
+export const DUET_PLAN_SYSTEM_PROMPT =
+  '你是方案规划模型（大模型）。你的职责是为执行模型（能力较弱、没有任何对话上下文）制定一份可直接照做的实现方案。' +
+  '先给出简短的方案概述与分步计划（引用具体文件路径与事实），然后输出一个自包含的实现提示词，' +
+  '用 <implementation_prompt></implementation_prompt> 标签包裹。提示词必须包含：目标、涉及文件与现状、逐步改动要求、约束与验收标准，' +
+  '并且不引用任何"上文/如前所述"——执行模型只能看到这一段提示词。不要在提示词里重新解释方案背景。'
+
+export const DUET_PLAN_USER_PROMPT =
+  '请为下面的任务制定实现方案，并在 <implementation_prompt> 标签内给出交给执行模型的完整实现提示词。'
+
+export const DUET_IMPLEMENT_USER_PROMPT =
+  '方案与实现提示词已就绪。请严格按上面的 <implementation_prompt> 执行实现；遇到与现状冲突的事实以实际代码为准并在进度中说明。不要重新规划。'
+
 export const COMPACTION_SCHEMA_PROMPT =
   'Compress this execution transcript into a faithful, structured working summary so the run can continue after the raw history is dropped. Use EXACTLY these Markdown sections, in this order, and keep every section:\n' +
   '## Objective\n## Important Details\n## Work State\n## Next Move\n## Relevant Files\n' +
@@ -105,6 +124,31 @@ function serializeToolArgs(args: Record<string, any>): string {
   } catch {
     return '{}';
   }
+}
+
+/** Left-to-right balanced {...} candidates for fallback tool-call parsing.
+ *  The depth scan ignores braces inside JSON string literals, so prose like
+ *  "{see note}" around the call cannot swallow or break the payload. */
+function jsonObjectCandidates(text: string, limit = 5): string[] {
+  const out: string[] = [];
+  for (let start = text.indexOf('{'); start >= 0 && out.length < limit; start = text.indexOf('{', start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}' && --depth === 0) { out.push(text.slice(start, i + 1)); break; }
+    }
+  }
+  return out;
 }
 
 /** Runtime settings pulled from Core's /api/settings/agent section. */
@@ -137,6 +181,10 @@ export interface AgentSettings {
   enable_skills?: boolean;
   skills_dir?: string;
   always_allow_tools?: string;
+  /** Minimal mode: English-only internals, terse output, smallest edits (token saving). */
+  minimal_mode?: boolean;
+  /** Duet mode: the think model drafts the plan, the output model implements. */
+  duet_mode?: boolean;
 }
 
 export interface AgentContext {
@@ -172,6 +220,18 @@ function trackSessionPromptTokens(sessionId: string, tokens: number): void {
     const oldest = sessionPromptTokens.keys().next().value;
     if (oldest) sessionPromptTokens.delete(oldest);
   }
+}
+
+/** Tools that mutate files: two parallel calls touching the same target would
+ *  silently clobber each other, so these run through one process-wide promise
+ *  chain. Read-only tools are unaffected and still run concurrently. */
+const FILE_MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'document', 'slides']);
+let fileMutationChain: Promise<unknown> = Promise.resolve();
+function serializeFileMutation<T>(tool: string, task: () => Promise<T>): Promise<T> {
+  if (!FILE_MUTATING_TOOLS.has(tool)) return task();
+  const run = fileMutationChain.then(task, task);
+  fileMutationChain = run.catch(() => {});
+  return run;
 }
 
 export class Agent {
@@ -221,6 +281,8 @@ export class Agent {
       enable_skills: true,
       skills_dir: '',
       always_allow_tools: DEFAULT_AUTO_APPROVE_TOOLS,
+      minimal_mode: false,
+      duet_mode: false,
     };
 
     this.mocr = new MocrProvider({ grpcAddress: this.config.mocrAddress });
@@ -295,6 +357,8 @@ export class Agent {
     if (typeof partial.always_allow_tools === 'string' && partial.always_allow_tools.trim() !== this.settings.always_allow_tools) {
       this.settings.always_allow_tools = partial.always_allow_tools.trim();
     }
+    if (typeof partial.minimal_mode === 'boolean') this.settings.minimal_mode = partial.minimal_mode;
+    if (typeof partial.duet_mode === 'boolean') this.settings.duet_mode = partial.duet_mode;
     this.applyToolToggles();
     void this.refreshPluginTools();
     void this.refreshMcpServers();
@@ -385,7 +449,11 @@ export class Agent {
       }
     } catch { /* keep whatever we have */ }
     if (servers.length) {
-      this.mcp.configure(servers);
+      try {
+        this.mcp.configure(servers);
+      } catch (error: any) {
+        console.warn('[Agent] MCP configure rejected a server config:', error.message);
+      }
       void this.mcp.refresh().catch((error) => console.warn('[Agent] MCP refresh failed:', error.message));
     }
   }
@@ -434,14 +502,29 @@ export class Agent {
     if (!Array.isArray(refs) || refs.length === 0) return { text: '', images: [] };
     const lines: string[] = [];
     const images: MessagePart[] = [];
+    // Attachment URLs always resolve against Core. An absolute http(s) URL
+    // pointing elsewhere would leak the Core bearer token, so it is rejected.
+    const base = coreHttpBase();
+    const baseOrigin = new URL(base).origin;
     for (const ref of refs) {
       const url = String(ref?.url || '');
       if (!url) continue;
       const name = String(ref?.name || path.basename(url.split('?')[0]));
       const mime = String(ref?.mime || '');
-      const absolute = /^https?:\/\//.test(url) ? url : `${CORE_HTTP}${url}`;
+      let absolute = '';
       try {
-        const response = await coreFetch(absolute, { headers: coreHeaders(), signal });
+        const resolved = new URL(url, base);
+        if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') throw new Error('not an http(s) URL');
+        if (resolved.origin !== baseOrigin) throw new Error('host is not the Core service');
+        absolute = resolved.toString();
+      } catch (error: any) {
+        console.warn(`[Agent] rejected attachment URL '${url}': ${error?.message || error}`);
+        lines.push(`- ${name || url} (attachment rejected: ${error?.message || 'invalid URL'})`);
+        continue;
+      }
+      try {
+        const headers = new URL(absolute).origin === baseOrigin ? coreHeaders() : {};
+        const response = await coreFetch(absolute, { headers, signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const bytes = Buffer.from(await response.arrayBuffer());
         if (this.isImageAttachment(name, mime)) {
@@ -533,7 +616,13 @@ export class Agent {
     const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
     for await (const chunk of this.mocr.generate({ modelId, messages: [{ role: 'user', content: transcript }], systemPrompt: COMPACTION_SCHEMA_PROMPT, tools: [], toolChoice: 'none', signal: context.signal, taskId: context.taskId, sessionId, maxTokens: 5000 })) summary += chunk.chunk || '';
     if (!summary.trim()) throw new Error('Context compaction returned no summary');
-    context.history = [{ role: 'user', content: context.prompt }, { role: 'assistant', content: `Structured context summary:\n${summary}` }];
+    // Carry the live todo list across the compaction so the plan is not lost
+    // with the raw history that is being dropped.
+    const todoBlock = formatTodoList(context.todo);
+    context.history = [
+      { role: 'user', content: context.prompt },
+      { role: 'assistant', content: `Structured context summary:\n${summary}${todoBlock ? `\n\n${todoBlock}` : ''}` },
+    ];
   }
 
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
@@ -605,6 +694,55 @@ export class Agent {
         context.history.push({ role: 'user', content: this.explorationDigest(proposals) });
       }
 
+      // Thinking intensity and its derived budget are loop-invariant; hoisted
+      // here so the duet plan phase below can reuse the same values.
+      // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
+      const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
+      const intensity = (options.thinking_intensity || intMatch?.[1] || 'medium').toLowerCase()
+      const numericIntensity=Number(intensity)
+      const difficultyHint = Number.isFinite(numericIntensity) ? Math.max(0,Math.min(100,numericIntensity))/100 : ({ off:0, low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5)
+      const requireThinking = intensity !== 'off' && difficultyHint > 0
+      // Minimal mode: per-task option wins ('1' force-on, '0' force-off), else the global setting.
+      const minimal = options.minimal_mode === '1' || (options.minimal_mode !== '0' && this.settings.minimal_mode);
+      // Thinking budget scales with intensity: reasoning tokens count toward
+      // max_tokens for most reasoning models, so a flat default made every
+      // level look identical.
+      const maxTokens = Math.max(4096, Math.round(difficultyHint * 32768))
+
+      // Duet mode (大模型定方案、小模型写实现): after exploration, the think
+      // model drafts the plan plus a self-contained implementation prompt, and
+      // the loop below runs pinned to the output model. Any planning failure
+      // falls back to the normal loop. A user-pinned model disables the split —
+      // the whole point of the mode is the big/small model pairing.
+      const duet = options.duet_mode === '1' || (options.duet_mode !== '0' && this.settings.duet_mode);
+      const userPinnedModel = !!(options.model_id && options.model_id !== 'MOCR') || !!this.settings.model_id;
+      let duetOutputModel = '';
+      if (duet && !userPinnedModel) {
+        try {
+          const pair = await this.mocr.chooseModelPair(context.prompt, requireThinking, difficultyHint, context.signal);
+          let planText = '';
+          for await (const chunk of this.mocr.generate({
+            modelId: pair.thinkModel,
+            messages: [{ role: 'user', content: DUET_PLAN_USER_PROMPT + '\n\n任务：\n' + context.prompt }],
+            systemPrompt: DUET_PLAN_SYSTEM_PROMPT,
+            tools: [], toolChoice: 'none', signal: context.signal,
+            taskId: context.taskId, sessionId: context.sessionId,
+            maxTokens: Math.max(4096, maxTokens),
+          })) planText += chunk.chunk || '';
+          const impl = /<implementation_prompt>([\s\S]*?)<\/implementation_prompt>/i.exec(planText);
+          const implPrompt = (impl ? impl[1] : planText).trim();
+          if (!implPrompt) throw new Error('duet plan phase returned no implementation prompt');
+          context.history.push(
+            { role: 'assistant', content: planText.trim() },
+            { role: 'user', content: DUET_IMPLEMENT_USER_PROMPT },
+          );
+          duetOutputModel = pair.outputModel;
+        } catch (e: any) {
+          if (context.signal.aborted) throw e;
+          console.warn('[Agent] duet plan phase failed; continuing with the normal loop:', e?.message);
+        }
+      }
+
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
         // `max_iterations` is deprecated: the model-driven context ledger now
@@ -613,21 +751,16 @@ export class Agent {
         if (i >= MAX_LOOP_ITERATIONS) {
           throw new Error(`Agent loop exceeded ${MAX_LOOP_ITERATIONS} iterations without finishing`);
         }
-        // Pinned model wins; otherwise intelligent selection (agent-only ChooseModels)
-        // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
-        const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
-        const intensity = (options.thinking_intensity || intMatch?.[1] || 'medium').toLowerCase()
-        const numericIntensity=Number(intensity)
-        const difficultyHint = Number.isFinite(numericIntensity) ? Math.max(0,Math.min(100,numericIntensity))/100 : ({ off:0, low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5)
-        const requireThinking = intensity !== 'off' && difficultyHint > 0
-        // Thinking budget scales with intensity: reasoning tokens count toward
-        // max_tokens for most reasoning models, so a flat default made every
-        // level look identical.
-        const maxTokens = Math.max(4096, Math.round(difficultyHint * 32768))
+        // Pinned model wins; duet mode pins the output model (the think model
+        // already drafted the plan below); otherwise intelligent selection
+        // (agent-only ChooseModels).
         let modelId = options.model_id === 'MOCR' ? '' : options.model_id || this.settings.model_id;
+        if (!modelId && duetOutputModel) modelId = duetOutputModel;
         if (!modelId) {
+          // The task prompt is enough for difficulty/thinking selection; sending
+          // the whole serialized history here is wasted tokens every iteration.
           modelId = await this.mocr.chooseModels(
-            context.history.map(m => `${m.role}: ${m.content}`).join('\n'),
+            context.prompt,
             requireThinking,
             difficultyHint,
             context.signal,
@@ -648,6 +781,10 @@ export class Agent {
           lastPromptTokens = 0;
         }
 
+        // The live todo list rides in the system prompt every turn, so it stays
+        // visible to the model regardless of how the history was compressed.
+        const todoBlock = formatTodoList(context.todo);
+
         let fullResponse = '';
         let finalText = '';
         let fullReasoning = '';
@@ -656,7 +793,11 @@ export class Agent {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '') + `\nPreferred UI language: ${options.language==='en'?'English':'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}` + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : ''),
+          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '', minimal)
+            + (minimal
+              ? `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Iteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}\n\n${this.minimalDirective(options.language)}`
+              : `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`)
+            + (todoBlock ? `\n\n${todoBlock}` : '') + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : ''),
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,
@@ -676,7 +817,7 @@ export class Agent {
           }
           if (chunk.usage && Number(chunk.usage.promptTokens) > 0) {
               lastPromptTokens = Number(chunk.usage.promptTokens);
-            if (context.sessionId) sessionPromptTokens.set(context.sessionId, lastPromptTokens);
+            if (context.sessionId) trackSessionPromptTokens(context.sessionId, lastPromptTokens);
               if (context.ledger) context.ledger.lastPromptTokens = lastPromptTokens;
           }
           if (chunk.done) {
@@ -844,7 +985,23 @@ export class Agent {
     return lines.join('\n');
   }
 
-  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = ''): string {
+  /**
+   * Strict token-saving rules for minimal mode. Everything internal stays in
+   * English and terse; only user-visible text (questions, final answer) uses
+   * the user's language, and the final answer is capped at the essentials.
+   */
+  private minimalDirective(language: string): string {
+    const userLang = language === 'en' ? 'English' : 'Chinese';
+    return [
+      'MINIMAL MODE (strict token economy) — overrides any conflicting instruction above:',
+      '1. ALL internal output — reasoning, todos, notes, progress text, tool arguments — in English only and as short as possible. Do not narrate steps, explain changes, or restate the task; emit no assistant text before tool calls.',
+      '2. Make the smallest possible change: fewest files, fewest lines, smallest replaceable region (prefer edit over write). No reformatting, renames, drive-by fixes or new comments; reuse existing code and helpers.',
+      `3. If information required to start is missing or ambiguous, stop BEFORE doing anything and ask the user one concise question (question tool) in ${userLang}. Never guess.`,
+      `4. Only the final answer is written in ${userLang}, and it stays under ~6 lines: what changed (file:line), verification result, blockers. No process summary, no extra suggestions.`,
+    ].join('\n');
+  }
+
+  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = '', minimal = false): string {
     const tools = this.tools.listTools();
     const toolDescriptions = tools
       .map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`)
@@ -853,6 +1010,22 @@ export class Agent {
     const skillBlock = this.settings.enable_skills
       ? `\n\n${this.skills.contextBlock(taskPrompt || '', forceSkill)}`
       : '';
+
+    if (minimal) {
+      return `You are an AI agent that can use tools to complete tasks.
+Host OS: ${process.platform}. Working directory: ${cwd}.
+The bash tool actually runs ${process.platform === 'win32' ? 'Windows cmd.exe: use cd/dir, && for chaining, no pwd/ls/Unix heredocs/semicolons; use the cwd argument.' : '/bin/sh'}.
+Use write/edit for code files. Tool/program errors may be the correct diagnostic result; report them honestly instead of forcing success.
+Verify every factual claim against evidence you retrieved and cite its source (file path, URL, DOI); never invent facts, citations or paths.
+
+Available tools:
+${toolDescriptions}
+${skillBlock}
+
+Use native tool calls when your model supports them; batch independent calls. Without native function calling, output exactly one JSON object:
+{"tool": "tool_name", "args": {"param": "value"}}
+Continue until the task is complete, then return a concise plain-text final answer.`;
+    }
 
     return `You are an AI agent that can use tools to complete tasks.
 
@@ -923,7 +1096,7 @@ factual claim and unverified items clearly marked.`;
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
-    return this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
+    return serializeFileMutation(toolCall.name, () => this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
       cwd: context.cwd,
       taskId: context.taskId,
       sessionId: context.sessionId,
@@ -941,21 +1114,28 @@ factual claim and unverified items clearly marked.`;
               () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, context.options),
               subTaskId);
           },
-    }), undefined, serializeToolArgs(args));
+    }), undefined, serializeToolArgs(args)));
   }
 
   private parseToolCall(response: string): { name: string; args: Record<string, any> } | null {
-    try {
-      // Try to extract JSON from response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (parsed.tool) {
-          return { name: parsed.tool, args: parsed.args || {} };
+    // A ```json fenced block is the strongest signal, so it is tried before the
+    // balanced-object scan of the surrounding prose.
+    const candidates: string[] = [];
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(response);
+    if (fenced && fenced[1].trim().startsWith('{')) candidates.push(fenced[1].trim());
+    candidates.push(...jsonObjectCandidates(response));
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (typeof parsed?.tool === 'string' && parsed.tool.trim()) {
+          return {
+            name: parsed.tool,
+            args: parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args) ? parsed.args : {},
+          };
         }
+      } catch {
+        // Not a valid JSON tool call — try the next candidate.
       }
-    } catch {
-      // Not a valid JSON tool call
     }
     return null;
   }
@@ -967,6 +1147,8 @@ factual claim and unverified items clearly marked.`;
   async close(): Promise<void> {
     for (const task of this.taskManager.getActiveTasks()) this.taskManager.cancelTask(task.id);
     await this.mcp.close();
+    // Headless Chrome must not outlive plugin shutdown.
+    await browserController.close().catch(() => {});
   }
 
   async flushTaskRecords(): Promise<void> {
@@ -1213,6 +1395,7 @@ factual claim and unverified items clearly marked.`;
     if (tool === 'workspace_read') {
       try {
         const file = path.resolve(String(parsed.path || ''));
+        if (!isPathAllowed(file)) throw new Error('path not allowed: outside workspace roots');
         const s = await stat(file);
         if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
         if (s.size > 1_500_000) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
@@ -1239,6 +1422,7 @@ factual claim and unverified items clearly marked.`;
       try {
         if (!parsed.path) throw new Error('path is required');
         const file = path.resolve(String(parsed.path));
+        if (!isPathAllowed(file)) throw new Error('path not allowed: outside workspace roots');
         const s = await stat(file);
         if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
         if (s.size > 30 * 1024 * 1024) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
@@ -1310,8 +1494,8 @@ factual claim and unverified items clearly marked.`;
     if (tool === 'approval_list') return {success:true,result:JSON.stringify(this.approvals.list(String(parsed.session_id || ''))),error:''};
     if (tool === 'approval_decide') {
       if (typeof parsed.allow !== 'boolean') return {success:false,result:'',error:'allow must be boolean'};
-      const ok=this.approvals.decide(String(parsed.id || ''),parsed.allow);
-      return {success:ok,result:JSON.stringify({ok}),error:ok?'':'Approval expired or not found'};
+      const ok=this.approvals.decide(String(parsed.id || ''),parsed.allow,String(parsed.executor_id || ''));
+      return {success:ok,result:JSON.stringify({ok}),error:ok?'':'Approval expired, not found, or owned by another executor'};
     }
     if (tool === 'context_usage') {
       try {
