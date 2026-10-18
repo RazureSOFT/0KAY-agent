@@ -31,3 +31,11 @@ github_check.py
 # Local working documents (not project artifacts)
 /GitHub数据统计.xlsx
 /习惯、认知控制与记忆的多系统计算模型.docx
+.0kay-agent/
+
+# Runtime output of the diagram/screenshot tools.
+/out/
+/.0kay/
+
+# Ad-hoc probes left behind by manual debugging (tmp_shot.png, tmp_ocr.txt …).
+/tmp_*

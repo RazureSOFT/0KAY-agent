@@ -4,6 +4,7 @@
  */
 
 import { exec as execCallback, execFile } from 'child_process';
+import { withWindowsShellHint } from './shell_hint.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -19,18 +20,31 @@ import { browserController } from './browser.js';
 import { ensureNative, nativeAvailable } from './win_native.js';
 import { posixInput, type PosixInput } from './posix_native.js';
 import { isPathAllowed } from '../workspace/paths.js';
+import { ScrapeTool } from './scrape.js';
+import { CrawlTool } from './crawl.js';
+import { ScreenshotToCodeTool } from './screenshot_to_code.js';
+import { ReverseEngineerTool } from './reverse_engineer.js';
+import { PentestTool } from './pentest.js';
+import { DiagramTool } from './diagram.js';
+import { SetupDepsTool } from './setup_deps.js';
+import { GitHubSearchTool } from './github_search.js';
+import { BackgroundTaskTool } from './background_task.js';
+import { Tool, type ToolResult, type ToolContext, type TodoItem, type McpClientLike } from './types.js';
+import {
+  success, failure, clamp, limitOutput, spillOutput, resolvePath, globToRegex, walk, simpleDiff,
+  MAX_FILE_BYTES as MAX_FILE_BYTES_LIMIT,
+} from './helpers.js';
+import { writeFileAtomic } from './atomic_write.js';
+import { streamWriteFile } from './stream_write.js';
+
+export { Tool };
+export type { ToolResult, ToolContext, TodoItem, McpClientLike };
+export type { JSONSchema, McpToolInfo } from './types.js';
 
 const exec = promisify(execCallback);
 // ESM has no __dirname; used to locate the sibling `life/src` package.
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const MAX_OUTPUT = 120_000;
-const MAX_FILE_BYTES = 2_000_000;
-
-export interface ToolResult {
-  success: boolean;
-  data: any;
-  error?: string;
-}
+const MAX_FILE_BYTES = MAX_FILE_BYTES_LIMIT;
 
 export interface ToolSchema {
   name: string;
@@ -39,57 +53,6 @@ export interface ToolSchema {
   dangerous?: boolean;
 }
 
-export interface TodoItem {
-  id: string;
-  content: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
-  priority?: 'high' | 'medium' | 'low';
-}
-
-export interface McpClientLike {
-  listTools(): Array<{ server: string; name: string; description: string; inputSchema?: Record<string, any> }>;
-  callTool(server: string, tool: string, args: Record<string, any>): Promise<any>;
-}
-
-export interface ToolContext {
-  cwd: string;
-  taskId: string;
-  sessionId?: string;
-  agentType: string;
-  todo: TodoItem[];
-  runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
-  mcp?: McpClientLike;
-  signal?: AbortSignal;
-  /** Live conversation history + its context ledger (model-driven compression). */
-  history?: any[];
-  ledger?: ContextLedger;
-}
-
-export abstract class Tool {
-  abstract get name(): string;
-  abstract get description(): string;
-  get parameters(): Record<string, any> {
-    return { type: 'object', properties: {} };
-  }
-  get dangerous(): boolean {
-    return false;
-  }
-  abstract execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult>;
-}
-
-function success(data: any): ToolResult {
-  return { success: true, data };
-}
-
-function failure(error: unknown): ToolResult {
-  return { success: false, data: null, error: error instanceof Error ? error.message : String(error) };
-}
-
-function clamp(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(parsed)));
-}
 
 /** Reject `promise` as soon as `signal` aborts (the underlying work is abandoned,
  *  not interrupted). Resolves/rejects with the original promise otherwise. */
@@ -105,79 +68,6 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, mess
       (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
     );
   });
-}
-
-function limitOutput(value: string): { text: string; truncated: boolean } {
-  if (value.length <= MAX_OUTPUT) return { text: value, truncated: false };
-  return { text: `${value.slice(0, MAX_OUTPUT)}\n\n[output truncated]`, truncated: true };
-}
-
-// Above this many characters a command's output is spilled to a file and only a
-// preview is returned, so the model can read the rest in chunks (ZCode-style).
-const SPILL_THRESHOLD = Number(process.env.OKAY_AGENT_OUTPUT_SPILL_BYTES || 30_000);
-
-async function spillOutput(value: string, taskId: string, label: string): Promise<{ text: string; truncated: boolean; fullPath?: string }> {
-  if (value.length <= SPILL_THRESHOLD) return { text: value, truncated: false };
-  const capped = limitOutput(value);
-  try {
-    const dir = path.join(os.tmpdir(), '0kay-agent-output');
-    await fs.mkdir(dir, { recursive: true });
-    // A random suffix keeps parallel commands from overwriting each other's spill files.
-    const file = path.join(dir, `${(taskId || 'task').replace(/[^\w.-]+/g, '_')}-${label}-${randomUUID()}.log`);
-    await fs.writeFile(file, value, 'utf8');
-    return { text: `${capped.text}\n\n[full ${label} (${value.length} chars) saved to ${file}]`, truncated: true, fullPath: file };
-  } catch {
-    return capped;
-  }
-}
-
-function resolvePath(input: unknown, cwd: string): string {
-  if (typeof input !== 'string' || !input.trim()) throw new Error('path is required');
-  return path.resolve(cwd, input);
-}
-
-function globToRegex(pattern: string): RegExp {
-  let out = '^';
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === '*') {
-      if (pattern[i + 1] === '*') {
-        i++;
-        if (pattern[i + 1] === '/') i++;
-        out += '.*';
-      } else {
-        out += '[^/]*';
-      }
-    } else if (ch === '?') {
-      out += '[^/]';
-    } else if ('\\^$+.|()[]{}'.includes(ch)) {
-      out += `\\${ch}`;
-    } else {
-      out += ch;
-    }
-  }
-  return new RegExp(`${out}$`, 'i');
-}
-
-async function walk(root: string, onFile: (fullPath: string, relative: string) => boolean | Promise<boolean>, max = 2_000): Promise<number> {
-  let seen = 0;
-  const visit = async (dir: string): Promise<boolean> => {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist') continue;
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!(await visit(fullPath))) return false;
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      seen++;
-      if (!(await onFile(fullPath, path.relative(root, fullPath).replace(/\\/g, '/'))) || seen >= max) return false;
-    }
-    return true;
-  };
-  await visit(root);
-  return seen;
 }
 
 export class ReadTool extends Tool {
@@ -216,11 +106,12 @@ export class ReadTool extends Tool {
 
 export class WriteTool extends Tool {
   get name(): string { return 'write'; }
-  get description(): string { return 'Create or fully replace a text file. Prefer edit for small targeted changes.'; }
+  get description(): string { return 'Create or fully replace a text file. Content is streamed to the file so the Agent UI can show it being written; pass stream:false for a single atomic replace (secrets, generated files, anything that must never be observed half-written). Prefer edit for small targeted changes.'; }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['filePath', 'content'], properties: {
       filePath: { type: 'string' }, content: { type: 'string' },
+      stream: { type: 'boolean', description: 'Publish the content progressively so the UI can render it as it is typed. Default true; false writes atomically in one step.' },
     }};
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
@@ -230,8 +121,18 @@ export class WriteTool extends Tool {
       if (typeof args.content !== 'string') throw new Error('content must be a string');
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       const existed = await fs.stat(filePath).then(() => true).catch(() => false);
-      await fs.writeFile(filePath, args.content, 'utf8');
-      return success({ path: filePath, created: !existed, bytes: Buffer.byteLength(args.content), lines: args.content.split(/\r?\n/).length });
+      const summary = { path: filePath, created: !existed, bytes: Buffer.byteLength(args.content), lines: args.content.split(/\r?\n/).length };
+
+      if (args.stream === false) {
+        await writeFileAtomic(filePath, args.content);
+        return success({ ...summary, streamed: false });
+      }
+
+      // Streaming truncates the target immediately and appends over ~2.5s, so an
+      // observer sees it grow. The previous contents are restored if this fails
+      // or is cancelled (see stream_write.ts).
+      const result = await streamWriteFile(filePath, args.content, context.signal);
+      return success({ ...summary, streamed: result.paced, bytes: result.bytes });
     } catch (error) { return failure(error); }
   }
 }
@@ -258,7 +159,7 @@ export class EditTool extends Tool {
       if (count === 0) throw new Error('oldString was not found; re-read the file and include exact whitespace');
       if (count > 1 && args.replaceAll !== true) throw new Error('oldString occurs multiple times; include more surrounding context or set replaceAll');
       const updated = args.replaceAll === true ? original.split(args.oldString).join(args.newString) : original.replace(args.oldString, args.newString);
-      await fs.writeFile(filePath, updated, 'utf8');
+      await writeFileAtomic(filePath, updated);
       return success({ path: filePath, replacements: args.replaceAll === true ? count : 1, diff: simpleDiff(filePath, original, updated) });
     } catch (error) { return failure(error); }
   }
@@ -293,11 +194,26 @@ export class ApplyPatchTool extends Tool {
       try {
         for (const patch of staged) {
           context.signal?.throwIfAborted();
-          await fs.writeFile(patch.filePath, patch.updated, 'utf8');
+          await writeFileAtomic(patch.filePath, patch.updated);
           written.push(patch);
         }
       } catch (error) {
-        for (const patch of written.reverse()) await fs.writeFile(patch.filePath, patch.original, 'utf8');
+        // Roll back what was already applied, and do not let a failing rollback
+        // replace the original error — the caller needs to know which write
+        // failed, not just that the undo failed too.
+        const rollbackFailures: string[] = [];
+        for (const patch of written.reverse()) {
+          try {
+            await writeFileAtomic(patch.filePath, patch.original);
+          } catch (rollbackError: any) {
+            rollbackFailures.push(`${patch.filePath}: ${rollbackError?.message || rollbackError}`);
+          }
+        }
+        if (rollbackFailures.length) {
+          throw new Error(
+            `${(error as any)?.message || error} — additionally, rollback failed for: ${rollbackFailures.join('; ')}`,
+          );
+        }
         throw error;
       }
       return success({ files: staged.map((patch) => ({ path: patch.filePath, diff: simpleDiff(patch.filePath, patch.original, patch.updated) })) });
@@ -452,7 +368,12 @@ export class ShellTool extends Tool {
         return success({ command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
       } catch (error: any) {
         const stdout = await spillOutput(String(error.stdout || ''), context.taskId, stdoutLabel);
-        const stderr = await spillOutput(String(error.stderr || error.message || 'command failed'), context.taskId, stderrLabel);
+        // A failed command on Windows may have failed only because it used POSIX
+        // syntax; cmd.exe's "not recognized" names neither the token nor the
+        // equivalent, so the model retries with another POSIX spelling. Appending
+        // the translation here is purely additive — it runs after the failure.
+        const rawStderr = withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'));
+        const stderr = await spillOutput(rawStderr, context.taskId, stderrLabel);
         return { success: false, data: { command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
       }
     } catch (error) { return failure(error); }
@@ -599,8 +520,9 @@ export class TodoWriteTool extends Tool {
         if (!['pending', 'in_progress', 'completed', 'cancelled'].includes(item.status)) throw new Error(`todo ${index + 1} has invalid status`);
         return { id: typeof item.id === 'string' && item.id ? item.id : randomUUID(), content: item.content.trim(), status: item.status, priority: item.priority };
       });
-      context.todo.splice(0, context.todo.length, ...todos);
-      return success({ todos: context.todo });
+      const current = context.todo ?? (context.todo = []);
+      current.splice(0, current.length, ...todos);
+      return success({ todos: current });
     } catch (error) { return failure(error); }
   }
 }
@@ -1380,25 +1302,10 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
+    new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
+    new GitHubSearchTool(), new BackgroundTaskTool(),
     new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new AcpStatusTool(),
   ]) registry.register(tool);
   return registry;
 }
 
-function simpleDiff(filePath: string, original: string, updated: string): string {
-  const oldLines = original.split(/\r?\n/); const newLines = updated.split(/\r?\n/);
-  const limit = 400; const out = [`--- a/${filePath}`, `+++ b/${filePath}`];
-  const max = Math.max(oldLines.length, newLines.length);
-  // Aligned comparison (writes are positional): group consecutive changes into a
-  // hunk and emit `@@ -old +new @@` so the UI can show the changed line numbers.
-  let oldNo = 1, newNo = 1, inHunk = false;
-  for (let i = 0; i < max && out.length < limit; i++) {
-    const before = oldLines[i]; const after = newLines[i];
-    if (before === after) { oldNo++; newNo++; inHunk = false; continue; }
-    if (!inHunk) { out.push(`@@ -${oldNo} +${newNo} @@`); inHunk = true; }
-    if (before !== undefined) { out.push(`-${before}`); oldNo++; }
-    if (after !== undefined) { out.push(`+${after}`); newNo++; }
-  }
-  if (out.length >= limit) out.push('[diff truncated]');
-  return out.join('\n');
-}

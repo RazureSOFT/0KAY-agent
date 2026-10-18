@@ -15,6 +15,7 @@ import {coreCredentials,coreOptions,coreMetadata,coreHeaders,authorized,coreFetc
 import { fileURLToPath } from 'url'
 import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
+import { startWorkspaceRootsSync } from './workspace/paths.js'
 
 const __filename = fileURLToPath(import.meta.url)
 /** Version reported to Core on registration; manifest.json is the source of truth. */
@@ -606,6 +607,12 @@ export async function startPlugin(): Promise<void> {
   // 3b. Pull Agent settings section (model pin, limits, tool toggles)
   await pollAgentSettings()
   settingsPollTimer = setInterval(pollAgentSettings, 15_000)
+
+  // 3c. Mirror Core's workspace allow-list (Settings → 工作区) into the write
+  // policy. Runs after registration so the request carries the plugin token;
+  // without it, a folder allowed from the UI would work for git but still be
+  // refused by write/edit.
+  startWorkspaceRootsSync()
 
   // 4. Handle shutdown signals
   process.on('SIGINT', shutdown)

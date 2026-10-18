@@ -22,7 +22,13 @@ import { taskRecorder } from '../task/records.js';
 import { coreFetch, coreHeaders, coreHttpBase, listPluginTools, executorIdentity } from '../connection.js';
 import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
-import { isPathAllowed } from '../workspace/paths.js';
+import { allowTaskRoot, isPathAllowed } from '../workspace/paths.js';
+import { DeliverySupervisor, supervisionDirective } from './supervision.js';
+import { resolvePosture, postureDirective } from './posture.js';
+import { resolveMode, type MultiAgentMode } from './modes.js';
+import { buildHandoffDoc } from './handoff.js';
+import { ensureAgentWorkspace, appendAgentNote } from './agent_workspace.js';
+import { extractDocumentText, isDocumentAttachment } from './attachment_text.js';
 
 /** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
@@ -89,21 +95,21 @@ export const DEFAULT_AUTO_APPROVE_TOOLS =
  * COMPACTION_HEADINGS so a compacted run and a compacted chat read the same.
  */
 export const DUET_PLAN_SYSTEM_PROMPT =
-  '你是方案规划模型（大模型）。你的职责是为执行模型（能力较弱、没有任何对话上下文）制定一份可直接照做的实现方案。' +
-  '先给出简短的方案概述与分步计划（引用具体文件路径与事实），然后输出一个自包含的实现提示词，' +
-  '用 <implementation_prompt></implementation_prompt> 标签包裹。提示词必须包含：目标、涉及文件与现状、逐步改动要求、约束与验收标准，' +
-  '并且不引用任何"上文/如前所述"——执行模型只能看到这一段提示词。不要在提示词里重新解释方案背景。'
+  'You are the planning model (large model). Your job is to produce an implementation plan the execution model (weaker, with no conversation context) can follow directly. ' +
+  'First give a short plan overview and step-by-step outline (citing concrete file paths and facts), then output a self-contained implementation prompt wrapped in <implementation_prompt></implementation_prompt>. ' +
+  'The prompt must include: the goal, the files involved and their current state, step-by-step change requirements, constraints and acceptance criteria, ' +
+  'and must not reference "above/as mentioned" — the execution model sees only this prompt. Do not re-explain the plan background inside the prompt.'
 
 export const DUET_PLAN_USER_PROMPT =
-  '请为下面的任务制定实现方案，并在 <implementation_prompt> 标签内给出交给执行模型的完整实现提示词。'
+  'Produce an implementation plan for the task below, and put the complete implementation prompt for the execution model inside <implementation_prompt> tags.'
 
 export const DUET_IMPLEMENT_USER_PROMPT =
-  '方案与实现提示词已就绪。请严格按上面的 <implementation_prompt> 执行实现；遇到与现状冲突的事实以实际代码为准并在进度中说明。不要重新规划。'
+  'The plan and implementation prompt are ready. Implement strictly according to the <implementation_prompt> above; where it conflicts with reality, trust the actual code and note it in your progress. Do not re-plan.'
 
 export const COMPACTION_SCHEMA_PROMPT =
   'Compress this execution transcript into a faithful, structured working summary so the run can continue after the raw history is dropped. Use EXACTLY these Markdown sections, in this order, and keep every section:\n' +
   '## Objective\n## Important Details\n## Work State\n## Next Move\n## Relevant Files\n' +
-  'Objective: the current goal and what done means. Important Details: durable facts, decisions, constraints, file paths, IDs, tool results and errors, user answers, acceptance criteria, and questions already answered (never secrets). Work State: grouped as Completed / Active / Blocked, reporting only observed results and never inventing success. Next Move: the concrete immediate next step(s). Relevant Files: file_path:line references needed to continue. If a section has nothing, write 无. Carry prior facts forward. Start directly with ## Objective; no preamble or restated instructions. Be terse and factual, no process narration. Do not execute tools. Keep under 4000 words.';
+  'Objective: the current goal and what done means. Important Details: durable facts, decisions, constraints, file paths, IDs, tool results and errors, user answers, acceptance criteria, and questions already answered (never secrets). Work State: grouped as Completed / Active / Blocked, reporting only observed results and never inventing success. Next Move: the concrete immediate next step(s). Relevant Files: file_path:line references needed to continue. If a section has nothing, write none. Carry prior facts forward. Start directly with ## Objective; no preamble or restated instructions. Be terse and factual, no process narration. Do not execute tools. Keep under 4000 words.';
 
 /** Ledger-friendly tool arguments: drop bulky text payloads (line stats come from results). */
 function serializeToolArgs(args: Record<string, any>): string {
@@ -236,6 +242,8 @@ function serializeFileMutation<T>(tool: string, task: () => Promise<T>): Promise
 
 export class Agent {
   private mocr: MocrProvider;
+  /** Model in use for the current task, reused by tool-side model calls. */
+  private activeModel = '';
   private tools: ToolRegistry;
   private skills: SkillRegistry;
   private taskManager: TaskManager;
@@ -492,16 +500,24 @@ export class Agent {
 
   /**
    * Fetch uploaded attachments referenced by the Core metadata (`attachments` is
-   * a JSON array of {name,url,mime,size}) into memory and turn them into prompt
-   * content: text files are inlined, images become multimodal parts sent
-   * straight to the model. Nothing is written to disk.
+   * a JSON array of {name,url,mime,size}) and turn them into prompt content.
+   *
+   * Images become multimodal parts sent straight to the model; plain text is
+   * inlined; anything else is written to a scratch directory and described by
+   * its absolute path, with the document text extracted when the format is one
+   * we can read (see attachment_text.ts). Before that, every non-text upload
+   * was reduced to "name (mime, size)" — the model could not read a PDF, a
+   * spreadsheet or a deck at all, and had no path to hand to a tool either.
    */
-  private async collectAttachments(raw: string, signal: AbortSignal): Promise<{ text: string; images: MessagePart[] }> {
+  private async collectAttachments(raw: string, signal: AbortSignal, taskId: string): Promise<{ text: string; images: MessagePart[] }> {
     let refs: Array<{ name?: string; url?: string; mime?: string }> = [];
     try { refs = JSON.parse(raw); } catch { return { text: '', images: [] }; }
     if (!Array.isArray(refs) || refs.length === 0) return { text: '', images: [] };
     const lines: string[] = [];
     const images: MessagePart[] = [];
+    // Materialised copies live in the temp dir, not the workspace: an upload is
+    // a read-only input, and the project tree must stay clean.
+    const dropDir = path.join(os.tmpdir(), '0kay-attachments', String(taskId).replace(/[^\w.-]/g, '_'));
     // Attachment URLs always resolve against Core. An absolute http(s) URL
     // pointing elsewhere would leak the Core bearer token, so it is rejected.
     const base = coreHttpBase();
@@ -527,23 +543,61 @@ export class Agent {
         const response = await coreFetch(absolute, { headers, signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const bytes = Buffer.from(await response.arrayBuffer());
+        const size = `${bytes.length} bytes`;
         if (this.isImageAttachment(name, mime)) {
           const type = mime || 'image/png';
           images.push({ type: 'image', imageUrl: `data:${type};base64,${bytes.toString('base64')}`, mimeType: type });
           lines.push(`- ${name} (image attached to this turn)`);
-        } else if (this.isTextAttachment(name, mime) && bytes.length <= 1_000_000) {
-          const text = bytes.toString('utf8');
-          const clipped = text.length > 12000 ? `${text.slice(0, 12000)}\n…(truncated)` : text;
-          lines.push(`- ${name} (${mime || 'text'}, ${bytes.length} bytes):\n\`\`\`\n${clipped}\n\`\`\``);
-        } else {
-          lines.push(`- ${name} (${mime || 'application/octet-stream'}, ${bytes.length} bytes)`);
+          continue;
         }
+        if (this.isTextAttachment(name, mime)) {
+          // Inline the head only: a 50 MB log is still worth reading, but not
+          // worth decoding into one string first.
+          const head = bytes.length > 200_000 ? bytes.subarray(0, 200_000).toString('utf8') : bytes.toString('utf8');
+          const clipped = head.length > 12000 ? `${head.slice(0, 12000)}\n…(truncated)` : head;
+          lines.push(`- ${name} (${mime || 'text'}, ${size}):\n\`\`\`\n${clipped}\n\`\`\``);
+          continue;
+        }
+        const saved = await this.materializeAttachment(dropDir, name, bytes);
+        const where = saved ? ` saved at ${saved}` : '';
+        const label = `${mime || 'application/octet-stream'}, ${size}`;
+        if (isDocumentAttachment(name, mime)) {
+          const { text, note } = await extractDocumentText(saved || name, name, mime, bytes);
+          if (text) {
+            const clipped = text.length > 12000 ? `${text.slice(0, 12000)}\n…(truncated)` : text;
+            lines.push(`- ${name} (${label})${where}. Extracted text:\n\`\`\`\n${clipped}\n\`\`\``);
+          } else {
+            lines.push(`- ${name} (${label})${where}. ${note || 'no text could be extracted'}; open it with a tool if the content matters.`);
+          }
+          continue;
+        }
+        lines.push(`- ${name} (${label})${where}. Binary file; use a tool on the saved path if its content matters.`);
       } catch (error: any) {
         if (signal.aborted) throw error;
         lines.push(`- ${url} (download failed: ${error?.message || error})`);
       }
     }
     return { text: lines.join('\n'), images };
+  }
+
+  /**
+   * Write an attachment to the scratch directory and return its absolute path.
+   *
+   * The name comes from the uploader, so it is flattened to a single safe
+   * segment: a `../` or an absolute path here would let an upload overwrite an
+   * arbitrary file on the executor host.
+   */
+  private async materializeAttachment(dir: string, name: string, bytes: Buffer): Promise<string> {
+    const safe = path.basename(name).replace(/[<>:"|?*\x00-\x1f]/g, '_').replace(/^\.+/, '').trim() || 'attachment';
+    try {
+      await mkdir(dir, { recursive: true });
+      const target = path.join(dir, safe);
+      await writeFile(target, bytes);
+      return target;
+    } catch (error: any) {
+      console.warn(`[Agent] could not save attachment '${name}': ${error?.message || error}`);
+      return '';
+    }
   }
 
   /** True when any message in the history carries an image part. */
@@ -568,6 +622,40 @@ export class Agent {
         return;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Model call for tools (scrape summary/extraction, screenshot_to_code). Routes
+   * through the same MOCR channel as the main loop so tools never need their own
+   * provider credentials. Returns the concatenated text, or null when no model
+   * is available.
+   */
+  private async toolLlm(request: import('../tools/types.js').LlmRequest, context: { taskId: string; sessionId: string; signal?: AbortSignal }): Promise<string | null> {
+    const modelId = this.activeModel || this.settings.model_id || '';
+    const messages = request.messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+      ...(message.parts?.length ? { parts: message.parts.map((part) => ({ type: part.type, text: part.text, imageUrl: part.imageUrl, mimeType: part.mimeType })) } : {}),
+    }));
+    let text = '';
+    try {
+      for await (const chunk of this.mocr.generate({
+        modelId: request.model || modelId,
+        messages,
+        systemPrompt: request.systemPrompt,
+        maxTokens: request.maxTokens,
+        temperature: request.temperature,
+        tools: [],
+        toolChoice: 'none',
+        signal: context.signal,
+        taskId: context.taskId,
+        sessionId: context.sessionId,
+      })) text += chunk.chunk || '';
+      return text || null;
+    } catch (error: any) {
+      console.warn(`[Agent] tool model call failed: ${error?.message || error}`);
+      return null;
     }
   }
 
@@ -647,6 +735,9 @@ export class Agent {
       const workspaceSelector = options.workspace || options.project;
       if (!workdir && workspaceSelector) workdir = await this.resolveWorkspacePath(String(workspaceSelector));
       const cwd = workdir ? path.resolve(workdir) : process.cwd();
+      // The user picked this directory for this task, so allow it immediately
+      // rather than waiting for Core's workspace settings to sync.
+      allowTaskRoot(cwd);
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
       // Best-effort dsh-style accounting: attach this session to the workspace
       // that owns cwd, so the sidebar can group sessions under directories.
@@ -658,8 +749,8 @@ export class Agent {
       const signal = this.taskManager.signal(taskId);
       let initialParts: MessagePart[] | undefined;
       if (options.attachments) {
-        const { text, images } = await this.collectAttachments(options.attachments, signal);
-        if (text) prompt += `\n\nAttachments: the user uploaded these files.\n${text}`;
+        const { text, images } = await this.collectAttachments(options.attachments, signal, taskId);
+        if (text) prompt += `\n\nAttachments: the user uploaded these files. Text is extracted below where the format allows it, and every file is saved at the path shown — read it with a tool if you need the raw bytes.\n${text}`;
         if (images.length) initialParts = [{ type: 'text', text: prompt }, ...images];
       }
       const context: AgentContext = {
@@ -672,13 +763,29 @@ export class Agent {
         cwd,
         options: forceSkill ? { ...options, force_skill: forceSkill } : options,
       };
+      // Per-workspace agent home: .0kay-agent/{memory,plan,review}.md (git-ignored).
+      if (depth === 0) {
+        try { await ensureAgentWorkspace(cwd) } catch { /* read-only workspace is fine */ }
+      }
       // Model-driven context compression: the model folds ranges via the
       // compress/decompress/search_context/acp_status tools as context grows.
       context.ledger = new ContextLedger(() => context.history);
+      // CVM-lite runtime supervision: record every tool call, gate delivery on
+      // evidence (test/build/typecheck) and flag doom-loops. Enforced only when
+      // OKAY_EVIDENCE_GATE=1; otherwise it is a passive trace.
+      const supervisor = new DeliverySupervisor();
+      // Runtime directives (loop-invariant): the CVM-lite delivery belief and the
+      // selected work posture (Tianshu "Star Domain" analogue). Empty by default.
+      const gateMode = (process.env.OKAY_EVIDENCE_GATE || '').trim().toLowerCase();
+      const runtimeDirectives = [
+        gateMode && gateMode !== '0' ? supervisionDirective() : '',
+        postureDirective(resolvePosture(options.posture || process.env.OKAY_POSTURE)),
+      ].filter(Boolean).join('\n\n');
 
       let result = '';
       let lastModel = this.settings.model_id;
       let lastPromptTokens = 0;
+      let gateBlocks = 0;
 
       // Workspace snapshot (git state) so the model knows the repo it is in.
       try {
@@ -688,10 +795,12 @@ export class Agent {
 
       // Explore mode: fan the problem out to independent explorer sub-agents,
       // then hand their proposals to the main loop to choose the best.
+      const multiAgentMode = resolveMode(options.multi_agent_mode);
       if (type === EXPLORE_AGENT_TYPE && depth === 0 && options.skip_explore !== '1') {
         const baseType = options.base_agent_type || 'code';
-        const proposals = await this.exploreSolutions(context, taskId, context.prompt, baseType);
-        context.history.push({ role: 'user', content: this.explorationDigest(proposals) });
+        if (multiAgentMode.readOnly) context.options.read_only_tools = '1';
+        const proposals = await this.exploreSolutions(context, taskId, context.prompt, baseType, multiAgentMode);
+        context.history.push({ role: 'user', content: this.explorationDigest(proposals, multiAgentMode) });
       }
 
       // Thinking intensity and its derived budget are loop-invariant; hoisted
@@ -767,6 +876,7 @@ export class Agent {
           );
         }
         lastModel = modelId;
+        this.activeModel = modelId;
 
         // Automatic context compaction: only when the context is nearly full.
         // The window is read from the provider's /models endpoint (context_length)
@@ -797,6 +907,7 @@ export class Agent {
             + (minimal
               ? `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Iteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}\n\n${this.minimalDirective(options.language)}`
               : `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`)
+            + (runtimeDirectives ? '\n\n' + runtimeDirectives : '')
             + (todoBlock ? `\n\n${todoBlock}` : '') + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : ''),
           temperature: this.settings.temperature,
           thinking: requireThinking,
@@ -839,8 +950,15 @@ export class Agent {
                 const item = settled[idx];
                 if (item.status === 'rejected') throw item.reason;
                 const toolResult = item.value;
+                supervisor.recordToolCall(toolCall.name, toolCall.arguments, toolResult.success);
                 if (toolCall.name === 'finish' && toolResult.success) {
-                  result = toolResult.data?.output || 'Task completed';
+                  const gate = this.gateFinish(toolResult.data?.output || 'Task completed', supervisor);
+                  if (gate.blocked && gateBlocks < 3) {
+                    gateBlocks++;
+                    context.history.push({ role: 'tool', toolCallId: toolCall.id, content: JSON.stringify({ success: true, data: { output: gate.message } }) });
+                    break;
+                  }
+                  result = gate.result;
                   break;
                 }
                 context.history.push({
@@ -869,13 +987,20 @@ export class Agent {
         const toolCall = this.parseToolCall(finalText || fullResponse);
         if (toolCall) {
           const toolResult = await this.executeToolCall({ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }, context, type, depth);
+          supervisor.recordToolCall(toolCall.name, JSON.stringify(toolCall.args), toolResult.success);
           context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }], reasoningContent: fullReasoning || undefined });
           const desktopImages: MessagePart[] = [];
           context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(this.desktopResult(toolCall.name, toolResult, desktopImages)) });
           if (desktopImages.length) context.history.push({ role: 'user', content: '', parts: desktopImages });
 
           if (toolResult.success && toolCall.name === 'finish') {
-            result = toolResult.data?.output || 'Task completed';
+            const gate = this.gateFinish(toolResult.data?.output || 'Task completed', supervisor);
+            if (gate.blocked && gateBlocks < 3) {
+              gateBlocks++;
+              context.history.push({ role: 'user', content: gate.message });
+              continue;
+            }
+            result = gate.result;
             break;
           }
         } else {
@@ -900,6 +1025,32 @@ export class Agent {
           }
         }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'任务已结束，产物信息提取失败，请查看 Agent 会话。'}))}
       }
+      // User-facing handoff document (Tianshu /handoff analogue): archive a
+      // structured markdown handoff per top-level task. Opt-in via OKAY_HANDOFF_DOC=1.
+      if (depth === 0 && process.env.OKAY_HANDOFF_DOC === '1') {
+        try {
+          const doc = buildHandoffDoc({ taskId, prompt: context.prompt, result, status: 'done' });
+          const dir = path.join(process.env.AGENT_DATA_DIR || './data/agent', 'handoffs');
+          await mkdir(dir, { recursive: true });
+          await writeFile(path.join(dir, `${String(taskId).replace(/[^a-zA-Z0-9_.-]/g, '_')}.md`), doc, 'utf8');
+        } catch { /* best-effort */ }
+      }
+      if (depth === 0) {
+        try {
+          const outcome = String(result || '').slice(0, 2000);
+          await appendAgentNote(cwd, 'memory', `Task: ${String(context.prompt).slice(0, 600)}\nOutcome: ${outcome}`);
+          const report = supervisor.report();
+          await appendAgentNote(cwd, 'review', `Status: ${report.status}\n${report.reasons.join('\n')}\nEvidence: ${report.evidence.join(', ') || 'none'}`);
+          const plan = formatTodoList(context.todo);
+          if (plan.trim()) await appendAgentNote(cwd, 'plan', plan);
+        } catch { /* best-effort */ }
+      }
+      if (gateMode && gateMode !== '0') {
+        try {
+          const report = supervisor.report();
+          await taskRecorder.record({ task_id: context.taskId, caller_id: 'agent', kind: 'delivery-gate', session_id: context.sessionId, state: report.status, result: JSON.stringify(report) });
+        } catch { /* best-effort telemetry */ }
+      }
       return result;
     }, depth > 0);
   }
@@ -910,7 +1061,7 @@ export class Agent {
    * objective, and collect their proposals concurrently. Explorers run
    * read-only: editing, execution and further sub-agents are disabled for them.
    */
-  private async exploreSolutions(context: AgentContext, taskId: string, prompt: string, baseType: string): Promise<Array<{ angle: string; result: string }>> {
+  private async exploreSolutions(context: AgentContext, taskId: string, prompt: string, baseType: string, mode: MultiAgentMode): Promise<Array<{ angle: string; result: string }>> {
     const angles = [
       'Prefer the simplest correct change with the smallest diff.',
       'Prefer robustness: enumerate edge cases and failure modes.',
@@ -921,7 +1072,7 @@ export class Agent {
       'Prefer security: least privilege, input validation, no new attack surface.',
       'Prefer testability: how would this change be verified cheaply and confidently?',
     ];
-    const fanout = envCount('OKAY_EXPLORE_FANOUT', EXPLORE_FANOUT, 1, angles.length);
+    const fanout = envCount('OKAY_EXPLORE_FANOUT', mode.fanout, 1, angles.length);
     const timeoutMs = envCount('OKAY_EXPLORE_TIMEOUT_MS', EXPLORE_TIMEOUT_MS, 10_000, 600_000);
     const selected = angles.slice(0, fanout);
     const proposals: Array<{ angle: string; result: string } | undefined> = new Array(selected.length);
@@ -950,13 +1101,13 @@ export class Agent {
   }
 
   /** Turn the explorer proposals into the instruction that seeds the main loop. */
-  private explorationDigest(proposals: Array<{ angle: string; result: string }>): string {
+  private explorationDigest(proposals: Array<{ angle: string; result: string }>, mode: MultiAgentMode): string {
     const blocks = proposals.map((proposal, index) => {
       const text = (proposal.result || '').trim();
       const clipped = text.length > 4000 ? `${text.slice(0, 4000)}\n…(truncated)` : text;
       return `### Candidate ${index + 1} — ${proposal.angle}\n${clipped || '(no output)'}`;
     }).join('\n\n');
-    return `${proposals.length} independent sub-agents explored the problem above from different angles. Review every candidate, then choose the best approach (or merge the strongest parts) and implement it. Judge by correctness, simplicity and fit to the existing code — verify against the repository rather than copying blindly. State which candidate you chose and why.\n\n${blocks}`;
+    return `${mode.digestLead} (${proposals.length} seats)\n\n${blocks}`;
   }
 
   /**
@@ -1030,28 +1181,20 @@ Continue until the task is complete, then return a concise plain-text final answ
     return `You are an AI agent that can use tools to complete tasks.
 
 Host OS: ${process.platform}. Working directory: ${cwd}.
-The bash tool actually runs ${process.platform === 'win32' ? 'Windows cmd.exe: use cd to print the directory, dir to list files, && for chaining. Do not use pwd, ls, Unix heredocs, or semicolon chaining. Use the cwd argument instead of changing directories.' : '/bin/sh'}.
-Use write/edit for code files rather than shell echo or fragile command quoting.
-Report progress to the user in assistant text before tool actions. Preserve explanations and final results.
-Choose the smallest implementation satisfying the request. Avoid unnecessary features or repeated probes.
-For multi-step or long-running tasks (coding, research, analysis, anything needing several tool rounds), FIRST call the todowrite tool to lay out a short checklist plan and keep exactly one item in_progress. As soon as an item is finished, update the list with todowrite (mark it completed, or drop it) before starting the next, so the checklist reflects live progress. Skip the checklist for trivial single-step requests.
-Distinguish tool/program errors from expected diagnostic results: an unreachable host or nonzero probe exit code may be the correct test result. Report it honestly rather than rewriting working code to force success.
-
-Verification (required before every final answer): check each factual claim against evidence you actually retrieved (tool results, files, websearch/papersearch/apidocsearch hits). Attach its source — URL, DOI, or file path — for anything stated as fact. If a claim is not backed by evidence, either search to confirm it or label it explicitly as unverified/uncertain; never present a guess as fact. Never invent citations, URLs, DOIs, version numbers, figures, quotes or API signatures. Prefer primary sources (official docs, papers) over blogs for technical claims, and note when sources disagree.
+Bash runs ${process.platform === 'win32' ? 'Windows cmd.exe (use cd/dir, && to chain; no pwd/ls/heredocs/semicolons; prefer the cwd argument over cd).' : '/bin/sh'}.
+Use write/edit for code files, not shell echo. Report progress in assistant text before tool actions. Choose the smallest change that satisfies the request; avoid speculative features and repeated probes.
+For multi-step work, first call todowrite with a short checklist and keep exactly one item in_progress; update it as items finish. Skip it for trivial requests.
+A tool/program error can be the correct diagnostic result — report it honestly instead of forcing success.
+Verification: back every factual claim with evidence you retrieved (tool result, file path, URL, DOI); label anything unverified. Never invent citations, URLs, DOIs, versions, figures, quotes or API signatures; prefer primary sources.
 
 Available tools:
 ${toolDescriptions}
 ${skillBlock}
 
-Use native tool calls when your model supports them. Independent tool calls in
-the same turn are executed in parallel, so batch them when they do not depend
-on each other. For providers without native
-function calling, output exactly one fallback JSON object:
+Use native tool calls when supported; batch independent calls (they run in parallel). Without native function calling, output exactly one JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
 
-After tool results arrive, continue until the task is complete. Return a concise
-plain-text final answer when no further tools are needed, with sources for any
-factual claim and unverified items clearly marked.`;
+Continue until the task is complete, then return a concise plain-text final answer with sources for factual claims and unverified items marked.`;
   }
 
   /** Approximate context composition (tokens) for the usage indicator. */
@@ -1077,6 +1220,33 @@ factual claim and unverified items clearly marked.`;
     images.push({ type: 'text', text: `Desktop screenshot: ${data.width}x${data.height}. Use original screen pixel coordinates.` },
       { type: 'image', imageUrl: `data:${data.mime};base64,${base64}`, mimeType: data.mime });
     return { ...result, data: { ...data, image: 'attached as visual input' } };
+  }
+
+  /**
+   * CVM-lite delivery gate. Mode is read from OKAY_EVIDENCE_GATE:
+   *   unset / '0'        → off (no behavior change)
+   *   '1' / 'warn'       → annotate the finish with the evidence report
+   *   '2' / 'strict'     → block a non-GREEN finish (caller caps retries) and
+   *                        ask the model for verification evidence
+   */
+  private gateFinish(output: string, supervisor: DeliverySupervisor): { blocked: boolean; result: string; message: string } {
+    const mode = (process.env.OKAY_EVIDENCE_GATE || '').trim().toLowerCase();
+    if (mode !== '1' && mode !== 'warn' && mode !== '2' && mode !== 'strict') {
+      return { blocked: false, result: output, message: '' };
+    }
+    const report = supervisor.evaluateDelivery(output);
+    const annotated = report.status === 'GREEN'
+      ? output
+      : `${output}\n\n[Delivery gate ${report.status}] ${report.reasons.join('; ')}${report.evidence.length ? `; verified: ${report.evidence.join(', ')}` : '; no verification command found'}`;
+    const strict = mode === '2' || mode === 'strict';
+    if (strict && report.status !== 'GREEN') {
+      return {
+        blocked: true,
+        result: annotated,
+        message: `Delivery gate ${report.status}: ${report.reasons.join('; ')}. Add verifiable evidence (run tests / build / typecheck and paste the result), or change strategy, then call finish again.`,
+      };
+    }
+    return { blocked: false, result: annotated, message: '' };
   }
 
   private async executeToolCall(toolCall: ToolCall, context: AgentContext, agentType: string, depth: number) {
@@ -1106,6 +1276,7 @@ factual claim and unverified items clearly marked.`;
       history: context.history,
       ledger: context.ledger,
       signal: context.signal,
+      llm: (request) => this.toolLlm(request, context),
       runSubAgent: depth >= 2 || context.options.no_subagents === '1'
         ? undefined
         : async (subPrompt, subType) => {
