@@ -50,8 +50,16 @@ export const EXPLORE_TIMEOUT_MS = 180_000;
 /** Explorer sub-agents may only call these tools; everything else is rejected. */
 const EXPLORE_READ_ONLY_TOOLS = new Set([
   'read', 'glob', 'grep', 'webfetch', 'websearch', 'papersearch', 'apidocsearch',
-  'todowrite', 'compress', 'decompress', 'search_context', 'acp_status',
+  'todowrite', 'compress', 'decompress', 'search_context', 'acp_status', 'report_artifacts',
 ]);
+
+/**
+ * Tools that touch nothing on disk and only report, so they skip the approval
+ * prompt even when `always_allow_tools` (a persisted setting) predates them.
+ * A user who saved the settings before `report_artifacts` existed would
+ * otherwise get a permission popup for a read-only bookkeeping call.
+ */
+const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts']);
 
 /** Read a positive integer env override, clamped to [min, max]; out-of-range falls back. */
 function envCount(name: string, fallback: number, min: number, max: number): number {
@@ -88,7 +96,7 @@ export function formatTodoList(todo?: Array<{ content?: string; status?: string 
  * overwriting the user's work, and both are confined to the workspace roots.
  */
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status';
+  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status,report_artifacts';
 
 /**
  * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
@@ -1175,7 +1183,9 @@ ${skillBlock}
 
 Use native tool calls when your model supports them; batch independent calls. Without native function calling, output exactly one JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
-Continue until the task is complete, then return a concise plain-text final answer.`;
+Continue until the task is complete, then return a concise plain-text final answer.
+
+If the turn produced files, call report_artifacts once (absolute path + one-line description each) just before the final answer.`;
     }
 
     return `You are an AI agent that can use tools to complete tasks.
@@ -1194,7 +1204,9 @@ ${skillBlock}
 Use native tool calls when supported; batch independent calls (they run in parallel). Without native function calling, output exactly one JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
 
-Continue until the task is complete, then return a concise plain-text final answer with sources for factual claims and unverified items marked.`;
+Continue until the task is complete, then return a concise plain-text final answer with sources for factual claims and unverified items marked.
+
+Deliverables: when the turn produced or modified files, call report_artifacts once (every deliverable, absolute path + one-line description) immediately before your final answer, so the UI can show the user a clickable list. Only list files that actually exist on disk; skip the call entirely when the turn produced nothing.`;
   }
 
   /** Approximate context composition (tokens) for the usage indicator. */
@@ -1262,7 +1274,7 @@ Continue until the task is complete, then return a concise plain-text final answ
     if (context.options.read_only_tools === '1' && !EXPLORE_READ_ONLY_TOOLS.has(toolCall.name)) {
       return { success: false, data: null, error: `${toolCall.name} is disabled: explorer sub-agents run strictly read-only` };
     }
-    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args)) {
+    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
@@ -1784,7 +1796,7 @@ Continue until the task is complete, then return a concise plain-text final answ
     // `call` action qualifies — `list` etc. still prompt.
     // Interactive agent tasks still prompt for other non-read-only actions.
     const mailMcp = tool === 'mcp' && String(parsed?.action || '') === 'call' && String(parsed?.server || '') === 'mail';
-    if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser' && !mailMcp) {
+    if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser' && !mailMcp && !ALWAYS_SAFE_TOOLS.has(tool)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }

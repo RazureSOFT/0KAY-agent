@@ -29,6 +29,7 @@ import { DiagramTool } from './diagram.js';
 import { SetupDepsTool } from './setup_deps.js';
 import { GitHubSearchTool } from './github_search.js';
 import { BackgroundTaskTool } from './background_task.js';
+import { ReportArtifactsTool } from './report_artifacts.js';
 import { Tool, type ToolResult, type ToolContext, type TodoItem, type McpClientLike } from './types.js';
 import {
   success, failure, clamp, limitOutput, spillOutput, resolvePath, globToRegex, walk, simpleDiff,
@@ -1303,7 +1304,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
-    new GitHubSearchTool(), new BackgroundTaskTool(),
+    new GitHubSearchTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),
     new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new AcpStatusTool(),
   ]) registry.register(tool);
   return registry;
