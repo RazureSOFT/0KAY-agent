@@ -1,3 +1,5 @@
+import type { SubAgentRunner } from '../agent/subagents.js'
+import type { SandboxPolicy } from '../sandbox/policy.js'
 export interface ToolResult {
   success: boolean;
   data: any;
@@ -44,6 +46,10 @@ export interface ToolContext {
   agentType: string;
   todo?: TodoItem[];
   runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
+  /** Spawn/list/cancel child agents. Absent at the deepest level, which is how recursion stops. */
+  subagents?: SubAgentRunner;
+  /** What this task may touch. Absent means "no policy", used only by tests. */
+  sandbox?: SandboxPolicy;
   mcp?: McpClientLike;
   signal?: AbortSignal;
   history?: any[];

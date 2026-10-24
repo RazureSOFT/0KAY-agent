@@ -1,4 +1,9 @@
 import { exec as execCallback, execFile } from 'child_process';
+import { SubAgentTool } from './packages/subagent.js';
+import { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
+import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
+export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
+export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { withWindowsShellHint } from './shell_hint.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -111,6 +116,8 @@ export class WriteTool extends Tool {
     try {
       const filePath = resolvePath(args.filePath, context.cwd);
       if (!isPathAllowed(filePath)) throw new Error('path not allowed: outside workspace roots');
+      const verdict = context.sandbox?.checkWrite(filePath);
+      if (verdict && !verdict.allowed) throw new Error(verdict.reason);
       if (typeof args.content !== 'string') throw new Error('content must be a string');
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       const existed = await fs.stat(filePath).then(() => true).catch(() => false);
@@ -310,6 +317,14 @@ export class ShellTool extends Tool {
           label: '',
         });
       }
+      // One policy check per command, before anything is spawned. A refusal is
+      // reported per command so a parallel batch tells you which one was blocked.
+      for (const request of requests) {
+        const verdict = context.sandbox?.checkShell(request.command);
+        if (verdict && !verdict.allowed) {
+          return failure(`${verdict.reason}${request.label ? ` (command ${request.label})` : ''}`);
+        }
+      }
       const results = await Promise.all(requests.map((request) => this.runOne(request, args, context)));
       if (results.length === 1) return results[0];
       const failed = results.filter((result) => !result.success).length;
@@ -426,68 +441,8 @@ export class WebSearchTool extends Tool {
   }
 }
 
-function readSearchResults(body: any, limit: number): Array<Record<string, any>> {
-  if (!Array.isArray(body?.results)) return [];
-  return body.results.slice(0, limit).map((item: any) => ({
-    title: item.title || '',
-    url: item.url || '',
-    snippet: item.snippet || '',
-    source: item.engine || '',
-    // Papers come back with the citation parts split out; keep them when the
-    // engine supplied them instead of flattening everything into the snippet.
-    ...(item.authors?.length ? { authors: item.authors } : {}),
-    ...(item.year ? { year: item.year } : {}),
-    ...(item.venue ? { venue: item.venue } : {}),
-  }));
-}
 
-export class PaperSearchTool extends Tool {
-  get name(): string { return 'papersearch'; }
-  get description(): string { return 'Search academic papers (arXiv, Crossref, OpenAlex). Returns title, authors, year, venue, URL and an abstract snippet so results can be cited.'; }
-  get parameters(): Record<string, any> {
-    return { type: 'object', required: ['query'], properties: {
-      query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
-    }};
-  }
-  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    try {
-      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
-      const limit = clamp(args.numResults, 6, 1, 20);
-      const endpoint = new URL(`${coreHttpBase()}/api/search/papers`);
-      endpoint.searchParams.set('q', args.query);
-      endpoint.searchParams.set('n', String(limit));
-      const timeout = AbortSignal.timeout(30000);
-      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
-      const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
-      if (!response.ok) throw new Error(`paper search returned ${response.status}`);
-      return success({ query: args.query, results: readSearchResults(await response.json(), limit) });
-    } catch (error) { return failure(error); }
-  }
-}
 
-export class ApiDocSearchTool extends Tool {
-  get name(): string { return 'apidocsearch'; }
-  get description(): string { return 'Search API documentation (MDN, Microsoft Learn, Stack Overflow, official doc sites). Use for library/API signatures, usage and examples.'; }
-  get parameters(): Record<string, any> {
-    return { type: 'object', required: ['query'], properties: {
-      query: { type: 'string' }, numResults: { type: 'integer', minimum: 1, maximum: 20 },
-    }};
-  }
-  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    try {
-      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required');
-      const limit = clamp(args.numResults, 6, 1, 20);
-      const endpoint = new URL(`${coreHttpBase()}/api/search/apidocs`);
-      endpoint.searchParams.set('q', args.query);
-      endpoint.searchParams.set('n', String(limit));
-      const timeout = AbortSignal.timeout(30000);
-      const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
-      const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
-      if (!response.ok) throw new Error(`api docs search returned ${response.status}`);
-      return success({ query: args.query, results: readSearchResults(await response.json(), limit) });
-    } catch (error) { return failure(error); }
-  }
-}
 
 export class TodoWriteTool extends Tool {
   get name(): string { return 'todowrite'; }
@@ -1181,56 +1136,9 @@ export class ToolRegistry {
   }
 }
 
-export class CompressContextTool extends Tool {
-  get name(): string { return 'compress'; }
-  get description(): string {
-    return 'Fold a range of earlier conversation messages into one high-fidelity summary to free context. Provide from/to (0-based indices into the visible history) and a summary that preserves decisions, file paths/commands, results and open threads. The originals are kept and can be restored with decompress; search_context can look inside them.';
-  }
-  get parameters(): Record<string, any> {
-    return { type: 'object', required: ['from', 'to', 'summary'], properties: {
-      from: { type: 'integer' }, to: { type: 'integer' }, summary: { type: 'string' },
-    }};
-  }
-  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    if (!context?.ledger) return failure('context ledger unavailable');
-    const block = context.ledger.compress(Number(args.from), Number(args.to), String(args.summary || ''));
-    if (!block) return failure('invalid range or empty summary');
-    return success({ block: block.id, folded_messages: block.messages.length, tokens_freed: block.tokens });
-  }
-}
 
-export class DecompressContextTool extends Tool {
-  get name(): string { return 'decompress'; }
-  get description(): string { return 'Restore a previously compressed range when exact details are needed again. Pass the block id returned by compress (or its 1-based number).'; }
-  get parameters(): Record<string, any> {
-    return { type: 'object', required: ['block'], properties: { block: { type: 'string' } } };
-  }
-  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    if (!context?.ledger) return failure('context ledger unavailable');
-    return context.ledger.decompress(String(args.block || '')) ? success({ restored: String(args.block) }) : failure('unknown block');
-  }
-}
 
-export class SearchContextTool extends Tool {
-  get name(): string { return 'search_context'; }
-  get description(): string { return 'Keyword search over compressed summaries and visible messages, to find details that were folded away.'; }
-  get parameters(): Record<string, any> {
-    return { type: 'object', required: ['query'], properties: { query: { type: 'string' }, limit: { type: 'integer' } } };
-  }
-  async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    if (!context?.ledger) return failure('context ledger unavailable');
-    return success({ results: context.ledger.search(String(args.query || ''), clamp(args.limit, 10, 1, 50)) });
-  }
-}
 
-export class AcpStatusTool extends Tool {
-  get name(): string { return 'acp_status'; }
-  get description(): string { return 'Context-usage overview: visible message count, estimated tokens, last prompt tokens and the compressed blocks.'; }
-  async execute(_args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    if (!context?.ledger) return failure('context ledger unavailable');
-    return success(context.ledger.status());
-  }
-}
 
 export interface PluginToolDef {
   plugin: string;
@@ -1262,6 +1170,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
+    new SubAgentTool(),
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),

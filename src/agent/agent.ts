@@ -4,6 +4,7 @@ import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
 import { randomUUID } from 'crypto';
+import { SubAgentRegistry } from './subagents.js';
 import * as path from 'path';
 import { stat, readdir, mkdir, readFile, writeFile, mkdtemp, rm } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
@@ -18,7 +19,8 @@ import { taskRecorder } from '../task/records.js';
 import { coreFetch, coreHeaders, coreHttpBase, listPluginTools, executorIdentity } from '../connection.js';
 import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
-import { allowTaskRoot, isPathAllowed } from '../workspace/paths.js';
+import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
+import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
 import { DeliverySupervisor, supervisionDirective } from './supervision.js';
 import { resolvePosture, postureDirective } from './posture.js';
 import { resolveMode, type MultiAgentMode } from './modes.js';
@@ -206,6 +208,7 @@ export class Agent {
   private handoffs = new Map<string,string>();
   private workspaces = new WorkspaceRegistry();
   private pluginToolNames = new Set<string>();
+  private subagents = new SubAgentRegistry();
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
 
   constructor(config: Partial<AgentConfig> = {}) {
@@ -1119,6 +1122,23 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
             return this.recorder.run('subagent', subPrompt, context.taskId, context.sessionId,
               () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, context.options),
               subTaskId);
+          },
+      // The policy every write and shell call is checked against. Defaults to
+      // workspace-write; a task can only widen it by saying so in its metadata.
+      sandbox: new SandboxPolicy(parseSandboxMode(context.options.sandbox_mode), allowedWorkspaceRoots()),
+      // Same depth rule as runSubAgent: a child two levels down gets no
+      // sub-agent tool, so the tree cannot grow past depth 2.
+      subagents: depth >= 2 || context.options.no_subagents === '1'
+        ? undefined
+        : {
+            spawn: (spec: any) => this.subagents.spawn(spec, () => {
+              const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
+              return this.recorder.run('subagent', spec.prompt, context.taskId, context.sessionId,
+                () => this.executeTaskInternal(subTaskId, spec.prompt, spec.agentType || agentType, depth + 1, context.sessionId, context.options),
+                subTaskId);
+            }),
+            list: () => this.subagents.list(),
+            cancel: (id: string) => this.subagents.cancel(id),
           },
     }), undefined, serializeToolArgs(args)));
   }
