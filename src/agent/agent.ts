@@ -1227,7 +1227,11 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // workspace-write; a task can only widen it by saying so in its metadata.
       sandbox: new SandboxPolicy(parseSandboxMode(context.options.sandbox_mode), allowedWorkspaceRoots()),
       toolGroups: this.toolGroupsApi(context.taskId),
-      recon: this.reconFor(context.taskId),
+      // Keyed by session, not task: the graph is about the target you are
+      // working on, which outlives one task and is shared by its subagents.
+      // It also has to match the direct path below (stateKey), or a UI reading
+      // the graph would see a different one than the model wrote to.
+      recon: this.reconFor(context.sessionId || context.taskId),
       // Same depth rule as runSubAgent: a child two levels down gets no
       // sub-agent tool, so the tree cannot grow past depth 2.
       subagents: depth >= 2 || context.options.no_subagents === '1'
