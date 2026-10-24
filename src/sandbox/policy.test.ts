@@ -81,3 +81,19 @@ test('the shell tool refuses before spawning anything', async () => {
   assert.equal(result.success, false)
   assert.match(result.error || '', /read-only/)
 })
+
+test('a write to an absolute path outside the workspace is refused in workspace-write', () => {
+  const policy = new SandboxPolicy('workspace-write', [root])
+  const outside = process.platform === 'win32' ? 'C:\\Windows\\Temp\\x.txt' : '/etc/passwd'
+  const verdict = policy.checkShell(`echo pwned > ${outside}`)
+  assert.equal(verdict.allowed, false)
+  assert.match(verdict.reason || '', /outside/)
+  // A write inside the workspace still goes through.
+  assert.equal(policy.checkShell(`echo fine > ${path.join(root, 'out.txt')}`).allowed, true)
+})
+
+test('a read of an absolute path is not treated as a write', () => {
+  const policy = new SandboxPolicy('workspace-write', [root])
+  const outside = process.platform === 'win32' ? 'C:\\Windows\\win.ini' : '/etc/hosts'
+  assert.equal(policy.checkShell(`cat ${outside}`).allowed, true)
+})

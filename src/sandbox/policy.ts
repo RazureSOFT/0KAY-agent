@@ -75,7 +75,11 @@ export class SandboxPolicy {
    * How to actually run a command: wrapped in an OS sandbox when one is
    * available, plain otherwise. `null` means "run it the way you always did".
    */
-  launch(command: string, cwd: string, options: { platform?: NodeJS.Platform; network?: boolean } = {}): LaunchSpec | null {
+  launch(
+    command: string,
+    cwd: string,
+    options: { platform?: NodeJS.Platform; network?: boolean; shell?: { file: string; args(command: string): string[] } } = {},
+  ): LaunchSpec | null {
     const spec = buildLaunch({
       platform: options.platform || process.platform,
       mode: this.mode,
@@ -83,8 +87,14 @@ export class SandboxPolicy {
       command,
       cwd: cwd || this.roots[0] || process.cwd(),
       network: options.network,
+      shell: options.shell,
     })
     return spec.backend === 'none' && !spec.notes.length ? null : spec
+  }
+
+  private isInsideRoots(target: string): boolean {
+    const resolved = path.resolve(target)
+    return this.roots.some((root) => resolved === root || resolved.startsWith(root + path.sep))
   }
 
   /** May this path be read? Reads are allowed everywhere except when the caller asked for a strict task. */
@@ -136,8 +146,29 @@ export class SandboxPolicy {
     if (destructive) {
       return { allowed: false, reason: `refusing "${destructive[0]}": recursive delete of a root path` }
     }
+
+    // A write aimed at an absolute path outside the workspace is unambiguous —
+    // the redirect names its target. Catch it here rather than hoping an OS
+    // layer will, because on Windows there is no OS layer.
+    if (WRITE_OPERATORS.test(text)) {
+      for (const target of absolutePathsIn(text)) {
+        if (this.isInsideRoots(target)) continue
+        return {
+          allowed: false,
+          reason: `sandbox is workspace-write: "${target}" is outside ${this.roots.join(', ')}`,
+        }
+      }
+    }
     return ALLOWED
   }
+}
+
+/** Absolute paths mentioned in a command, in either platform's spelling. */
+function absolutePathsIn(command: string): string[] {
+  const found = new Set<string>()
+  for (const match of command.matchAll(/[A-Za-z]:\\[^\s"';|&<>]+/g)) found.add(match[0])
+  for (const match of command.matchAll(/(?:^|[\s"'=(])(\/[^\s"';|&<>]+)/g)) found.add(match[1])
+  return [...found]
 }
 
 /** Parse a stored setting, defaulting to the safe mode rather than the open one. */

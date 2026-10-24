@@ -278,6 +278,14 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '逗号分隔的工具名，直接执行不弹确认；bash 建议保持审批（如需放开：read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,bash）',
           },
           {
+            key: 'sandbox_mode',
+            type: 'select',
+            label: '沙箱模式',
+            defaultValue: 'workspace-write',
+            options: ['read-only', 'workspace-write', 'danger-full-access'],
+            help: 'read-only 禁止一切写入；workspace-write 只允许写工作区（默认）；danger-full-access 不限制。Linux/macOS 会用 bwrap/sandbox-exec 真正隔离，Windows 目前只有命令分类器',
+          },
+          {
             key: 'minimal_mode',
             type: 'bool',
             label: '极简模式',
@@ -398,6 +406,7 @@ async function pollAgentSettings(): Promise<void> {
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
       always_allow_tools:
         typeof values.always_allow_tools === 'string' ? values.always_allow_tools : DEFAULT_AUTO_APPROVE_TOOLS,
+      sandbox_mode: typeof values.sandbox_mode === 'string' ? values.sandbox_mode : 'workspace-write',
       minimal_mode: values.minimal_mode === true,
       duet_mode: values.duet_mode === true,
     })
@@ -432,7 +441,10 @@ function startAgentService(proto: any): Promise<number> {
       console.log(`[Agent] ExecuteTask ${taskId}: ${prompt.substring(0, 80)}...`)
 
       try {
-        const result = await agent.executeTask(taskId, prompt, agentType, metadata || {})
+        // The configured mode is the default for every task; a caller that
+        // passes sandbox_mode explicitly still wins.
+        const effectiveMetadata = { sandbox_mode: agent.sandboxMode, ...(metadata || {}) }
+        const result = await agent.executeTask(taskId, prompt, agentType, effectiveMetadata)
         callback(null, {
           taskId,
           state: 'TASK_STATE_DONE',

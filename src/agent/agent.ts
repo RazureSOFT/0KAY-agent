@@ -132,6 +132,7 @@ export interface AgentSettings {
   max_iterations?: number;
   max_concurrent_tasks?: number;
   default_agent_type?: string;
+  sandbox_mode?: string;
   enable_shell_tool?: boolean;
   enable_filesystem_tool?: boolean;
   enable_web_tools?: boolean;
@@ -209,6 +210,8 @@ export class Agent {
   private workspaces = new WorkspaceRegistry();
   private pluginToolNames = new Set<string>();
   private subagents = new SubAgentRegistry();
+  /** The configured sandbox mode; tasks inherit it unless they pass their own. */
+  get sandboxMode(): string { return this.settings.sandbox_mode || 'workspace-write' }
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
 
   constructor(config: Partial<AgentConfig> = {}) {
@@ -223,6 +226,7 @@ export class Agent {
       max_iterations: this.config.maxIterations,
       max_concurrent_tasks: 5,
       default_agent_type: 'general',
+      sandbox_mode: 'workspace-write',
       enable_shell_tool: true,
       enable_filesystem_tool: true,
       enable_web_tools: true,
@@ -275,6 +279,11 @@ export class Agent {
     }
     if (typeof partial.default_agent_type === 'string' && partial.default_agent_type) {
       this.settings.default_agent_type = partial.default_agent_type;
+    }
+    if (typeof partial.sandbox_mode === 'string' && partial.sandbox_mode) {
+      // Normalised on the way in: an unknown value must not silently become
+      // "no restriction".
+      this.settings.sandbox_mode = parseSandboxMode(partial.sandbox_mode);
     }
     if (typeof partial.enable_shell_tool === 'boolean') {
       this.settings.enable_shell_tool = partial.enable_shell_tool;
@@ -1608,6 +1617,9 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       agentType: this.settings.default_agent_type,
       todo: [],
       mcp: this.mcp,
+      // The direct path used to skip the sandbox entirely, which made /api/run a
+      // way around the policy the loop enforces.
+      sandbox: new SandboxPolicy(parseSandboxMode(this.settings.sandbox_mode), allowedWorkspaceRoots()),
     })
     if (res.success) {
       let result = ''

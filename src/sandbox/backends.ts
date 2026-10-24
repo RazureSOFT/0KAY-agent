@@ -41,6 +41,8 @@ export interface LaunchInput {
   network?: boolean
   /** Injected in tests; defaults to a PATH lookup. */
   available?: (binary: string) => boolean
+  /** The shell the caller would use without a sandbox, so the fallback matches. */
+  shell?: { file: string; args(command: string): string[] }
 }
 
 function onPath(binary: string): boolean {
@@ -104,9 +106,12 @@ export function buildLaunch(input: LaunchInput): LaunchSpec {
   }
 
   // Windows, or a Linux/macOS box without the tool installed. Say it plainly.
+  const fallback = input.shell
+    ? { file: input.shell.file, args: input.shell.args(input.command) }
+    : { file: shellFile(input.platform), args: shellArgs(input.platform, input.command) }
   return {
-    file: shellFile(input.platform),
-    args: shellArgs(input.platform, input.command),
+    file: fallback.file,
+    args: fallback.args,
     backend: 'none',
     notes: [
       input.platform === 'win32'

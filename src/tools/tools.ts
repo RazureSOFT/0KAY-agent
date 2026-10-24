@@ -5,6 +5,7 @@ import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatu
 export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { withWindowsShellHint } from './shell_hint.js';
+import { shellChoice } from './shell_choice.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -280,7 +281,7 @@ interface ShellRequest {
 export class ShellTool extends Tool {
   get name(): string { return 'bash'; }
   get description(): string {
-    return `Run shell command(s) using ${process.platform === 'win32' ? 'Windows cmd.exe (NOT bash or PowerShell). Use dir/cd and &&, not pwd/ls or semicolons.' : '/bin/sh'}. Pass one command in command, or several independent ones in commands to run them all in parallel and get one result per command (e.g. build + test + lint at once). Use cwd and timeout (ms) when needed.`;
+    return `Run shell command(s) using ${shellChoice().describe()}. Pass one command in command, or several independent ones in commands to run them all in parallel and get one result per command (e.g. build + test + lint at once). Use cwd and timeout (ms) when needed.`;
   }
   get dangerous(): boolean { return true; }
   get parameters(): Record<string, any> {
@@ -339,16 +340,19 @@ export class ShellTool extends Tool {
   private async runOne(request: ShellRequest, args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const cwd = request.cwd ? resolvePath(request.cwd, context.cwd) : context.cwd;
+      // Resolved once per call so the catch block can ask what ran.
+      const shell = shellChoice();
       const timeout = clamp(request.timeout ?? args.timeout, 30_000, 1_000, 300_000);
       const stdoutLabel = request.label ? `stdout-${request.label}` : 'stdout';
       const stderrLabel = request.label ? `stderr-${request.label}` : 'stderr';
       try {
         // Wrapped in an OS sandbox when one exists; the plain shell otherwise.
-        const launch = context.sandbox?.launch(request.command, cwd);
+        const launch = context.sandbox?.launch(request.command, cwd, { shell });
         const sandboxed = launch && launch.backend !== 'none';
         const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-          const command = process.platform === 'win32' ? `chcp 65001 >nul & ${request.command}` : request.command;
-          const options = { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } };
+          // chcp is a cmd.exe builtin; bash already speaks UTF-8.
+          const command = shell.kind === 'cmd' ? `chcp 65001 >nul & ${request.command}` : request.command;
+          const options = { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', ...(shell.kind === 'bash' ? { MSYS_NO_PATHCONV: '1' } : {}) } };
           const onDone = (error: any, stdout: string, stderr: string) => {
             clearTimeout(timer);
             context.signal?.removeEventListener('abort', cancel);
@@ -357,7 +361,7 @@ export class ShellTool extends Tool {
           };
           const child = sandboxed
             ? execFile(launch!.file, launch!.args, options, onDone)
-            : execCallback(command, options, onDone);
+            : execFile(shell.file, shell.args(command), options, onDone);
           const cancel = () => {
             if (process.platform === 'win32' && child.pid) {
               execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
@@ -384,7 +388,10 @@ export class ShellTool extends Tool {
         });
       } catch (error: any) {
         const stdout = await spillOutput(String(error.stdout || ''), context.taskId, stdoutLabel);
-        const rawStderr = withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'));
+        // The cmd translation table only helps when cmd is what ran.
+        const rawStderr = shell.kind === 'cmd'
+          ? withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'))
+          : String(error.stderr || error.message || 'command failed');
         const stderr = await spillOutput(rawStderr, context.taskId, stderrLabel);
         return { success: false, data: { command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
       }
