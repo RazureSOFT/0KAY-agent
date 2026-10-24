@@ -1,4 +1,5 @@
 import * as path from 'node:path'
+import { buildLaunch, type LaunchSpec } from './backends.js'
 
 // Sandbox policy: what a task is allowed to touch, and what it gets told when it
 // tries something else.
@@ -68,6 +69,22 @@ export class SandboxPolicy {
       allowed: false,
       reason: `sandbox is workspace-write: ${resolved} is outside ${this.roots.join(', ')}`,
     }
+  }
+
+  /**
+   * How to actually run a command: wrapped in an OS sandbox when one is
+   * available, plain otherwise. `null` means "run it the way you always did".
+   */
+  launch(command: string, cwd: string, options: { platform?: NodeJS.Platform; network?: boolean } = {}): LaunchSpec | null {
+    const spec = buildLaunch({
+      platform: options.platform || process.platform,
+      mode: this.mode,
+      workspaceRoots: this.roots,
+      command,
+      cwd: cwd || this.roots[0] || process.cwd(),
+      network: options.network,
+    })
+    return spec.backend === 'none' && !spec.notes.length ? null : spec
   }
 
   /** May this path be read? Reads are allowed everywhere except when the caller asked for a strict task. */

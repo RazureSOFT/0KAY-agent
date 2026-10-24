@@ -343,14 +343,21 @@ export class ShellTool extends Tool {
       const stdoutLabel = request.label ? `stdout-${request.label}` : 'stdout';
       const stderrLabel = request.label ? `stderr-${request.label}` : 'stderr';
       try {
+        // Wrapped in an OS sandbox when one exists; the plain shell otherwise.
+        const launch = context.sandbox?.launch(request.command, cwd);
+        const sandboxed = launch && launch.backend !== 'none';
         const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
           const command = process.platform === 'win32' ? `chcp 65001 >nul & ${request.command}` : request.command;
-          const child = execCallback(command, { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }, (error, stdout, stderr) => {
+          const options = { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } };
+          const onDone = (error: any, stdout: string, stderr: string) => {
             clearTimeout(timer);
             context.signal?.removeEventListener('abort', cancel);
             if (error) reject(Object.assign(error, { stdout, stderr }));
             else resolve({ stdout, stderr });
-          });
+          };
+          const child = sandboxed
+            ? execFile(launch!.file, launch!.args, options, onDone)
+            : execCallback(command, options, onDone);
           const cancel = () => {
             if (process.platform === 'win32' && child.pid) {
               execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
@@ -365,7 +372,16 @@ export class ShellTool extends Tool {
         });
         const stdout = await spillOutput(result.stdout || '', context.taskId, stdoutLabel);
         const stderr = await spillOutput(result.stderr || '', context.taskId, stderrLabel);
-        return success({ command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
+        return success({
+          command: request.command,
+          cwd,
+          stdout: stdout.text,
+          stderr: stderr.text,
+          exitCode: 0,
+          truncated: stdout.truncated || stderr.truncated,
+          fullOutputPath: stdout.fullPath || stderr.fullPath,
+          ...(launch ? { sandbox: launch.backend, ...(launch.notes.length ? { sandboxNotes: launch.notes } : {}) } : {}),
+        });
       } catch (error: any) {
         const stdout = await spillOutput(String(error.stdout || ''), context.taskId, stdoutLabel);
         const rawStderr = withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'));
