@@ -50,6 +50,12 @@ export interface ToolContext {
   subagents?: SubAgentRunner;
   /** What this task may touch. Absent means "no policy", used only by tests. */
   sandbox?: SandboxPolicy;
+  /** Which tool groups this task has loaded into its prompt. */
+  toolGroups?: {
+    list(): Array<{ group: string; hint: string; loaded: boolean; tools: string[] }>;
+    load(group: string): boolean;
+    unload(group: string): boolean;
+  };
   mcp?: McpClientLike;
   signal?: AbortSignal;
   history?: any[];

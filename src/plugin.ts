@@ -278,6 +278,14 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '逗号分隔的工具名，直接执行不弹确认；bash 建议保持审批（如需放开：read,write,edit,apply_patch,glob,grep,webfetch,websearch,todowrite,skill,bash）',
           },
           {
+            key: 'tool_disclosure',
+            type: 'select',
+            label: '工具披露方式',
+            defaultValue: 'progressive',
+            options: ['progressive', 'all'],
+            help: 'progressive：提示词只带核心工具，其余按组列出名字、按需加载（省约 8k token/次，工具仍可直接按名调用）；all：全部 39 个工具 schema 每次都带',
+          },
+          {
             key: 'sandbox_mode',
             type: 'select',
             label: '沙箱模式',
@@ -406,6 +414,7 @@ async function pollAgentSettings(): Promise<void> {
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
       always_allow_tools:
         typeof values.always_allow_tools === 'string' ? values.always_allow_tools : DEFAULT_AUTO_APPROVE_TOOLS,
+      tool_disclosure: typeof values.tool_disclosure === 'string' ? values.tool_disclosure : 'progressive',
       sandbox_mode: typeof values.sandbox_mode === 'string' ? values.sandbox_mode : 'workspace-write',
       minimal_mode: values.minimal_mode === true,
       duet_mode: values.duet_mode === true,

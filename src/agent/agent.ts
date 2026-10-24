@@ -21,6 +21,8 @@ import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
 import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
+import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/groups.js';
+import { shellChoice } from '../tools/shell_choice.js';
 import { DeliverySupervisor, supervisionDirective } from './supervision.js';
 import { resolvePosture, postureDirective } from './posture.js';
 import { resolveMode, type MultiAgentMode } from './modes.js';
@@ -47,7 +49,9 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
 // tools that cannot touch anything. they skip the approval gate even when the
 // saved always_allow_tools predates them — a permission popup for a read-only
 // call just makes the whole agent look broken.
-const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts']);
+// Tools that cannot touch the world, so an approval prompt would only be noise.
+// `tools` lists and loads tool groups: it mutates an in-memory set and nothing else.
+const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools']);
 
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -65,7 +69,7 @@ export function formatTodoList(todo?: Array<{ content?: string; status?: string 
 }
 
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status,report_artifacts';
+  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status,report_artifacts,tools';
 
 export const DUET_PLAN_SYSTEM_PROMPT =
   'You are the planning model (large model). Your job is to produce an implementation plan the execution model (weaker, with no conversation context) can follow directly. ' +
@@ -133,6 +137,7 @@ export interface AgentSettings {
   max_concurrent_tasks?: number;
   default_agent_type?: string;
   sandbox_mode?: string;
+  tool_disclosure?: string;
   enable_shell_tool?: boolean;
   enable_filesystem_tool?: boolean;
   enable_web_tools?: boolean;
@@ -210,6 +215,8 @@ export class Agent {
   private workspaces = new WorkspaceRegistry();
   private pluginToolNames = new Set<string>();
   private subagents = new SubAgentRegistry();
+  /** Groups a task has pulled into its prompt. */
+  private taskGroups = new Map<string, Set<string>>();
   /** The configured sandbox mode; tasks inherit it unless they pass their own. */
   get sandboxMode(): string { return this.settings.sandbox_mode || 'workspace-write' }
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
@@ -227,6 +234,7 @@ export class Agent {
       max_concurrent_tasks: 5,
       default_agent_type: 'general',
       sandbox_mode: 'workspace-write',
+      tool_disclosure: 'progressive',
       enable_shell_tool: true,
       enable_filesystem_tool: true,
       enable_web_tools: true,
@@ -279,6 +287,9 @@ export class Agent {
     }
     if (typeof partial.default_agent_type === 'string' && partial.default_agent_type) {
       this.settings.default_agent_type = partial.default_agent_type;
+    }
+    if (typeof partial.tool_disclosure === 'string' && partial.tool_disclosure) {
+      this.settings.tool_disclosure = partial.tool_disclosure === 'all' ? 'all' : 'progressive';
     }
     if (typeof partial.sandbox_mode === 'string' && partial.sandbox_mode) {
       // Normalised on the way in: an unknown value must not silently become
@@ -769,7 +780,7 @@ export class Agent {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '', minimal)
+          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '', minimal, context.taskId)
             + (minimal
               ? `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Iteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}\n\n${this.minimalDirective(options.language)}`
               : `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`)
@@ -780,7 +791,7 @@ export class Agent {
           difficultyHint,
           requireThinking,
           maxTokens,
-          tools: [...this.tools.listTools(),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}],
+          tools: [...this.tools.listTools(this.toolVisible(context.taskId)),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}],
           toolChoice: 'auto',
           signal: context.signal,
           taskId: context.taskId,
@@ -1000,8 +1011,72 @@ export class Agent {
     ].join('\n');
   }
 
-  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = '', minimal = false): string {
-    const tools = this.tools.listTools();
+  /** Groups loaded for a task; `all` disclosure ignores this entirely. */
+  private loadedGroups(taskId: string): Set<string> {
+    let groups = this.taskGroups.get(taskId)
+    if (!groups) {
+      groups = new Set(ALWAYS_LOADED)
+      this.taskGroups.set(taskId, groups)
+    }
+    return groups
+  }
+
+  private loadGroup(taskId: string, group: string): boolean {
+    if (!TOOL_GROUPS[group]) return false;
+    this.loadedGroups(taskId).add(group);
+    return true;
+  }
+
+  /**
+   * Which tools appear in the prompt and in the native tool array. A tool that
+   * is filtered out here can still be called by name — executeToolCall loads its
+   * group on the way through — so this decides what the model is *told*, not
+   * what it is allowed to do.
+   */
+  private toolVisible(taskId: string) {
+    if (this.settings.tool_disclosure === 'all') return () => true;
+    const groups = this.loadedGroups(taskId);
+    return (name: string) => isAlwaysLoaded(name) || groups.has(groupOf(name) || '');
+  }
+
+  /**
+   * One line per group that is not loaded, so the model knows what exists
+   * without paying for its schema. Calling a deferred tool by name still works:
+   * executeToolCall loads its group first.
+   */
+  private deferredIndex(taskId: string): string {
+    if (this.settings.tool_disclosure === 'all') return '';
+    const loaded = this.loadedGroups(taskId);
+    const lines: string[] = [];
+    for (const [group, definition] of Object.entries(TOOL_GROUPS)) {
+      if (loaded.has(group) || ALWAYS_LOADED.includes(group)) continue;
+      const available = definition.tools.filter((name) => this.tools.get(name));
+      if (!available.length) continue;
+      lines.push(`- ${group} (${available.join(', ')}): ${definition.hint}`);
+    }
+    if (!lines.length) return '';
+    return `\n\nMore tools, not loaded (call one by name and it works; or tools(action:"load", group:"<name>") to add the whole group):\n${lines.join('\n')}`;
+  }
+
+  /** The view of the groups a tool sees. */
+  private toolGroupsApi(taskId: string) {
+    return {
+      list: () => Object.entries(TOOL_GROUPS).map(([group, definition]) => ({
+        group,
+        hint: definition.hint,
+        loaded: ALWAYS_LOADED.includes(group) || this.loadedGroups(taskId).has(group),
+        tools: definition.tools.filter((name) => this.tools.get(name)),
+      })),
+      load: (group: string) => this.loadGroup(taskId, group),
+      unload: (group: string) => {
+        if (ALWAYS_LOADED.includes(group) || !TOOL_GROUPS[group]) return false;
+        return this.loadedGroups(taskId).delete(group);
+      },
+    };
+  }
+
+  private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = '', minimal = false, taskId = ''): string {
+    const tools = this.tools.listTools(this.toolVisible(taskId));
     const toolDescriptions = tools
       .map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`)
       .join('\n');
@@ -1017,12 +1092,12 @@ export class Agent {
     if (minimal) {
       return `You are an AI agent that can use tools to complete tasks.
 Host OS: ${process.platform}. Working directory: ${cwd}.
-The bash tool actually runs ${process.platform === 'win32' ? 'Windows cmd.exe: use cd/dir, && for chaining, no pwd/ls/Unix heredocs/semicolons; use the cwd argument.' : '/bin/sh'}.
+The bash tool actually runs ${shellChoice().describe()}.
 Use write/edit for code files. Tool/program errors may be the correct diagnostic result; report them honestly instead of forcing success.
 Verify every factual claim against evidence you retrieved and cite its source (file path, URL, DOI); never invent facts, citations or paths.
 
 Available tools:
-${toolDescriptions}
+${toolDescriptions}${this.deferredIndex(taskId)}
 ${skillBlock}${evolveBlock}
 
 Use native tool calls when your model supports them; batch independent calls. Without native function calling, output exactly one JSON object:
@@ -1035,14 +1110,14 @@ If the turn produced files, call report_artifacts once (absolute path + one-line
     return `You are an AI agent that can use tools to complete tasks.
 
 Host OS: ${process.platform}. Working directory: ${cwd}.
-Bash runs ${process.platform === 'win32' ? 'Windows cmd.exe (use cd/dir, && to chain; no pwd/ls/heredocs/semicolons; prefer the cwd argument over cd).' : '/bin/sh'}.
+Bash runs ${shellChoice().describe()}.
 Use write/edit for code files, not shell echo. Report progress in assistant text before tool actions. Choose the smallest change that satisfies the request; avoid speculative features and repeated probes.
 For multi-step work, first call todowrite with a short checklist and keep exactly one item in_progress; update it as items finish. Skip it for trivial requests.
 A tool/program error can be the correct diagnostic result — report it honestly instead of forcing success.
 Verification: back every factual claim with evidence you retrieved (tool result, file path, URL, DOI); label anything unverified. Never invent citations, URLs, DOIs, versions, figures, quotes or API signatures; prefer primary sources.
 
 Available tools:
-${toolDescriptions}
+${toolDescriptions}${this.deferredIndex(taskId)}
 ${skillBlock}${evolveBlock}
 
 Use native tool calls when supported; batch independent calls (they run in parallel). Without native function calling, output exactly one JSON object:
@@ -1109,6 +1184,10 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if (context.options.read_only_tools === '1' && !EXPLORE_READ_ONLY_TOOLS.has(toolCall.name)) {
       return { success: false, data: null, error: `${toolCall.name} is disabled: explorer sub-agents run strictly read-only` };
     }
+    // A deferred tool is still callable by name; loading its group here is what
+    // makes progressive disclosure safe rather than a guessing game.
+    const toolGroup = groupOf(toolCall.name);
+    if (toolGroup) this.loadGroup(context.taskId, toolGroup);
     if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
@@ -1135,6 +1214,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // The policy every write and shell call is checked against. Defaults to
       // workspace-write; a task can only widen it by saying so in its metadata.
       sandbox: new SandboxPolicy(parseSandboxMode(context.options.sandbox_mode), allowedWorkspaceRoots()),
+      toolGroups: this.toolGroupsApi(context.taskId),
       // Same depth rule as runSubAgent: a child two levels down gets no
       // sub-agent tool, so the tree cannot grow past depth 2.
       subagents: depth >= 2 || context.options.no_subagents === '1'
@@ -1620,6 +1700,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // The direct path used to skip the sandbox entirely, which made /api/run a
       // way around the policy the loop enforces.
       sandbox: new SandboxPolicy(parseSandboxMode(this.settings.sandbox_mode), allowedWorkspaceRoots()),
+      toolGroups: this.toolGroupsApi(sessionIdOrEmpty()),
     })
     if (res.success) {
       let result = ''

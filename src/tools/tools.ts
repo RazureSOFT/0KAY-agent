@@ -1,5 +1,6 @@
 import { exec as execCallback, execFile } from 'child_process';
 import { SubAgentTool } from './packages/subagent.js';
+import { ToolsTool } from './packages/tools_meta.js';
 import { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
@@ -1154,8 +1155,14 @@ export class ToolRegistry {
     if (!tool) return failure(`Tool '${name}' not found`);
     return tool.execute(args, context);
   }
-  listTools(): ToolSchema[] {
-    return [...this.tools.values()].map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, dangerous: tool.dangerous }));
+  listTools(only?: (name: string) => boolean): ToolSchema[] {
+    return [...this.tools.values()]
+      .filter((tool) => !only || only(tool.name))
+      .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, dangerous: tool.dangerous }));
+  }
+
+  names(): string[] {
+    return [...this.tools.keys()];
   }
 }
 
@@ -1193,7 +1200,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
-    new SubAgentTool(),
+    new SubAgentTool(), new ToolsTool(),
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
