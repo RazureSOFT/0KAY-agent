@@ -45,6 +45,8 @@ function repoRoot(context: ToolContext, configured: string): string {
   return existsSync(path.join(candidate, '.git')) ? candidate : context.cwd;
 }
 
+// every write goes into a worktree on a self/<slug> branch. that one rule is
+// what makes "no PR, no change" true instead of a fucking promise.
 export class EvolveBeginTool extends Tool {
   get name(): string { return 'evolve_begin'; }
 

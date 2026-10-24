@@ -42,9 +42,9 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
   'todowrite', 'compress', 'decompress', 'search_context', 'acp_status', 'report_artifacts',
 ]);
 
-// tools that cannot touch anything. they skip the approval gate even when
-// the saved always_allow_tools predates them, because a permission popup
-// for a read-only call is just a way to make the agent look broken.
+// tools that cannot touch anything. they skip the approval gate even when the
+// saved always_allow_tools predates them — a permission popup for a read-only
+// call just makes the whole agent look broken.
 const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts']);
 
 function envCount(name: string, fallback: number, min: number, max: number): number {
