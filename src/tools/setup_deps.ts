@@ -1,17 +1,3 @@
-/**
- * `setup_deps` tool — the one-click capability bootstrapper.
- *
- * Rounds out the environment so the full-feature tools can use their heavier
- * paths (headless browser, decompiler, PDF/OCR, ffmpeg):
- *  - `status`: report every system CLI and npm library and whether it is present.
- *  - `plan`:   show the exact install commands that would run on this host.
- *  - `install`: run them. Installs the optional npm libraries and, when a
- *    package manager is available, the missing system CLIs. `yes:true` is
- *    required to actually install (plan is always safe to run first).
- *
- * Every tool also works with its TypeScript fallback, so installing is optional.
- */
-
 import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { success, failure } from './helpers.js';
 import { probeCapabilities, npmInstall, planCliInstall, installCli, NPM_CAPABILITIES } from './deps.js';
@@ -71,7 +57,6 @@ export class SetupDepsTool extends Tool {
         });
       }
 
-      // action === 'install'
       if (args.yes !== true) return failure('install requires yes:true (run action:"plan" first to review the commands)');
       const installed: any[] = [];
       const failed: any[] = [];

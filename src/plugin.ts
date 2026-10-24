@@ -1,10 +1,3 @@
-/**
- * 0kay Agent Plugin
- *
- * Registers with Core via gRPC (protobuf), exposes AgentService for task
- * execution, and sends periodic heartbeats. All AI calls go through mocr.
- */
-
 import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import * as os from 'os'
@@ -18,7 +11,6 @@ import { TaskManager } from './task/task.js'
 import { startWorkspaceRootsSync } from './workspace/paths.js'
 
 const __filename = fileURLToPath(import.meta.url)
-/** Version reported to Core on registration; manifest.json is the source of truth. */
 async function manifestVersion(): Promise<string> {
   try {
     const manifest = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
@@ -28,7 +20,6 @@ async function manifestVersion(): Promise<string> {
   }
 }
 
-/** Declared permissions from manifest.json, sent to Core on registration. */
 async function manifestPermissions(): Promise<Record<string, unknown> | undefined> {
   try {
     const manifest = JSON.parse(await readFile(new URL('../manifest.json', import.meta.url), 'utf8'))
@@ -48,7 +39,6 @@ const AGENT_PORT = process.env.AGENT_GRPC_PORT || '50054'
 const AGENT_ADDRESS = process.env.AGENT_ADDRESS || `localhost:${AGENT_PORT}`
 const MOCR_ADDRESS = process.env.MOCR_ADDRESS || 'localhost:50052'
 
-// Proto-loader options: camelCase field names, enums as strings
 const loaderOptions: protoLoader.Options = {
   keepCase: false,
   longs: String,
@@ -65,9 +55,6 @@ let grpcServer: grpc.Server | null = null
 let heartbeatTimer: NodeJS.Timeout | null = null
 let executorId = ''
 
-/**
- * Load protobuf definitions from the shared proto/ directory.
- */
 function loadProtos(): any {
   const files = [
     path.join(PROTO_DIR, 'core/v1/core.proto'),
@@ -80,7 +67,6 @@ function loadProtos(): any {
   return grpc.loadPackageDefinition(packageDefinition) as any
 }
 
-/** Build host info for heartbeat (hostname/os/arch/cpu/mem/workdir). */
 function buildHostInfo(): any {
   return {
     hostname: os.hostname(),
@@ -94,9 +80,6 @@ function buildHostInfo(): any {
   }
 }
 
-/**
- * Create a gRPC client for Core's PluginService.
- */
 function createCoreClient(proto: any): any {
   if (coreClient) return coreClient
   const corePkg = proto.core?.v1
@@ -110,9 +93,6 @@ function createCoreClient(proto: any): any {
   return coreClient
 }
 
-/**
- * Register this agent plugin with Core.
- */
 async function registerWithCore(proto: any): Promise<string | null> {
   const client = createCoreClient(proto)
 
@@ -344,9 +324,6 @@ async function registerWithCore(proto: any): Promise<string | null> {
   })
 }
 
-/**
- * Send a heartbeat to Core.
- */
 function sendHeartbeat(proto: any): void {
   if (shuttingDown) return
   void agent.flushTaskRecords().catch(error => console.warn('Task ledger retry failed:', error.message))
@@ -368,7 +345,6 @@ function sendHeartbeat(proto: any): void {
   client.Heartbeat(request, coreMetadata(), { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
     if (err) {
       console.warn('[Agent] Heartbeat failed:', err.message)
-      // Try to re-register if we lost connection
       if (err.code === grpc.status.UNAVAILABLE || err.code === grpc.status.NOT_FOUND) {
         console.log('[Agent] Attempting to re-register...')
         pluginId = null
@@ -385,16 +361,12 @@ function sendHeartbeat(proto: any): void {
   })
 }
 
-// Shared agent + task manager
 const agent = new Agent({ mocrAddress: MOCR_ADDRESS })
 const taskManager = agent.getTaskManager()
 
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080'
 let settingsPollTimer: NodeJS.Timeout | null = null
 
-/**
- * Poll Core for saved Agent settings and apply them to the runtime.
- */
 async function pollAgentSettings(): Promise<void> {
   try {
     const res = await coreFetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() })
@@ -431,13 +403,9 @@ async function pollAgentSettings(): Promise<void> {
     })
     taskManager.setMaxConcurrentTasks(Number(values.max_concurrent_tasks ?? 5))
   } catch {
-    // Core HTTP not reachable — keep current settings
   }
 }
 
-/**
- * Start the AgentService gRPC server.
- */
 function startAgentService(proto: any): Promise<number> {
   const agentPkg = proto.agent?.v1
   if (!agentPkg) {
@@ -564,9 +532,6 @@ function startAgentService(proto: any): Promise<number> {
   })
 }
 
-/**
- * Graceful shutdown.
- */
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
@@ -580,9 +545,6 @@ function shutdown(): void {
   })
 }
 
-/**
- * Main entry: start server, register with Core, start heartbeat loop.
- */
 export async function startPlugin(): Promise<void> {
   const dataDir=process.env.AGENT_DATA_DIR || './data/agent'
   await mkdir(dataDir,{recursive:true})
@@ -594,10 +556,8 @@ export async function startPlugin(): Promise<void> {
   console.log('[Agent] Loading protos from', PROTO_DIR)
   const proto = loadProtos()
 
-  // 1. Start AgentService server
   await startAgentService(proto)
 
-  // 2. Register with Core (retry a few times if Core isn't up yet)
   for (let attempt = 1; attempt <= 10; attempt++) {
     const id = await registerWithCore(proto)
     if (id) {
@@ -612,23 +572,15 @@ export async function startPlugin(): Promise<void> {
     console.error('[Agent] Failed to register with Core after 10 attempts')
   }
 
-  // 3. Heartbeat every 10s (Core timeout is 30s)
   heartbeatTimer = setInterval(() => sendHeartbeat(proto), 10_000)
 
-  // First heartbeat soon after registration
   setTimeout(() => sendHeartbeat(proto), 1000)
 
-  // 3b. Pull Agent settings section (model pin, limits, tool toggles)
   await pollAgentSettings()
   settingsPollTimer = setInterval(pollAgentSettings, 15_000)
 
-  // 3c. Mirror Core's workspace allow-list (Settings → 工作区) into the write
-  // policy. Runs after registration so the request carries the plugin token;
-  // without it, a folder allowed from the UI would work for git but still be
-  // refused by write/edit.
   startWorkspaceRootsSync()
 
-  // 4. Handle shutdown signals
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 

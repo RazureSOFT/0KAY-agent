@@ -1,27 +1,3 @@
-/**
- * `reverse_engineer` tool — full reimplementation of the morluto/rea static
- * analysis surface plus provider bridges, in TypeScript.
- *
- * Self-implemented (no external tool):
- *  - Format ID: ELF/PE/.NET/Mach-O/WASM/ASAR/ZIP/SQLite/JS/PCAP.
- *  - ELF: header, program/section headers, symbols, relocations, needed libs,
- *    mitigations (NX/PIE/RELRO/canary).
- *  - PE: header, sections, data directories, imports/exports, .NET metadata
- *    (assembly refs, type/method names), mitigations (ASLR/DEP/CFG/GS).
- *  - Mach-O: header, load commands, segments, dylibs.
- *  - WASM: sections, imports/exports, and WAT decoding when wabt is present.
- *  - Go build info + modules, Rust cargo-auditable crates.
- *  - JavaScript/Electron: imports/requires, IPC, routes, source maps.
- *  - SQLite schema, PCAP summary (endpoints/DNS/TLS SNI/protocols).
- *  - Strings with offsets, entropy per section, IOC extraction.
- *
- * Provider bridges (when installed) for deeper analysis:
- *  - ghidra (analyzeHeadless) -> decompiled pseudocode.
- *  - jadx -> Android APK/DEX decompiled sources.
- *  - objdump -> disassembly; wasm2wat -> WAT; dotnet/ildasm -> IL.
- * Each bridge reports which provider ran, and degrades with a clear message.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Tool, type ToolContext, type ToolResult } from './types.js';
@@ -74,7 +50,6 @@ function entropy(data: Buffer): number {
   return Number(h.toFixed(3));
 }
 
-// --- ELF --------------------------------------------------------------------
 function parseElf(buffer: Buffer, findings: Finding[]): void {
   const is64 = buffer[4] === 2; const le = buffer[5] === 1;
   const r16 = (o: number) => (le ? buffer.readUInt16LE(o) : buffer.readUInt16BE(o));
@@ -103,18 +78,15 @@ function parseElf(buffer: Buffer, findings: Finding[]): void {
   for (let i = 0; i < Math.min(shnum, 128); i++) { const s = readSection(i); const name = readName(s.nameOffset); sections.push({ name, type: s.type, size: s.size, entropy: s.type === 1 && s.size ? entropy(buffer.slice(s.offset, s.offset + s.size)) : undefined }); }
   findings.push({ kind: 'elf.sections', detail: sections.filter((s) => s.name) });
 
-  // Dynamic: needed libraries + imported/exported symbols.
   const neededLibs = [...new Set([...buffer.slice(0, Math.min(buffer.length, 4_000_000)).toString('latin1').matchAll(/lib[A-Za-z0-9_.+-]+\.so(\.[0-9]+)*/g)].map((m) => m[0]))].slice(0, 64);
   if (neededLibs.length) findings.push({ kind: 'elf.needed', detail: neededLibs });
 
-  // Mitigations from program headers / dynamic tags / symbols.
   const hasGnuStack = buffer.includes(Buffer.from('.note.GNU-stack'));
   const hasRelro = buffer.includes(Buffer.from('GNU_RELRO'));
   const dynType = ['NONE', 'REL', 'EXEC', 'DYN', 'CORE'][r16(16)] || r16(16);
   const text = buffer.toString('latin1');
   findings.push({ kind: 'elf.mitigations', detail: { pie: dynType === 'DYN', nx: hasGnuStack, relro: hasRelro, canary: /\b__stack_chk_fail\b/.test(text), fortify: /\b__.*_chk\b/.test(text) } });
 
-  // Symbols + relocations from section tables.
   const symbols: Array<{ name: string; value: number; type: string }> = [];
   const sections2 = [];
   for (let i = 0; i < Math.min(shnum, 128); i++) sections2.push(readSection(i));
@@ -136,7 +108,6 @@ function parseElf(buffer: Buffer, findings: Finding[]): void {
   if (symbols.length) findings.push({ kind: 'elf.symbols', detail: symbols.slice(0, 500) });
 }
 
-// --- PE ---------------------------------------------------------------------
 function parsePe(buffer: Buffer, findings: Finding[]): void {
   const peOffset = buffer.readUInt32LE(0x3c);
   if (buffer.slice(peOffset, peOffset + 4).toString('ascii') !== 'PE\0\0') return;
@@ -158,7 +129,6 @@ function parsePe(buffer: Buffer, findings: Finding[]): void {
   }
   findings.push({ kind: 'pe.sections', detail: sections.map(({ name, virtualSize, rawSize, entropy: e }) => ({ name, virtualSize, rawSize, entropy: e })) });
 
-  // Import table (walk the import directory of the data directory).
   const dataDirOffset = peOffset + 24 + (is64 ? 112 : 96);
   const importRva = buffer.readUInt32LE(dataDirOffset + 8);
   const rvaToOffset = (rva: number): number => {
@@ -197,7 +167,6 @@ function parsePe(buffer: Buffer, findings: Finding[]): void {
   if (buffer.includes(Buffer.from('BSJB'))) parseDotNet(buffer, findings);
 }
 
-// --- Mach-O -----------------------------------------------------------------
 function parseMacho(buffer: Buffer, findings: Finding[]): void {
   const magic = buffer.readUInt32BE(0);
   const is64 = magic === 0xfeedfacf || magic === 0xcffaedfe;
@@ -211,14 +180,14 @@ function parseMacho(buffer: Buffer, findings: Finding[]): void {
   const dylibs: string[] = [];
   for (let i = 0; i < Math.min(ncmds, 512) && offset + 8 <= buffer.length; i++) {
     const cmd = r32(offset); const cmdsize = r32(offset + 4);
-    if (cmd === 0x19 && is64) { // LC_SEGMENT_64
+    if (cmd === 0x19 && is64) {
       const name = buffer.slice(offset + 8, offset + 24).toString('ascii').replace(/\0+$/, '');
       segments.push({ name, vmSize: r64(offset + 32) });
     } else if (cmd === 0x19 || cmd === 0x1) {
       const name = buffer.slice(offset + 8, offset + 24).toString('ascii').replace(/\0+$/, '');
       segments.push({ name, vmSize: r32(offset + 32) });
     }
-    if (cmd === 0xc || cmd === 0xd || cmd === 0x18 || cmd === 0x1f) { // dylib load commands
+    if (cmd === 0xc || cmd === 0xd || cmd === 0x18 || cmd === 0x1f) {
       const nameOffset = r32(offset + (is64 ? 24 : 20));
       const start = offset + nameOffset; let end = start; while (end < buffer.length && buffer[end] !== 0) end++;
       dylibs.push(buffer.slice(Math.min(start, buffer.length), Math.min(end, start + 300)).toString('utf8'));
@@ -229,7 +198,6 @@ function parseMacho(buffer: Buffer, findings: Finding[]): void {
   if (dylibs.length) findings.push({ kind: 'macho.dylibs', detail: dylibs });
 }
 
-// --- WASM -------------------------------------------------------------------
 function parseWasm(buffer: Buffer, findings: Finding[]): void {
   let offset = 8;
   const names = ['custom', 'type', 'import', 'function', 'table', 'memory', 'global', 'export', 'start', 'element', 'code', 'data', 'datacount'];
@@ -248,15 +216,13 @@ function parseWasm(buffer: Buffer, findings: Finding[]): void {
   if (exports.length) findings.push({ kind: 'wasm.exports', detail: exports });
 }
 
-// --- ZIP/ASAR/APK/JAR -------------------------------------------------------
 function parseZip(buffer: Buffer, findings: Finding[], label: string): void {
   try {
     const entries = buildZipRead(buffer).map((entry) => ({ name: entry.name, size: entry.size }));
     findings.push({ kind: `${label}.entries`, detail: entries.slice(0, 500) });
-  } catch { /* unreadable zip */ }
+  } catch { }
 }
 
-// --- Go / Rust --------------------------------------------------------------
 function parseGoBuildInfo(buffer: Buffer, findings: Finding[]): void {
   const text = buffer.toString('latin1');
   const version = /go1\.\d+(\.\d+)?/.exec(text)?.[0];
@@ -273,7 +239,6 @@ function parseRustAuditable(buffer: Buffer, findings: Finding[]): void {
   if (crates.size >= 5) findings.push({ kind: 'rust.crates', detail: [...crates] });
 }
 
-// --- .NET -------------------------------------------------------------------
 function parseDotNet(buffer: Buffer, findings: Finding[]): void {
   const text = buffer.toString('latin1');
   const refs = new Set<string>();
@@ -285,7 +250,6 @@ function parseDotNet(buffer: Buffer, findings: Finding[]): void {
   findings.push({ kind: 'dotnet.metadata', detail: { present: buffer.includes(Buffer.from('BSJB')) } });
 }
 
-// --- SQLite -----------------------------------------------------------------
 function parseSqlite(buffer: Buffer, findings: Finding[]): void {
   const pageSize = buffer.readUInt16BE(16) || 4096; const enc = buffer.readUInt32BE(56);
   findings.push({ kind: 'sqlite.header', detail: { pageSize, encoding: enc === 1 ? 'utf8' : enc === 2 ? 'utf16le' : enc === 3 ? 'utf16be' : String(enc) } });
@@ -298,7 +262,6 @@ function parseSqlite(buffer: Buffer, findings: Finding[]): void {
   if (indexes.size) findings.push({ kind: 'sqlite.indexes', detail: [...indexes] });
 }
 
-// --- JavaScript -------------------------------------------------------------
 function analyzeJavaScript(source: string, findings: Finding[]): void {
   const imports = new Set<string>(); const requires = new Set<string>();
   for (const m of source.matchAll(/(?:^|\n)\s*import\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/g)) imports.add(m[1]);
@@ -316,7 +279,6 @@ function analyzeJavaScript(source: string, findings: Finding[]): void {
   if (/sourceMappingURL=/.test(source)) findings.push({ kind: 'javascript.sourcemap', detail: /sourceMappingURL=([^\s*]+)/.exec(source)?.[1] });
 }
 
-// --- PCAP (summary, no deep protocol decode) --------------------------------
 function parsePcap(buffer: Buffer, findings: Finding[]): void {
   const le = buffer.readUInt32BE(0) !== 0xa1b2c3d4;
   const r32 = (o: number) => (le ? buffer.readUInt32LE(o) : buffer.readUInt32BE(o));
@@ -332,7 +294,6 @@ function parsePcap(buffer: Buffer, findings: Finding[]): void {
       const src = `${frame[ipStart + 12]}.${frame[ipStart + 13]}.${frame[ipStart + 14]}.${frame[ipStart + 15]}`;
       const dst = `${frame[ipStart + 16]}.${frame[ipStart + 17]}.${frame[ipStart + 18]}.${frame[ipStart + 19]}`;
       endpoints.add(`${src} -> ${dst}`);
-      // DNS query name in UDP/53 payload (best-effort).
       if (frame[ipStart + 9] === 17) {
         const udpStart = ipStart + 20;
         const dport = (frame[udpStart + 2] << 8) | frame[udpStart + 3];
@@ -347,7 +308,6 @@ function parsePcap(buffer: Buffer, findings: Finding[]): void {
   findings.push({ kind: 'pcap.summary', detail: { packets, endpoints: [...endpoints].slice(0, 300), dns: [...dns].slice(0, 200) } });
 }
 
-// --- IOC extraction ---------------------------------------------------------
 function extractIocs(text: string): Record<string, string[]> {
   const urls = [...new Set([...text.matchAll(/https?:\/\/[^\s"'<>)]+/g)].map((m) => m[0]))].slice(0, 100);
   const ips = [...new Set([...text.matchAll(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g)].map((m) => m[0]))].slice(0, 100);
@@ -357,7 +317,6 @@ function extractIocs(text: string): Record<string, string[]> {
   return { urls, ips, domains, emails, hashes };
 }
 
-/** Run an external decompiler/disassembler provider if requested + available. */
 async function runProvider(format: string, filePath: string, options: AnalyzeOptions, signal?: AbortSignal): Promise<Finding[]> {
   const findings: Finding[] = [];
   const provider = options.provider || 'auto';
@@ -372,26 +331,20 @@ async function runProvider(format: string, filePath: string, options: AnalyzeOpt
       findings.push({ kind: 'provider.ghidra', detail: { ran: !!result, exit: result?.code, note: 'Ghidra headless run; pseudocode output depends on project scripts', args } });
     }
   }
-  // jadx handles jars as well as apks. Restricting this to `apk` meant an
-  // installed jadx was never invoked for a jar — the exact container most of
-  // these mods ship as.
   if (provider === 'jadx' || (provider === 'auto' && (format === 'apk' || format === 'jar'))) {
     const jadx = await resolveCli('jadx');
     if (jadx.available) {
       const outDir = await fs.mkdtemp(path.join((await import('os')).tmpdir(), '0kay-jadx-'));
       const result = await runCli(jadx.command, ['-d', outDir, '-q', filePath], { timeout: 300_000, signal, maxBuffer: 32 * 1024 * 1024 }).catch(() => null);
       let decompiled: string[] = [];
-      try { decompiled = (await fs.readdir(outDir, { recursive: true })).filter((f) => String(f).endsWith('.java')).map(String).slice(0, 200); } catch { /* none */ }
+      try { decompiled = (await fs.readdir(outDir, { recursive: true })).filter((f) => String(f).endsWith('.java')).map(String).slice(0, 200); } catch { }
 
-      // Include actual source, not just the file list. Reporting only paths left
-      // the model with nothing to read, which is the same dead end as not running
-      // jadx at all. Bounded: a handful of files, a few KB each.
       const sources: Array<{ file: string; code: string }> = [];
       for (const file of decompiled.slice(0, 6)) {
         try {
           const code = await fs.readFile(path.join(outDir, file), 'utf8');
           sources.push({ file, code: code.slice(0, 4_000) });
-        } catch { /* unreadable */ }
+        } catch { }
       }
 
       findings.push({
@@ -407,8 +360,6 @@ async function runProvider(format: string, filePath: string, options: AnalyzeOpt
         },
       });
     } else {
-      // Say so explicitly. Silence here is what made it look as though the tool
-      // had analysed nothing when the container simply had no decompiler.
       findings.push({ kind: 'provider.jadx', detail: { ran: false, note: 'jadx not installed; used the built-in class-file analyser. Run setup_deps to install jadx for full source recovery.' } });
     }
   }
@@ -486,11 +437,6 @@ export class ReverseEngineerTool extends Tool {
       else if (format === 'sqlite') parseSqlite(buffer, findings);
       else if (format === 'pcap') parsePcap(buffer, findings);
       else if (['zip', 'asar', 'apk', 'jar'].includes(format)) {
-        // JVM containers get the real analyser: manifest, mod descriptors,
-        // constant-pool parsing of every .class, nested jars, and protection
-        // markers. Routing them through parseZip alone returned a bare entry
-        // listing, which is why a jar "analysis" looked like the RE path had not
-        // run. Plain zip/asar keep the listing-only path.
         if (format === 'jar' || format === 'apk') analyzeJar(buffer, findings, format);
         else parseZip(buffer, findings, format);
       }

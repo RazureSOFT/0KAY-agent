@@ -1,7 +1,3 @@
-/**
- * Task manager for Agent - handles task lifecycle
- */
-
 export type TaskState = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELLED';
 
 export interface Task {
@@ -92,8 +88,6 @@ export class TaskManager {
   }
 
   private wake(): void {
-    // Wake exactly one waiter per freed slot; the woken loop re-checks the
-    // concurrency limit and re-queues itself, so nobody is orphaned.
     const next = this.waiters.shift();
     if (next) next();
   }

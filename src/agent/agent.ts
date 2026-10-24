@@ -1,7 +1,3 @@
-/**
- * Agent main loop - Core can trigger via gRPC
- */
-
 import { MocrProvider, Message, MessagePart, GenerateRequest, GenerateResponse, ToolCall } from '../provider/mocr.js';
 import { ToolRegistry, createDefaultRegistry, PluginTool } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
@@ -30,7 +26,6 @@ import { buildHandoffDoc } from './handoff.js';
 import { ensureAgentWorkspace, appendAgentNote } from './agent_workspace.js';
 import { extractDocumentText, isDocumentAttachment } from './attachment_text.js';
 
-/** Core HTTP base, used to pull uploaded attachments onto the agent host. */
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
 
 export interface AgentConfig {
@@ -38,41 +33,23 @@ export interface AgentConfig {
   maxIterations: number;
 }
 
-/**
- * Agent type that fans a problem out to several independent explorer sub-agents
- * before solving it, then synthesizes the best approach. See exploreSolutions.
- */
 export const EXPLORE_AGENT_TYPE = 'code_explore';
 export const EXPLORE_FANOUT = 5;
-/** Explorers that miss this deadline are cancelled; the rest still feed the digest. */
 export const EXPLORE_TIMEOUT_MS = 180_000;
 
-/** Explorer sub-agents may only call these tools; everything else is rejected. */
 const EXPLORE_READ_ONLY_TOOLS = new Set([
   'read', 'glob', 'grep', 'webfetch', 'websearch', 'papersearch', 'apidocsearch',
   'todowrite', 'compress', 'decompress', 'search_context', 'acp_status', 'report_artifacts',
 ]);
 
-/**
- * Tools that touch nothing on disk and only report, so they skip the approval
- * prompt even when `always_allow_tools` (a persisted setting) predates them.
- * A user who saved the settings before `report_artifacts` existed would
- * otherwise get a permission popup for a read-only bookkeeping call.
- */
 const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts']);
 
-/** Read a positive integer env override, clamped to [min, max]; out-of-range falls back. */
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
   if (!Number.isFinite(parsed) || parsed < min) return fallback;
   return Math.min(max, Math.floor(parsed));
 }
 
-/**
- * Render the live todo list as a compact checklist for the model. Injected into
- * the system prompt every turn (and into the compaction summary) so the plan
- * survives context compression instead of being dropped with the raw history.
- */
 export function formatTodoList(todo?: Array<{ content?: string; status?: string }>): string {
   const items = (todo || []).filter((item) => item && String(item.content || '').trim() && item.status !== 'cancelled');
   if (!items.length) return '';
@@ -82,26 +59,9 @@ export function formatTodoList(todo?: Array<{ content?: string; status?: string 
   return `Current todo list — ${remaining} item(s) remaining. Keep it current with todowrite and exactly one item in_progress:\n${lines.join('\n')}`;
 }
 
-/**
- * Comma-separated tools that execute without an approval prompt.
- *
- * Every tool that *modifies existing files* is deliberately absent: write, edit
- * and apply_patch all sit behind the gate, as do bash, computeruse, browser and
- * the MCP surface. Auto-approving them made the approval gate decorative and
- * contradicted what the README promises about file edits, while the tools that
- * remain (read-only inspection, search, todo/skill bookkeeping, context
- * compression) have no side effect worth interrupting the user for.
- *
- * document and slides stay auto-approved: they emit new artifacts rather than
- * overwriting the user's work, and both are confined to the workspace roots.
- */
 export const DEFAULT_AUTO_APPROVE_TOOLS =
   'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status,report_artifacts';
 
-/**
- * Fixed handoff schema for in-run context compaction. Mirrors LIFE's
- * COMPACTION_HEADINGS so a compacted run and a compacted chat read the same.
- */
 export const DUET_PLAN_SYSTEM_PROMPT =
   'You are the planning model (large model). Your job is to produce an implementation plan the execution model (weaker, with no conversation context) can follow directly. ' +
   'First give a short plan overview and step-by-step outline (citing concrete file paths and facts), then output a self-contained implementation prompt wrapped in <implementation_prompt></implementation_prompt>. ' +
@@ -119,7 +79,6 @@ export const COMPACTION_SCHEMA_PROMPT =
   '## Objective\n## Important Details\n## Work State\n## Next Move\n## Relevant Files\n' +
   'Objective: the current goal and what done means. Important Details: durable facts, decisions, constraints, file paths, IDs, tool results and errors, user answers, acceptance criteria, and questions already answered (never secrets). Work State: grouped as Completed / Active / Blocked, reporting only observed results and never inventing success. Next Move: the concrete immediate next step(s). Relevant Files: file_path:line references needed to continue. If a section has nothing, write none. Carry prior facts forward. Start directly with ## Objective; no preamble or restated instructions. Be terse and factual, no process narration. Do not execute tools. Keep under 4000 words.';
 
-/** Ledger-friendly tool arguments: drop bulky text payloads (line stats come from results). */
 function serializeToolArgs(args: Record<string, any>): string {
   try {
     const clean: Record<string, any> = { ...(args || {}) };
@@ -140,9 +99,6 @@ function serializeToolArgs(args: Record<string, any>): string {
   }
 }
 
-/** Left-to-right balanced {...} candidates for fallback tool-call parsing.
- *  The depth scan ignores braces inside JSON string literals, so prose like
- *  "{see note}" around the call cannot swallow or break the payload. */
 function jsonObjectCandidates(text: string, limit = 5): string[] {
   const out: string[] = [];
   for (let start = text.indexOf('{'); start >= 0 && out.length < limit; start = text.indexOf('{', start + 1)) {
@@ -165,7 +121,6 @@ function jsonObjectCandidates(text: string, limit = 5): string[] {
   return out;
 }
 
-/** Runtime settings pulled from Core's /api/settings/agent section. */
 export interface AgentSettings {
   model_id?: string;
   temperature?: number;
@@ -176,32 +131,22 @@ export interface AgentSettings {
   enable_filesystem_tool?: boolean;
   enable_web_tools?: boolean;
   enable_computer_use?: boolean;
-  /** Browser automation via the Chrome DevTools Protocol. */
   enable_browser_tool?: boolean;
-  /** Word/Markdown document generation. */
   enable_document_tool?: boolean;
-  /** PowerPoint presentation generation. */
   enable_slides_tool?: boolean;
-  /** Allow the WebUI terminal to run shell commands on this host. */
   enable_terminal?: boolean;
-  /** Self-iteration: edit this repository inside a `self/*` worktree. */
   self_evolve_enabled?: boolean;
-  /** Repository to evolve; empty = the agent's own checkout. */
   self_evolve_repo?: string;
   vision_model?: string;
-  /** Manual context window in tokens (0 = auto from the provider). */
   context_window?: number;
   enable_mcp_tool?: boolean;
-  /** Allow tools contributed by plugins (via Core's tool catalog). */
   enable_plugin_tools?: boolean;
   enable_task_tool?: boolean;
   mcp_servers_json?: string;
   enable_skills?: boolean;
   skills_dir?: string;
   always_allow_tools?: string;
-  /** Minimal mode: English-only internals, terse output, smallest edits (token saving). */
   minimal_mode?: boolean;
-  /** Duet mode: the think model drafts the plan, the output model implements. */
   duet_mode?: boolean;
 }
 
@@ -214,23 +159,17 @@ export interface AgentContext {
   sessionId: string;
   cwd: string;
   options: Record<string, string>;
-  /** Model-driven context compression ledger (billion-context style). */
   ledger?: ContextLedger;
 }
 
-/** Rough token estimate: ~4 ASCII chars/token, ~1 token per non-ASCII char
- *  (CJK is roughly one token per character, so chars/4 badly under-counts it). */
 export function estimateTextTokens(text: string): number {
   let ascii = 0, wide = 0;
   for (const ch of text) { (ch.codePointAt(0) ?? 0) < 128 ? ascii++ : wide++; }
   return Math.round(ascii / 4 + wide);
 }
 
-/** Last real prompt-token count the model reported, per session (for the usage
- *  indicator). Cleared on process exit; falls back to a text estimate. */
 const sessionPromptTokens = new Map<string, number>();
 const MAX_SESSION_PROMPT_TOKENS = 1000;
-/** Hard safety ceiling for the agent loop (see the deprecation note in runLoop). */
 const MAX_LOOP_ITERATIONS = 500;
 function trackSessionPromptTokens(sessionId: string, tokens: number): void {
   sessionPromptTokens.set(sessionId, tokens);
@@ -240,9 +179,6 @@ function trackSessionPromptTokens(sessionId: string, tokens: number): void {
   }
 }
 
-/** Tools that mutate files: two parallel calls touching the same target would
- *  silently clobber each other, so these run through one process-wide promise
- *  chain. Read-only tools are unaffected and still run concurrently. */
 const FILE_MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'document', 'slides']);
 let fileMutationChain: Promise<unknown> = Promise.resolve();
 function serializeFileMutation<T>(tool: string, task: () => Promise<T>): Promise<T> {
@@ -254,7 +190,6 @@ function serializeFileMutation<T>(tool: string, task: () => Promise<T>): Promise
 
 export class Agent {
   private mocr: MocrProvider;
-  /** Model in use for the current task, reused by tool-side model calls. */
   private activeModel = '';
   private tools: ToolRegistry;
   private skills: SkillRegistry;
@@ -266,9 +201,7 @@ export class Agent {
   private approvals = new ApprovalManager();
   private questions = new QuestionManager();
   private handoffs = new Map<string,string>();
-  /** dsh-style workspace registry: durable workspaces that own session accounts. */
   private workspaces = new WorkspaceRegistry();
-  /** Names of plugin-contributed tools currently registered (for refresh). */
   private pluginToolNames = new Set<string>();
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
 
@@ -321,7 +254,6 @@ export class Agent {
     });
   }
 
-  /** Apply settings loaded from Core's Agent settings section. */
   applySettings(partial: AgentSettings): void {
     if (typeof partial.model_id === 'string') this.settings.model_id = partial.model_id.trim();
     if (typeof partial.temperature === 'number' && Number.isFinite(partial.temperature)) {
@@ -396,7 +328,6 @@ export class Agent {
     return { ...this.settings };
   }
 
-  /** True when the tool is listed in always_allow_tools → skip approval prompts. */
   private autoApproved(tool: string): boolean {
     if (!tool) return false;
     return this.settings.always_allow_tools
@@ -406,16 +337,11 @@ export class Agent {
       .includes(tool);
   }
 
-  /** computeruse screenshot/listwindows are read-only and may run without a prompt. */
   private readOnlyComputerUse(tool: string, args: Record<string, any>): boolean {
     return tool === 'computeruse' && ['screenshot', 'listwindows'].includes(String(args?.action || ''));
   }
 
-  /** Register/unregister the optional tools according to the current settings.
-   *  Called on construction and whenever a toggle changes, so flipping a switch
-   *  in the settings pane does not need a restart. */
   private applyToolToggles(): void {
-    // Rebuild registry so disabled tools are absent from listTools / call().
     this.tools = createDefaultRegistry(this.skills);
     if (!this.settings.self_evolve_enabled) {
       for (const name of ['evolve_begin', 'evolve_commit', 'evolve_upstream', 'evolve_finish']) this.tools.unregister(name);
@@ -436,10 +362,6 @@ export class Agent {
     if (!this.settings.enable_skills) this.tools.unregister('skill');
   }
 
-  /**
-   * Pull tools contributed by plugins from Core's tool catalog and register
-   * each as a dynamic tool that routes execution back through Core.
-   */
   private async refreshPluginTools(): Promise<void> {
     for (const name of this.pluginToolNames) this.tools.unregister(name);
     this.pluginToolNames.clear();
@@ -452,11 +374,6 @@ export class Agent {
     }
   }
 
-  /**
-   * Load the shared MCP server list from Core (Settings → MCP) plus any
-   * plugin-contributed servers and configure the MCP manager. A user-configured
-   * server wins over a plugin one with the same id.
-   */
   private async refreshMcpServers(): Promise<void> {
     const servers: McpServerConfig[] = [];
     try {
@@ -469,7 +386,7 @@ export class Agent {
           if (Array.isArray(parsed)) servers.push(...(parsed as McpServerConfig[]));
         }
       }
-    } catch { /* keep whatever we have */ }
+    } catch { }
     try {
       const res = await coreFetch(`${CORE_HTTP}/api/plugins/capabilities`, { headers: coreHeaders(), signal: AbortSignal.timeout(8000) });
       if (res.ok) {
@@ -480,7 +397,7 @@ export class Agent {
           if (config?.id && !seen.has(config.id)) { servers.push(config); seen.add(config.id); }
         }
       }
-    } catch { /* keep whatever we have */ }
+    } catch { }
     if (servers.length) {
       try {
         this.mcp.configure(servers);
@@ -491,7 +408,6 @@ export class Agent {
     }
   }
 
-  /** Load skill directories contributed by installed plugins. */
   private async refreshPluginSkills(): Promise<void> {
     if (!this.settings.enable_skills) return;
     try {
@@ -500,19 +416,15 @@ export class Agent {
       const caps: any = await res.json();
       for (const skill of caps?.skills || []) {
         if (!skill?.path) continue;
-        try { this.skills.loadDir(skill.path); } catch { /* ignore a bad skill dir */ }
+        try { this.skills.loadDir(skill.path); } catch { }
       }
-    } catch { /* ignore */ }
+    } catch { }
   }
 
-  /**
-   * Execute a task - main agent loop
-   */
   async executeTask(taskId: string, prompt: string, agentType?: string, metadata: Record<string, string> = {}): Promise<string> {
     return this.executeTaskInternal(taskId, prompt, agentType, 0, metadata.session_id || '', metadata);
   }
 
-  /** True for filenames/mimes whose bytes are safe to inline as UTF-8 text. */
   private isTextAttachment(name: string, mime: string): boolean {
     if (mime.startsWith('text/')) return true;
     if (['application/json', 'application/xml', 'application/javascript', 'application/x-yaml', 'application/yaml', 'application/toml'].includes(mime)) return true;
@@ -523,28 +435,13 @@ export class Agent {
     return mime.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
   }
 
-  /**
-   * Fetch uploaded attachments referenced by the Core metadata (`attachments` is
-   * a JSON array of {name,url,mime,size}) and turn them into prompt content.
-   *
-   * Images become multimodal parts sent straight to the model; plain text is
-   * inlined; anything else is written to a scratch directory and described by
-   * its absolute path, with the document text extracted when the format is one
-   * we can read (see attachment_text.ts). Before that, every non-text upload
-   * was reduced to "name (mime, size)" — the model could not read a PDF, a
-   * spreadsheet or a deck at all, and had no path to hand to a tool either.
-   */
   private async collectAttachments(raw: string, signal: AbortSignal, taskId: string): Promise<{ text: string; images: MessagePart[] }> {
     let refs: Array<{ name?: string; url?: string; mime?: string }> = [];
     try { refs = JSON.parse(raw); } catch { return { text: '', images: [] }; }
     if (!Array.isArray(refs) || refs.length === 0) return { text: '', images: [] };
     const lines: string[] = [];
     const images: MessagePart[] = [];
-    // Materialised copies live in the temp dir, not the workspace: an upload is
-    // a read-only input, and the project tree must stay clean.
     const dropDir = path.join(os.tmpdir(), '0kay-attachments', String(taskId).replace(/[^\w.-]/g, '_'));
-    // Attachment URLs always resolve against Core. An absolute http(s) URL
-    // pointing elsewhere would leak the Core bearer token, so it is rejected.
     const base = coreHttpBase();
     const baseOrigin = new URL(base).origin;
     for (const ref of refs) {
@@ -576,8 +473,6 @@ export class Agent {
           continue;
         }
         if (this.isTextAttachment(name, mime)) {
-          // Inline the head only: a 50 MB log is still worth reading, but not
-          // worth decoding into one string first.
           const head = bytes.length > 200_000 ? bytes.subarray(0, 200_000).toString('utf8') : bytes.toString('utf8');
           const clipped = head.length > 12000 ? `${head.slice(0, 12000)}\n…(truncated)` : head;
           lines.push(`- ${name} (${mime || 'text'}, ${size}):\n\`\`\`\n${clipped}\n\`\`\``);
@@ -605,13 +500,6 @@ export class Agent {
     return { text: lines.join('\n'), images };
   }
 
-  /**
-   * Write an attachment to the scratch directory and return its absolute path.
-   *
-   * The name comes from the uploader, so it is flattened to a single safe
-   * segment: a `../` or an absolute path here would let an upload overwrite an
-   * arbitrary file on the executor host.
-   */
   private async materializeAttachment(dir: string, name: string, bytes: Buffer): Promise<string> {
     const safe = path.basename(name).replace(/[<>:"|?*\x00-\x1f]/g, '_').replace(/^\.+/, '').trim() || 'attachment';
     try {
@@ -625,16 +513,10 @@ export class Agent {
     }
   }
 
-  /** True when any message in the history carries an image part. */
   private historyHasImages(messages: Message[]): boolean {
     return messages.some((message) => (message.parts || []).some((part) => part.type === 'image'));
   }
 
-  /**
-   * Run a model request, retrying once on the configured vision model when the
-   * primary model rejects the attached images. The structured handoff schema is
-   * never involved here.
-   */
   private async *generateWithVisionFallback(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
     try {
       yield* this.mocr.generate(request);
@@ -650,12 +532,6 @@ export class Agent {
     }
   }
 
-  /**
-   * Model call for tools (scrape summary/extraction, screenshot_to_code). Routes
-   * through the same MOCR channel as the main loop so tools never need their own
-   * provider credentials. Returns the concatenated text, or null when no model
-   * is available.
-   */
   private async toolLlm(request: import('../tools/types.js').LlmRequest, context: { taskId: string; sessionId: string; signal?: AbortSignal }): Promise<string | null> {
     const modelId = this.activeModel || this.settings.model_id || '';
     const messages = request.messages.map((message) => ({
@@ -684,7 +560,6 @@ export class Agent {
     }
   }
 
-  /** Prompt-level thinking budget, applied to every model regardless of provider. */
   private thinkingDirective(intensity: string, difficultyHint: number): string {
     const level = intensity === 'off' || difficultyHint <= 0
       ? 'none'
@@ -705,7 +580,6 @@ export class Agent {
     }
   }
 
-  /** Rough token estimate: ~4 chars per token plus a flat cost per image part. */
   private estimateTokens(messages: Message[]): number {
     let text = '';
     let images = 0;
@@ -723,14 +597,11 @@ export class Agent {
     return /context length|context_length|maximum context|max context|too long|token limit|too many tokens|reduce the length|exceeds? the maximum|上下文|超出/i.test(String(error?.message || error));
   }
 
-  /** Replace the run history with the structured compaction handoff summary. */
   private async compactHistory(context: AgentContext, modelId: string, sessionId: string): Promise<void> {
     let summary = '';
     const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
     for await (const chunk of this.mocr.generate({ modelId, messages: [{ role: 'user', content: transcript }], systemPrompt: COMPACTION_SCHEMA_PROMPT, tools: [], toolChoice: 'none', signal: context.signal, taskId: context.taskId, sessionId, maxTokens: 5000 })) summary += chunk.chunk || '';
     if (!summary.trim()) throw new Error('Context compaction returned no summary');
-    // Carry the live todo list across the compaction so the plan is not lost
-    // with the raw history that is being dropped.
     const todoBlock = formatTodoList(context.todo);
     context.history = [
       { role: 'user', content: context.prompt },
@@ -740,7 +611,6 @@ export class Agent {
 
   private async executeTaskInternal(taskId: string, prompt: string, agentType: string | undefined, depth: number, sessionId: string, options: Record<string, string> = {}): Promise<string> {
     const type = (agentType && agentType !== 'default' ? agentType : this.settings.default_agent_type) || 'general';
-    // /{skill_name} [request] → force-apply that skill and use the rest as the task.
     let forceSkill = '';
     if (this.settings.enable_skills) {
       const slash = /^\s*\/([A-Za-z0-9_-]{1,64})(?:\s+([\s\S]*))?$/.exec(prompt);
@@ -749,27 +619,20 @@ export class Agent {
         const rest = (slash[2] || '').trim();
         prompt = rest || `Follow the "${forceSkill}" skill to produce the standard output for this request.`;
       }
-      // A mode named after a skill activates it (e.g. agent_type "science").
       if (!forceSkill && type && type !== 'general' && this.skills.get(type)) forceSkill = type;
     }
     this.taskManager.createTask(taskId, prompt, type);
     return this.taskManager.executeTask(taskId, async () => {
-      // Workspace selection: explicit workdir wins, else a saved project name
-      // (options.project), else the agent's own cwd.
       let workdir = options.workdir;
       const workspaceSelector = options.workspace || options.project;
       if (!workdir && workspaceSelector) workdir = await this.resolveWorkspacePath(String(workspaceSelector));
       const cwd = workdir ? path.resolve(workdir) : process.cwd();
-      // The user picked this directory for this task, so allow it immediately
-      // rather than waiting for Core's workspace settings to sync.
       allowTaskRoot(cwd);
       if (!(await stat(cwd)).isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
-      // Best-effort dsh-style accounting: attach this session to the workspace
-      // that owns cwd, so the sidebar can group sessions under directories.
       const sessionId = String(options.session_id || '');
       if (sessionId) {
         const owner = await this.workspaces.resolveByPath(cwd).catch(() => undefined);
-        if (owner) await owner.attachSession(sessionId, cwd).catch(() => { /* membership is best-effort */ });
+        if (owner) await owner.attachSession(sessionId, cwd).catch(() => { });
       }
       const signal = this.taskManager.signal(taskId);
       let initialParts: MessagePart[] | undefined;
@@ -788,19 +651,11 @@ export class Agent {
         cwd,
         options: forceSkill ? { ...options, force_skill: forceSkill } : options,
       };
-      // Per-workspace agent home: .0kay-agent/{memory,plan,review}.md (git-ignored).
       if (depth === 0) {
-        try { await ensureAgentWorkspace(cwd) } catch { /* read-only workspace is fine */ }
+        try { await ensureAgentWorkspace(cwd) } catch { }
       }
-      // Model-driven context compression: the model folds ranges via the
-      // compress/decompress/search_context/acp_status tools as context grows.
       context.ledger = new ContextLedger(() => context.history);
-      // CVM-lite runtime supervision: record every tool call, gate delivery on
-      // evidence (test/build/typecheck) and flag doom-loops. Enforced only when
-      // OKAY_EVIDENCE_GATE=1; otherwise it is a passive trace.
       const supervisor = new DeliverySupervisor();
-      // Runtime directives (loop-invariant): the CVM-lite delivery belief and the
-      // selected work posture (Tianshu "Star Domain" analogue). Empty by default.
       const gateMode = (process.env.OKAY_EVIDENCE_GATE || '').trim().toLowerCase();
       const runtimeDirectives = [
         gateMode && gateMode !== '0' ? supervisionDirective() : '',
@@ -812,14 +667,11 @@ export class Agent {
       let lastPromptTokens = 0;
       let gateBlocks = 0;
 
-      // Workspace snapshot (git state) so the model knows the repo it is in.
       try {
         const note = await this.workspaceContext(cwd);
         if (note) context.options.workspace_note = note;
-      } catch { /* not a repo or git unavailable */ }
+      } catch { }
 
-      // Explore mode: fan the problem out to independent explorer sub-agents,
-      // then hand their proposals to the main loop to choose the best.
       const multiAgentMode = resolveMode(options.multi_agent_mode);
       if (type === EXPLORE_AGENT_TYPE && depth === 0 && options.skip_explore !== '1') {
         const baseType = options.base_agent_type || 'code';
@@ -828,26 +680,14 @@ export class Agent {
         context.history.push({ role: 'user', content: this.explorationDigest(proposals, multiAgentMode) });
       }
 
-      // Thinking intensity and its derived budget are loop-invariant; hoisted
-      // here so the duet plan phase below can reuse the same values.
-      // Parse thinking intensity from life-prefixed prompt: [thinking_intensity=max]
       const intMatch = /\[thinking_intensity=(\w+)\]/i.exec(context.prompt)
       const intensity = (options.thinking_intensity || intMatch?.[1] || 'medium').toLowerCase()
       const numericIntensity=Number(intensity)
       const difficultyHint = Number.isFinite(numericIntensity) ? Math.max(0,Math.min(100,numericIntensity))/100 : ({ off:0, low: 0.2, medium: 0.5, high: 0.75, max: 1.0 }[intensity] ?? 0.5)
       const requireThinking = intensity !== 'off' && difficultyHint > 0
-      // Minimal mode: per-task option wins ('1' force-on, '0' force-off), else the global setting.
       const minimal = options.minimal_mode === '1' || (options.minimal_mode !== '0' && this.settings.minimal_mode);
-      // Thinking budget scales with intensity: reasoning tokens count toward
-      // max_tokens for most reasoning models, so a flat default made every
-      // level look identical.
       const maxTokens = Math.max(4096, Math.round(difficultyHint * 32768))
 
-      // Duet mode (大模型定方案、小模型写实现): after exploration, the think
-      // model drafts the plan plus a self-contained implementation prompt, and
-      // the loop below runs pinned to the output model. Any planning failure
-      // falls back to the normal loop. A user-pinned model disables the split —
-      // the whole point of the mode is the big/small model pairing.
       const duet = options.duet_mode === '1' || (options.duet_mode !== '0' && this.settings.duet_mode);
       const userPinnedModel = !!(options.model_id && options.model_id !== 'MOCR') || !!this.settings.model_id;
       let duetOutputModel = '';
@@ -879,20 +719,12 @@ export class Agent {
 
       for (let i = 0; ; i++) {
         context.signal.throwIfAborted();
-        // `max_iterations` is deprecated: the model-driven context ledger now
-        // governs when to stop. A high safety ceiling still guarantees the loop
-        // cannot run forever on a model that never calls finish.
         if (i >= MAX_LOOP_ITERATIONS) {
           throw new Error(`Agent loop exceeded ${MAX_LOOP_ITERATIONS} iterations without finishing`);
         }
-        // Pinned model wins; duet mode pins the output model (the think model
-        // already drafted the plan below); otherwise intelligent selection
-        // (agent-only ChooseModels).
         let modelId = options.model_id === 'MOCR' ? '' : options.model_id || this.settings.model_id;
         if (!modelId && duetOutputModel) modelId = duetOutputModel;
         if (!modelId) {
-          // The task prompt is enough for difficulty/thinking selection; sending
-          // the whole serialized history here is wasted tokens every iteration.
           modelId = await this.mocr.chooseModels(
             context.prompt,
             requireThinking,
@@ -903,10 +735,6 @@ export class Agent {
         lastModel = modelId;
         this.activeModel = modelId;
 
-        // Automatic context compaction: only when the context is nearly full.
-        // The window is read from the provider's /models endpoint (context_length)
-        // and cached; a configured context_window overrides it. When neither is
-        // known, a provider overflow error below compacts reactively.
         let contextLimit = this.settings.context_window || 0;
         if (!contextLimit && typeof (this.mocr as any).modelContextLength === 'function') {
           contextLimit = await this.mocr.modelContextLength(modelId, context.signal).catch(() => 0);
@@ -916,8 +744,6 @@ export class Agent {
           lastPromptTokens = 0;
         }
 
-        // The live todo list rides in the system prompt every turn, so it stays
-        // visible to the model regardless of how the history was compressed.
         const todoBlock = formatTodoList(context.todo);
 
         let fullResponse = '';
@@ -1050,15 +876,13 @@ export class Agent {
           }
         }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'任务已结束，产物信息提取失败，请查看 Agent 会话。'}))}
       }
-      // User-facing handoff document (Tianshu /handoff analogue): archive a
-      // structured markdown handoff per top-level task. Opt-in via OKAY_HANDOFF_DOC=1.
       if (depth === 0 && process.env.OKAY_HANDOFF_DOC === '1') {
         try {
           const doc = buildHandoffDoc({ taskId, prompt: context.prompt, result, status: 'done' });
           const dir = path.join(process.env.AGENT_DATA_DIR || './data/agent', 'handoffs');
           await mkdir(dir, { recursive: true });
           await writeFile(path.join(dir, `${String(taskId).replace(/[^a-zA-Z0-9_.-]/g, '_')}.md`), doc, 'utf8');
-        } catch { /* best-effort */ }
+        } catch { }
       }
       if (depth === 0) {
         try {
@@ -1068,24 +892,18 @@ export class Agent {
           await appendAgentNote(cwd, 'review', `Status: ${report.status}\n${report.reasons.join('\n')}\nEvidence: ${report.evidence.join(', ') || 'none'}`);
           const plan = formatTodoList(context.todo);
           if (plan.trim()) await appendAgentNote(cwd, 'plan', plan);
-        } catch { /* best-effort */ }
+        } catch { }
       }
       if (gateMode && gateMode !== '0') {
         try {
           const report = supervisor.report();
           await taskRecorder.record({ task_id: context.taskId, caller_id: 'agent', kind: 'delivery-gate', session_id: context.sessionId, state: report.status, result: JSON.stringify(report) });
-        } catch { /* best-effort telemetry */ }
+        } catch { }
       }
       return result;
     }, depth > 0);
   }
 
-  /**
-   * Fan a problem out to several independent explorer sub-agents (default
-   * EXPLORE_FANOUT, override with OKAY_EXPLORE_FANOUT), each with a different
-   * objective, and collect their proposals concurrently. Explorers run
-   * read-only: editing, execution and further sub-agents are disabled for them.
-   */
   private async exploreSolutions(context: AgentContext, taskId: string, prompt: string, baseType: string, mode: MultiAgentMode): Promise<Array<{ angle: string; result: string }>> {
     const angles = [
       'Prefer the simplest correct change with the smallest diff.',
@@ -1125,7 +943,6 @@ export class Agent {
     return proposals.map((proposal) => proposal as { angle: string; result: string });
   }
 
-  /** Turn the explorer proposals into the instruction that seeds the main loop. */
   private explorationDigest(proposals: Array<{ angle: string; result: string }>, mode: MultiAgentMode): string {
     const blocks = proposals.map((proposal, index) => {
       const text = (proposal.result || '').trim();
@@ -1135,10 +952,6 @@ export class Agent {
     return `${mode.digestLead} (${proposals.length} seats)\n\n${blocks}`;
   }
 
-  /**
-   * Compact git state for the workspace, injected into the system prompt so the
-   * model knows the branch, pending changes and recent history (ZCode-style).
-   */
   private async workspaceContext(cwd: string): Promise<string> {
     const git = async (args: string[]): Promise<string> => {
       try {
@@ -1161,11 +974,6 @@ export class Agent {
     return lines.join('\n');
   }
 
-  /**
-   * Strict token-saving rules for minimal mode. Everything internal stays in
-   * English and terse; only user-visible text (questions, final answer) uses
-   * the user's language, and the final answer is capped at the essentials.
-   */
   private minimalDirective(language: string): string {
     const userLang = language === 'en' ? 'English' : 'Chinese';
     return [
@@ -1187,9 +995,6 @@ export class Agent {
       ? `\n\n${this.skills.contextBlock(taskPrompt || '', forceSkill)}`
       : '';
 
-    // Self-iteration is a workflow, not a single call, so the model needs the
-    // order and the one hard rule: never touch the user's checkout, and never
-    // open a PR without asking.
     const evolveBlock = this.settings.self_evolve_enabled
       ? '\n\nSelf-iteration (this repository): call evolve_begin to get a worktree on a self/<slug> branch, edit files ONLY inside that worktree, then evolve_commit. If the base moved, evolve_upstream merges origin/main into the branch and reports conflicts for you to resolve. Finish with evolve_finish — but ask the user first with the question tool whether they want a pull request, and pass open_pr=true only when they said yes. If they decline, the branch stays local and their working checkout is untouched, which is the point.'
       : '';
@@ -1233,7 +1038,6 @@ Continue until the task is complete, then return a concise plain-text final answ
 Deliverables: when the turn produced or modified files, call report_artifacts once (every deliverable, absolute path + one-line description) immediately before your final answer, so the UI can show the user a clickable list. Only list files that actually exist on disk; skip the call entirely when the turn produced nothing.`;
   }
 
-  /** Approximate context composition (tokens) for the usage indicator. */
   private contextBreakdown(cwd: string, conversationTokens: number, window: number) {
     const toolList = this.tools.listTools()
     const toolDescriptions = toolList.map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`).join('\n')
@@ -1252,19 +1056,11 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
   private desktopResult(tool: string, result: any, images: MessagePart[]) {
     if (tool !== 'computeruse' || !result.success || !result.data?.base64) return result;
     const { base64, ...data } = result.data;
-    // 截图作为视觉输入传给下一轮模型，不能把 base64 当普通文本塞满上下文。
     images.push({ type: 'text', text: `Desktop screenshot: ${data.width}x${data.height}. Use original screen pixel coordinates.` },
       { type: 'image', imageUrl: `data:${data.mime};base64,${base64}`, mimeType: data.mime });
     return { ...result, data: { ...data, image: 'attached as visual input' } };
   }
 
-  /**
-   * CVM-lite delivery gate. Mode is read from OKAY_EVIDENCE_GATE:
-   *   unset / '0'        → off (no behavior change)
-   *   '1' / 'warn'       → annotate the finish with the evidence report
-   *   '2' / 'strict'     → block a non-GREEN finish (caller caps retries) and
-   *                        ask the model for verification evidence
-   */
   private gateFinish(output: string, supervisor: DeliverySupervisor): { blocked: boolean; result: string; message: string } {
     const mode = (process.env.OKAY_EVIDENCE_GATE || '').trim().toLowerCase();
     if (mode !== '1' && mode !== 'warn' && mode !== '2' && mode !== 'strict') {
@@ -1325,8 +1121,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
   }
 
   private parseToolCall(response: string): { name: string; args: Record<string, any> } | null {
-    // A ```json fenced block is the strongest signal, so it is tried before the
-    // balanced-object scan of the surrounding prose.
     const candidates: string[] = [];
     const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(response);
     if (fenced && fenced[1].trim().startsWith('{')) candidates.push(fenced[1].trim());
@@ -1341,7 +1135,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
           };
         }
       } catch {
-        // Not a valid JSON tool call — try the next candidate.
       }
     }
     return null;
@@ -1354,7 +1147,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
   async close(): Promise<void> {
     for (const task of this.taskManager.getActiveTasks()) this.taskManager.cancelTask(task.id);
     await this.mcp.close();
-    // Headless Chrome must not outlive plugin shutdown.
     await browserController.close().catch(() => {});
   }
 
@@ -1362,19 +1154,10 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     await this.recorder.record();
   }
 
-  /** Expose tool registry for direct (no-LLM) tool dispatch. */
   getTools(): ToolRegistry {
     return this.tools;
   }
 
-  /**
-   * Run a single tool immediately without an LLM loop (Core.RunDirect).
-   */
-  /**
-   * Open the host's native OS folder picker and return the chosen path. Windows
-   * uses an STA PowerShell FolderBrowserDialog; macOS uses `choose folder`.
-   * Cancelling returns `{cancelled:true}` rather than an error.
-   */
   private async pickFolder(description: string): Promise<{ success: boolean; result: string; error: string }> {
     try {
       if (process.platform === 'win32') {
@@ -1402,19 +1185,16 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       }
       return { success: false, result: '', error: 'native folder picker is only available on Windows and macOS hosts' }
     } catch (error: any) {
-      // A cancelled dialog exits non-zero on some platforms; treat it as cancel.
       return { success: false, result: JSON.stringify({ cancelled: true }), error: '' }
     }
   }
 
-  /** Resolve a workspace selector (id or title) to its directory. */
   private async resolveWorkspacePath(selector: string): Promise<string> {
     const workspace = await this.workspaces.resolve(selector);
     if (!workspace) throw new Error(`unknown project '${selector}'`);
     return workspace.path;
   }
 
-  /** Serializable view of a workspace for tools and the UI. */
   private workspaceView(workspace: Workspace, exists?: boolean): Record<string, unknown> {
     return {
       id: workspace.id,
@@ -1427,7 +1207,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     };
   }
 
-  /** dsh-style workspace operations (create/get/list/resolve/delete/reorder/…). */
   private async handleWorkspaceAdmin(parsed: any): Promise<any> {
     await this.workspaces.init();
     const action = String(parsed.action || 'list').toLowerCase();
@@ -1530,9 +1309,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
 
     if(tool==='question_list')return {success:true,result:JSON.stringify(this.questions.list()),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
-    // Workspace registry (dsh-style) with legacy `projects_admin` aliases.
-    // Workspaces own an ordered account of sessions and carry a display title;
-    // see src/workspace/registry.ts.
     if (tool === 'workspace_admin' || tool === 'projects_admin') {
       try {
         return { success: true, result: JSON.stringify(await this.handleWorkspaceAdmin(parsed)), error: '' };
@@ -1637,8 +1413,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         return { success: true, error: '', result: JSON.stringify({ path: file, size: buffer.length, base64: buffer.toString('base64') }) };
       } catch (error: any) { return { success: false, result: '', error: error?.message || 'workspace_read_binary failed' }; }
     }
-    // Convert a document to another format (legacy .doc/.ppt → pdf) using
-    // LibreOffice when it is installed on this host.
     if (tool === 'workspace_convert') {
       try {
         if (!parsed.path) throw new Error('path is required');
@@ -1649,8 +1423,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         const outDir = await mkdtemp(path.join(os.tmpdir(), '0kay-convert-'));
         const profileDir = await mkdtemp(path.join(os.tmpdir(), '0kay-lo-profile-'));
         try {
-          // A private user profile per call avoids the "another instance is
-          // already running" failure when conversions overlap.
           const profileUrl = `file:///${profileDir.replace(/\\/g, '/')}`;
           await runSofficeSerialized(() => execFileAsync(soffice, ['--headless', '--norestore', '--nolockcheck', `-env:UserInstallation=${profileUrl}`, '--convert-to', target, '--outdir', outDir, file], { timeout: 150000, windowsHide: true, maxBuffer: 1024 * 1024 }));
           const outPath = path.join(outDir, `${path.basename(file).replace(/\.[^.]+$/, '')}.${target}`);
@@ -1664,7 +1436,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         return { success: false, result: '', error: error?.message || 'convert failed' };
       }
     }
-    // Best-effort plain-text extraction for legacy Office formats.
     if (tool === 'workspace_extract_text') {
       try {
         if (!parsed.path) throw new Error('path is required');
@@ -1749,9 +1520,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       }
     }
 
-    // Live desktop frame for the WebUI's "AI is using the computer" window. It is
-    // a read-only capture (no input), gated by the computer-use setting, and reuses
-    // the registered tool so it shares the desktop action queue.
     if (tool === 'computeruse_status') {
       return { success: true, error: '', result: JSON.stringify({ enabled: !!this.settings.enable_computer_use, supported: ['win32', 'darwin', 'linux'].includes(process.platform) }) };
     }
@@ -1776,7 +1544,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         if (frame?.image) {
           return { success: true, error: '', result: JSON.stringify({ running: true, enabled: true, image: frame.image, mime: frame.mime || 'image/jpeg', width: frame.width, height: frame.height, at: frame.at }) };
         }
-        // Unchanged frame (no pixels re-sent) or the worker is warming up.
         const alive = typeof capture.streamAlive === 'function' ? capture.streamAlive() : false;
         return { success: true, error: '', result: JSON.stringify({ running: alive, enabled: true, image: '', at: frame?.at, warming: alive }) };
       } catch (error: any) {
@@ -1784,10 +1551,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       }
     }
 
-    // Terminal console: the WebUI operator runs a shell command on this host
-    // directly. The call is user-initiated, so it bypasses the approval gate.
-    // Output is captured as raw bytes and re-decoded, because Windows cmd built-
-    // ins emit the OEM code page even when the console code page is UTF-8.
     if (tool === 'terminal_exec') {
       try {
         if (!this.settings.enable_terminal) throw new Error('terminal-disabled: enable it in the agent plugin settings');
@@ -1811,14 +1574,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     }
 
     const directId=sessionIdOrEmpty();
-    // Direct computeruse calls are already gated by Core's `computer_use`
-    // permission (RunDirect) and the enable_computer_use setting, so LIFE's
-    // autonomous loop can drive the mouse/keyboard without a second prompt.
-    // Mail reached through the built-in mcp server is likewise already gated by
-    // L.I.F.E's own mail approval, so a second prompt here is redundant (and
-    // blocks the autonomous inbox read when mail approval is off). Only the
-    // `call` action qualifies — `list` etc. still prompt.
-    // Interactive agent tasks still prompt for other non-read-only actions.
     const mailMcp = tool === 'mcp' && String(parsed?.action || '') === 'call' && String(parsed?.server || '') === 'mail';
     if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser' && !mailMcp && !ALWAYS_SAFE_TOOLS.has(tool)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
@@ -1844,7 +1599,6 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
   }
 }
 
-// --- legacy Office helpers ----------------------------------------------------
 let sofficePromise: Promise<string> | null = null;
 function findSoffice(): Promise<string> {
   if (!sofficePromise) {
@@ -1864,17 +1618,13 @@ function findSoffice(): Promise<string> {
         const { stdout } = await execFileAsync('where', ['soffice']);
         const found = String(stdout).split(/\r?\n/)[0].trim();
         if (found) return found;
-      } catch { /* not on PATH */ }
+      } catch { }
       return '';
     })();
   }
-  // A failed lookup is not cached: installing LibreOffice takes effect on the
-  // next conversion attempt without an agent restart.
   return sofficePromise.then((found) => { if (!found) sofficePromise = null; return found; });
 }
 
-// LibreOffice cannot run two instances against the same profile; serialize
-// conversions so overlapping previews don't fail.
 let sofficeChain: Promise<unknown> = Promise.resolve();
 function runSofficeSerialized<T>(task: () => Promise<T>): Promise<T> {
   const run = sofficeChain.then(task, task);
@@ -1882,7 +1632,6 @@ function runSofficeSerialized<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/** Pull text out of a legacy .ppt/.pot/.pps OLE stream (best effort, no layout). */
 async function extractPptText(file: string): Promise<string> {
   // @ts-ignore - cfb ships no type declarations
   const cfbModule: any = await import('cfb');
@@ -1915,10 +1664,6 @@ function sessionIdOrEmpty(): string {
   return `direct:${Date.now()}`;
 }
 
-// --- terminal command runner (UTF-8 aware) ------------------------------------
-// Windows cmd built-ins (`dir`, error messages, …) write the OEM code page to a
-// pipe even after `chcp 65001`, so captured bytes are decoded as UTF-8 and, when
-// that yields replacement characters, re-decoded with the system OEM code page.
 const CODEPAGE_LABELS: Record<number, string> = {
   874: 'windows-874', 932: 'shift_jis', 936: 'gbk', 949: 'euc-kr', 950: 'big5',
   1250: 'windows-1250', 1251: 'windows-1251', 1252: 'windows-1252',
@@ -1973,10 +1718,9 @@ function runTerminalCommand(command: string, cwd: string, timeoutMs: number, lab
         if (isWin && child?.pid) execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
         else {
           child?.kill('SIGTERM');
-          // Escalate in case the child ignores SIGTERM.
-          setTimeout(() => { try { child?.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
+          setTimeout(() => { try { child?.kill('SIGKILL'); } catch { } }, 5000);
         }
-      } catch { /* ignore */ }
+      } catch { }
     }, timeoutMs);
   });
 }

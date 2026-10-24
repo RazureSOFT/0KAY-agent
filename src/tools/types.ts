@@ -1,18 +1,9 @@
-/**
- * Shared tool base types for the 0kay Agent tool suite.
- *
- * This module has no imports from `tools.ts` so concrete tool modules can
- * extend `Tool` without creating an import cycle (tools.ts imports the concrete
- * tools to build the registry).
- */
-
 export interface ToolResult {
   success: boolean;
   data: any;
   error?: string;
 }
 
-/** JSON Schema object describing a tool's arguments. */
 export type JSONSchema = Record<string, any>;
 
 export interface TodoItem {
@@ -36,7 +27,6 @@ export interface McpClientLike {
 
 export interface LlmMessagePart { type: string; text?: string; imageUrl?: string; mimeType?: string; }
 
-/** A text/multimodal request routed through the agent's model channel (MOCR). */
 export interface LlmRequest {
   messages: Array<{ role: string; content: string; parts?: LlmMessagePart[] }>;
   systemPrompt?: string;
@@ -45,9 +35,6 @@ export interface LlmRequest {
   temperature?: number;
 }
 
-/** Model caller injected by the agent so tools reuse the MOCR channel instead
- *  of calling a provider directly. Returns the full text, or null when no model
- *  channel is available. */
 export type LlmCaller = (request: LlmRequest) => Promise<string | null>;
 
 export interface ToolContext {
@@ -59,10 +46,8 @@ export interface ToolContext {
   runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
   mcp?: McpClientLike;
   signal?: AbortSignal;
-  /** Live conversation history + its context ledger (model-driven compression). */
   history?: any[];
   ledger?: any;
-  /** Model channel (MOCR). Tools that need a model call this first. */
   llm?: LlmCaller;
 }
 
@@ -78,7 +63,6 @@ export abstract class Tool {
   abstract execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult>;
 }
 
-/** Shared helper for success/failure. */
 export function ok(data: any): ToolResult {
   return { success: true, data };
 }

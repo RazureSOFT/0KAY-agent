@@ -1,22 +1,9 @@
-/**
- * Named multi-agent modes — a 0kay generalization of the existing explore fan-out,
- * modelled on Tianshu-harness's /scout · /team · /council vocabulary.
- *
- * All modes reuse the same sub-agent machinery; they differ only in how many
- * seats are spawned, whether they run read-only, and how the digest tells the
- * main loop to act. Dependency-free.
- */
-
 export interface MultiAgentMode {
   id: string;
-  /** Short display name (Chinese). */
   name: string;
   summary: string;
-  /** Number of independent seats to spawn. */
   fanout: number;
-  /** Seats run strictly read-only (no editing/execution). */
   readOnly: boolean;
-  /** Lead instruction prepended to the digest that seeds the main loop. */
   digestLead: string;
 }
 
@@ -65,7 +52,6 @@ export const MODES: Record<string, MultiAgentMode> = {
 
 export const DEFAULT_MODE_ID = 'explore';
 
-/** Resolve a mode by id (case-insensitive); unknown ids fall back to explore. */
 export function resolveMode(id?: string): MultiAgentMode {
   const key = String(id || '').trim().toLowerCase();
   return MODES[key] || MODES[DEFAULT_MODE_ID];

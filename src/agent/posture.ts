@@ -1,27 +1,12 @@
-/**
- * Work postures — a 0kay adaptation of Tianshu-harness's "Star Domain".
- *
- * A posture does NOT add capability. It only biases how the agent works by
- * changing the prompt belief (and optionally the tool surface / thresholds) —
- * "the same model, walking into a different posture, lights up a different
- * working tendency." Dependency-free and side-effect free.
- */
-
 export type Intensity = 'off' | 'low' | 'medium' | 'high' | 'max';
 
 export interface Posture {
   id: string;
-  /** Short display name (Chinese). */
   name: string;
-  /** One-line intent. */
   summary: string;
-  /** Prompt-layer belief injected when this posture is active. */
   belief: string;
-  /** Tool allow-list; undefined/empty means "all tools". */
   tools?: string[];
-  /** Bias the delivery gate toward blocking (verifier posture). */
   strictDelivery?: boolean;
-  /** Suggested reasoning intensity. */
   intensity?: Intensity;
 }
 
@@ -70,7 +55,6 @@ export const POSTURES: Record<string, Posture> = {
 
 export const DEFAULT_POSTURE_ID = 'default';
 
-/** Resolve a posture by id (case-insensitive); unknown ids fall back to default. */
 export function resolvePosture(id?: string): Posture {
   const key = String(id || '').trim().toLowerCase();
   return POSTURES[key] || POSTURES[DEFAULT_POSTURE_ID];
@@ -80,7 +64,6 @@ export function listPostures(): Posture[] {
   return Object.values(POSTURES);
 }
 
-/** Prompt-layer directive for a posture (empty for the default posture). */
 export function postureDirective(posture: Posture): string {
   if (!posture || posture.id === DEFAULT_POSTURE_ID) return '';
   const tools = posture.tools && posture.tools.length ? `\nTools limited to: ${posture.tools.join(', ')}.` : '';

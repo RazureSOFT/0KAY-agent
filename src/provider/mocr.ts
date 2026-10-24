@@ -1,7 +1,3 @@
-/**
- * MocrProvider - All AI calls go through mocr (real gRPC).
- */
-
 import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import * as path from 'path'
@@ -31,7 +27,6 @@ export interface GenerateRequest {
   toolChoice?: 'auto' | 'none' | 'required' | string;
   signal?: AbortSignal;
   taskId?: string;
-  /** Unique id for this logical generation (reused across retries). */
   requestId?: string;
   sessionId?: string;
 }
@@ -41,18 +36,13 @@ export interface Message {
   content: string;
   toolCallId?: string;
   toolCalls?: ToolCall[];
-  /** Multimodal parts (text + images) sent straight to the model. */
   parts?: MessagePart[];
-  /** Prior assistant chain-of-thought (DeepSeek thinking mode pass-back). */
   reasoningContent?: string;
 }
 
-/** One segment of a multimodal message. */
 export interface MessagePart {
-  /** "text" or "image". */
   type: string;
   text?: string;
-  /** data URL (data:<mime>;base64,<data>) or https URL. */
   imageUrl?: string;
   mimeType?: string;
 }
@@ -78,11 +68,8 @@ export interface GenerateResponse {
   role?: string;
   text?: string;
   toolCalls?: ToolCall[];
-  /** Model that actually produced the output (after any auto-switch). */
   model?: string;
-  /** Model the caller requested. */
   requestedModel?: string;
-  /** Non-empty when a fallback model produced the output. */
   fallbackReason?: string;
   usage?: {
     promptTokens: number;
@@ -107,7 +94,6 @@ const loaderOptions: protoLoader.Options = {
 let cachedStub: any = null
 let cachedAddress = ''
 
-/** Pull a context-window number out of a provider model object, if present. */
 function extractContextLength(value: any): number {
   if (!value || typeof value !== 'object') return 0;
   for (const key of ['context_length', 'context_window', 'max_context_length', 'max_input_tokens', 'input_token_limit', 'n_ctx', 'max_model_len']) {
@@ -149,9 +135,6 @@ export class MocrProvider {
 
   private async resolveCredentials(modelId: string, provider = '', signal?: AbortSignal) {
     const base = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
-    // Credentials are resolved per call: GET /api/providers is redacted now, so
-    // the secret-bearing catalog comes from /api/providers/credentials. Not
-    // caching keeps provider edits effective immediately.
     const response = await coreFetch(`${base}/api/providers/credentials`, { headers:coreHeaders(), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error(`Cannot load providers: HTTP ${response.status}`);
     const data: any = await response.json();
@@ -159,10 +142,6 @@ export class MocrProvider {
     const defaultProvider = list.find(p => p.id === data.default_provider_id);
     let chosen: any;
     if (modelId) {
-      // The provider hint from MOCR is the preset name (e.g. "custom"), while
-      // this endpoint normalizes `provider` to the effective wire protocol
-      // (e.g. "openai"), so the id/model must decide. Match by model, and use
-      // the hint only to break ties.
       const byModel = list.filter(p =>
         (p.models || []).some((m: any) => (typeof m === 'string' ? m : m.id || m.model_id) === modelId) &&
         !(p.disabled_models || []).includes(modelId));
@@ -181,10 +160,6 @@ export class MocrProvider {
     return { provider: chosen.provider || '', baseUrl: chosen.base_url || '', apiKey: chosen.api_key || '', format: chosen.format || '', model: resolvedModel };
   }
 
-  /**
-   * Best-effort context window (in tokens) for a model, read from the provider's
-   * `/models/{model}` (then the `/models` list). Cached; 0 when unknown.
-   */
   async modelContextLength(modelId: string, signal?: AbortSignal): Promise<number> {
     if (!modelId) return 0;
     const cached = this.contextLengths.get(modelId);
@@ -200,7 +175,7 @@ export class MocrProvider {
         length = await this.contextLengthFrom(`${endpoint}/models/${encodeURIComponent(modelId)}`, headers, timeout);
         if (!length) length = await this.contextLengthFrom(`${endpoint}/models`, headers, timeout, modelId);
       }
-    } catch { /* best effort */ }
+    } catch { }
     if (length > 0) this.contextLengths.set(modelId, length);
     return length;
   }
@@ -214,7 +189,6 @@ export class MocrProvider {
     } catch { return 0; }
   }
 
-  /** Extract a context window from a provider /models payload (pure). */
   private parseContextLength(data: any, matchId = ''): number {
     if (matchId) {
       const list: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
@@ -226,11 +200,6 @@ export class MocrProvider {
     return extractContextLength(data) || extractContextLength(data?.data);
   }
 
-  /**
-   * Describe an image with a vision-capable provider model (OpenAI-compatible
-   * or Anthropic format). Used to make uploaded images visible to the text-only
-   * agent loop.
-   */
   async describeImage(modelId: string, base64: string, mime = 'image/png', prompt = '', maxTokens = 1024, signal?: AbortSignal): Promise<string> {
     if (!base64) return '';
     const creds = await this.resolveCredentials(modelId, '', signal);
@@ -259,9 +228,6 @@ export class MocrProvider {
     return String(content || '').trim();
   }
 
-  /**
-   * Call mocr for text generation (server-streaming gRPC).
-   */
   async *generate(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
     const event = { task_id: `agent-model:${crypto.randomUUID()}`, caller_id: 'agent', kind: 'think', prompt: request.modelId,
       parent_id: request.taskId || '', session_id: request.sessionId || '', state: 'running' };
@@ -300,10 +266,6 @@ export class MocrProvider {
   private async *generateStream(request: GenerateRequest): AsyncGenerator<GenerateResponse> {
     const creds = request.baseUrl && request.apiKey ? request : await this.resolveCredentials(request.modelId, request.provider || this.selectedProviders.get(request.modelId), request.signal);
     const options = resolveRetryOptions();
-    // One request-id per logical generation, reused across retries so a retry
-    // cannot double-count. It must be unique per call: mocr keys its usage
-    // outbox by request-id, so reusing a task id for every turn of a task would
-    // overwrite earlier turns and massively under-count usage.
     const scoped: GenerateRequest = request.requestId
       ? request
       : { ...request, requestId: `${request.taskId || 'agent-model'}:${crypto.randomUUID()}` };
@@ -339,8 +301,6 @@ export class MocrProvider {
           content: message.content,
           toolCalls: message.toolCalls?.map(call => ({ id: call.id, type: call.type || 'function', functionName: call.name, arguments: call.arguments })),
         };
-        // Prior assistant chain-of-thought (DeepSeek thinking mode requires
-        // it on every assistant message once tools are present).
         if (message.reasoningContent) {
           wire.reasoningContent = message.reasoningContent;
         }
@@ -402,8 +362,6 @@ export class MocrProvider {
           thinkingContent: resp.thinkingContent || undefined,
           role: resp.role || undefined,
           text: resp.text || undefined,
-          // mocr reports the model actually used (after any auto-switch) and the
-          // requested one; the UI renders "requested unavailable · fell back to X".
           model: resp.model || undefined,
           requestedModel: resp.requestedModel || undefined,
           fallbackReason: resp.fallbackReason || undefined,
@@ -425,8 +383,6 @@ export class MocrProvider {
         }
         const hasPayload = !!(out.chunk || out.thinkingContent || (out.toolCalls && out.toolCalls.length) || (out.done && out.text));
         if (hasPayload) { sawPayload = true; onEmit(); }
-        // A done frame with no text/tool calls is worth one clean retry rather
-        // than surfacing an empty answer (mirrors ZCode's empty-completion retry).
         if (resp.done && !sawPayload) throw new ModelEmptyCompletionError();
         yield out;
         if (resp.done) { completed = true; break; }
@@ -438,10 +394,6 @@ export class MocrProvider {
     }
   }
 
-  /**
-   * Choose think/output models via mocr (optional helper).
-   * difficultyHint/requireThinking come from life thinking intensity metadata.
-   */
   async chooseModels(
     prompt: string,
     requireThinking = false,
@@ -473,11 +425,6 @@ export class MocrProvider {
       return model.modelId;
   }
 
-  /**
-   * Choose BOTH think (strong) and output (light) models via mocr. Duet mode
-   * uses the pair directly: the think model drafts the plan and the
-   * implementation prompt, the loop then runs pinned to the output model.
-   */
   async chooseModelPair(
     prompt: string,
     requireThinking = false,

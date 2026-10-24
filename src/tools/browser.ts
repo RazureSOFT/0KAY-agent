@@ -1,12 +1,3 @@
-/**
- * Browser automation for the Agent, driven over the Chrome DevTools Protocol.
- *
- * Node 22+ ships a global WebSocket, so a launched Chrome/Edge can be driven
- * with no extra dependency (no Playwright/Puppeteer). One controller owns a
- * single browser instance per agent host and exposes a queryable status object
- * that the WebUI reads to show the live state.
- */
-
 import { spawn, type ChildProcess } from 'child_process';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -17,29 +8,18 @@ import * as path from 'path';
 const execFileAsync = promisify(execFile);
 
 export interface BrowserStatus {
-  /** Whether a browser binary was found on this host. */
   available: boolean;
-  /** Whether a browser instance is currently running. */
   running: boolean;
-  /** Whether the running instance is headless. */
   headless: boolean;
-  /** Current page URL. */
   url: string;
-  /** Current page title. */
   title: string;
-  /** Number of open page targets. */
   tabs: number;
-  /** Navigation history availability for the controlled tab. */
   canGoBack: boolean;
   canGoForward: boolean;
-  /** Page viewport size in CSS px (for mapping clicks from the streamed image). */
   viewportWidth: number;
   viewportHeight: number;
-  /** Best-known executable path. */
   executable: string;
-  /** Last error, cleared on the next successful action. */
   error: string;
-  /** ISO timestamp of the last status change. */
   updatedAt: string;
 }
 
@@ -78,7 +58,7 @@ class CdpConnection {
   static connect(url: string, timeoutMs = 15000, handler: CdpEventHandler | null = null): Promise<CdpConnection> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
-      const timer = setTimeout(() => { try { socket.close(); } catch { /* ignore */ } reject(new Error('CDP connect timeout')); }, timeoutMs);
+      const timer = setTimeout(() => { try { socket.close(); } catch { } reject(new Error('CDP connect timeout')); }, timeoutMs);
       socket.addEventListener('open', () => { clearTimeout(timer); resolve(new CdpConnection(socket, handler)); }, { once: true });
       socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('CDP connect failed')); }, { once: true });
     });
@@ -96,7 +76,7 @@ class CdpConnection {
   close(): void {
     for (const call of this.pending.values()) { clearTimeout(call.timer); call.reject(new Error('CDP closed')); }
     this.pending.clear();
-    try { this.socket.close(); } catch { /* ignore */ }
+    try { this.socket.close(); } catch { }
   }
 }
 
@@ -127,13 +107,11 @@ export class BrowserController {
   private executable = '';
   private targetId = '';
   private frame: { data: string; at: number } | null = null;
-  /** Screenshot files written to tmpdir; pruned and cleared so they don't accumulate. */
   private screenshots: string[] = [];
   private status: BrowserStatus = {
     available: false, running: false, headless: true, url: '', title: '', tabs: 0, canGoBack: false, canGoForward: false, viewportWidth: 0, viewportHeight: 0, executable: '', error: '', updatedAt: new Date().toISOString(),
   };
 
-  /** Cached executable discovery. */
   private async findExecutable(): Promise<string> {
     if (this.executable) return this.executable;
     const explicit = process.env.OKAY_BROWSER_PATH || process.env.CHROME_PATH || '';
@@ -144,7 +122,7 @@ export class BrowserController {
     }
     if (process.platform === 'linux') {
       for (const command of LINUX_COMMANDS) {
-        try { const { stdout } = await execFileAsync('which', [command]); const found = String(stdout).trim(); if (found) { this.executable = found; this.status.available = true; return found; } } catch { /* try next */ }
+        try { const { stdout } = await execFileAsync('which', [command]); const found = String(stdout).trim(); if (found) { this.executable = found; this.status.available = true; return found; } } catch { }
       }
     }
     this.status.available = false;
@@ -155,13 +133,11 @@ export class BrowserController {
     return { ...this.status, executable: this.executable, updatedAt: this.status.updatedAt };
   }
 
-  /** Probe the host for a browser binary, then return the current status. */
   async probe(): Promise<BrowserStatus> {
     await this.findExecutable();
     return this.getStatus();
   }
 
-  /** Re-point the controlled session at another existing target. */
   private async connectToTarget(id: string): Promise<void> {
     this.cdp?.close();
     this.cdp = null;
@@ -170,7 +146,6 @@ export class BrowserController {
     await this.ensureConnection();
   }
 
-  /** List the browser's page tabs. */
   private async tabsResult(): Promise<any> {
     if (!this.process) return { tabs: [] };
     await this.ensureConnection().catch(() => null);
@@ -178,11 +153,9 @@ export class BrowserController {
     return { tabs: pages.map((t) => ({ id: t.id, url: t.url || '', title: t.title || '', active: t.id === this.targetId })) };
   }
 
-  /** Open a new tab and make it the controlled one. */
   private async newTab(args: Record<string, any>): Promise<any> {
     await this.ensureConnection();
     const url = String(args.url || 'about:blank');
-    // DevTools HTTP endpoint; Chrome 111+ requires PUT for /json/new.
     const res = await fetch(`http://127.0.0.1:${this.port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT', signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`new tab failed: ${res.status}`);
     const target: any = await res.json();
@@ -190,7 +163,6 @@ export class BrowserController {
     return { id: target?.id || '', url: target?.url || url };
   }
 
-  /** Switch the controlled tab. */
   private async activateTab(args: Record<string, any>): Promise<any> {
     const id = String(args.id || '');
     if (!id) throw new Error('id is required');
@@ -199,7 +171,6 @@ export class BrowserController {
     return { activated: id };
   }
 
-  /** Close a tab; if it was controlled, fall back to another page. */
   private async closeTab(args: Record<string, any>): Promise<any> {
     const id = String(args.id || '');
     if (!id) throw new Error('id is required');
@@ -214,13 +185,12 @@ export class BrowserController {
     return { closed: id };
   }
 
-  /** Latest live frame, falling back to an on-demand capture. */
   private async frameResult(): Promise<any> {
     if (!this.process) return { image: '', mime: 'image/jpeg', at: 0 };
     await this.ensureConnection();
     let frame = this.frame;
     if (!frame) {
-      try { const shot = await this.screenshot({ format: 'jpeg' }); frame = { data: shot.base64, at: Date.now() }; } catch { /* ignore */ }
+      try { const shot = await this.screenshot({ format: 'jpeg' }); frame = { data: shot.base64, at: Date.now() }; } catch { }
     }
     return { image: frame?.data || '', mime: 'image/jpeg', at: frame?.at || 0 };
   }
@@ -229,13 +199,10 @@ export class BrowserController {
     this.status = { ...this.status, ...patch, executable: this.executable, headless: this.headless, updatedAt: new Date().toISOString() };
   }
 
-  /** Launch a hidden (headless) browser instance. Never shows a window. */
   private async launch(): Promise<void> {
     const executable = await this.findExecutable();
     if (!executable) throw new Error('no Chrome/Chromium/Edge found; set OKAY_BROWSER_PATH to the browser executable');
     this.headless = true;
-    // Port 0 lets the OS pick a free port; the browser then writes the real
-    // port to DevToolsActivePort in the profile dir, so collisions are impossible.
     this.profileDir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-browser-'));
     const args = [
       '--headless=new',
@@ -251,8 +218,6 @@ export class BrowserController {
     this.process = spawn(executable, args, { stdio: 'ignore', windowsHide: true, detached: false });
     this.process.on('exit', () => this.cleanupAfterExit());
     const proc = this.process;
-    // Fail fast when the browser dies (or cannot spawn at all) during startup
-    // instead of polling for a DevTools endpoint that will never come up.
     await new Promise<void>((resolve, reject) => {
       const onExit = (code: number | null) => reject(new Error(`browser exited during startup (code ${code ?? 'signal'})`));
       const onError = (error: Error) => reject(new Error(`browser failed to start: ${error.message}`));
@@ -267,7 +232,6 @@ export class BrowserController {
     this.touch({ available: true, running: true, error: '' });
   }
 
-  /** Read the OS-assigned debugging port from DevToolsActivePort in the profile dir. */
   private async readDevToolsPort(timeoutMs = 20000): Promise<void> {
     const marker = path.join(this.profileDir, 'DevToolsActivePort');
     const deadline = Date.now() + timeoutMs;
@@ -276,7 +240,7 @@ export class BrowserController {
         const text = await fs.readFile(marker, 'utf8');
         const port = Number(text.split(/\r?\n/, 1)[0]);
         if (Number.isInteger(port) && port > 0) { this.port = port; return; }
-      } catch { /* not written yet */ }
+      } catch { }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     throw new Error('browser did not write DevToolsActivePort in time');
@@ -301,9 +265,6 @@ export class BrowserController {
       if (!res.ok) return null;
       const targets: any[] = await res.json();
       const pages = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-      // Prefer our previously-controlled tab, then a normal web page; Edge/Chrome
-      // first-run or sync dialogs (edge://, chrome://, devtools://) must not hijack
-      // the controlled tab.
       return pages.find((t) => t.id === this.targetId)
         || pages.find((t) => !/^(edge|chrome|devtools|about):/i.test(String(t.url || '')))
         || pages[0]
@@ -328,7 +289,6 @@ export class BrowserController {
     return this.cdp;
   }
 
-  /** Continuous frames pushed by CDP so the WebUI stream stays smooth. */
   private onCdpEvent(method: string, params: any): void {
     if (method !== 'Page.screencastFrame') return;
     const data = params?.data;
@@ -341,10 +301,9 @@ export class BrowserController {
     if (!this.cdp) return;
     try {
       await this.cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 960, maxHeight: 600, everyNthFrame: 1 });
-    } catch { /* screencast unsupported */ }
+    } catch { }
   }
 
-  /** Latest screencast frame (JPEG base64), or null when none has arrived yet. */
   latestFrame(): { data: string; at: number } | null {
     return this.frame;
   }
@@ -364,12 +323,12 @@ export class BrowserController {
         const total = Array.isArray(history?.entries) ? history.entries.length : 0;
         canGoBack = index > 0;
         canGoForward = total > 0 && index < total - 1;
-      } catch { /* history unavailable */ }
+      } catch { }
       try {
         const metrics = await this.cdp.send('Page.getLayoutMetrics', {}, 4000);
         const view = metrics?.cssVisualViewport || metrics?.visualViewport || metrics?.cssLayoutViewport || metrics?.layoutViewport;
         if (view?.clientWidth) { viewportWidth = Math.round(Number(view.clientWidth)); viewportHeight = Math.round(Number(view.clientHeight)); }
-      } catch { /* metrics unavailable */ }
+      } catch { }
     }
     this.touch({ running: !!this.process, tabs: pages.length, canGoBack, canGoForward, viewportWidth, viewportHeight, url: active?.url || this.status.url, title: active?.title || this.status.title });
   }
@@ -405,8 +364,6 @@ export class BrowserController {
     return String(await this.evaluate('document.readyState').catch(() => 'complete'));
   }
 
-  /** Reject `promise` as soon as `signal` aborts so a cancelled task does not
-   *  wait on a long CDP call. The underlying work is abandoned, not interrupted. */
   private raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error('browser action aborted'));
@@ -491,7 +448,6 @@ export class BrowserController {
     return { path: filename, mime: format === 'jpeg' ? 'image/jpeg' : 'image/png', base64: data, url: await this.currentUrl() };
   }
 
-  /** Keep only the newest screenshot files; older ones are deleted. */
   private trackScreenshot(file: string): void {
     this.screenshots.push(file);
     while (this.screenshots.length > 20) {
@@ -537,7 +493,6 @@ export class BrowserController {
     return { typed: text.length };
   }
 
-  /** Forward a pointer event (for manual interaction through the streamed view). */
   private async mouse(args: Record<string, any>): Promise<any> {
     const cdp = await this.ensureConnection();
     const x = Number(args.x) || 0;
@@ -550,7 +505,6 @@ export class BrowserController {
     return { ok: true };
   }
 
-  /** Forward a wheel/scroll event. */
   private async wheel(args: Record<string, any>): Promise<any> {
     const cdp = await this.ensureConnection();
     await cdp.send('Input.dispatchMouseEvent', {
@@ -564,7 +518,6 @@ export class BrowserController {
     const key = String(args.key || '').trim();
     if (!key) throw new Error('key is required');
     const cdp = await this.ensureConnection();
-    // "ctrl+shift+a" style combos: modifiers accumulate, the last part is the key.
     const parts = key.split('+').map((part) => part.trim().toLowerCase()).filter(Boolean);
     let modifiers = 0;
     let main = '';
@@ -610,14 +563,14 @@ export class BrowserController {
   }
 
   async close(): Promise<void> {
-    if (this.cdp) { try { await this.cdp.send('Page.stopScreencast', {}, 2000); } catch { /* ignore */ } }
+    if (this.cdp) { try { await this.cdp.send('Page.stopScreencast', {}, 2000); } catch { } }
     this.cdp?.close();
     this.cdp = null;
     this.frame = null;
     if (this.process) {
       const proc = this.process;
       this.process = null;
-      try { proc.kill(); } catch { /* ignore */ }
+      try { proc.kill(); } catch { }
       if (process.platform === 'win32' && proc.pid) execFileAsync('taskkill', ['/pid', String(proc.pid), '/T', '/F']).catch(() => {});
     }
     if (this.profileDir) { await fs.rm(this.profileDir, { recursive: true, force: true }).catch(() => {}); this.profileDir = ''; }
@@ -626,5 +579,4 @@ export class BrowserController {
   }
 }
 
-/** One browser instance per agent host. */
 export const browserController = new BrowserController();

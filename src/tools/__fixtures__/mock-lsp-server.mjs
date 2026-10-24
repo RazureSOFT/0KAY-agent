@@ -1,5 +1,3 @@
-// Minimal mock language server for tests: speaks LSP over stdio and answers
-// initialize / definition / references, emitting one diagnostic on didOpen.
 let buffer = Buffer.alloc(0);
 
 function send(obj) {

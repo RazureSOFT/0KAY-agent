@@ -3,7 +3,6 @@ import { executorIdentity } from '../connection.js';
 
 export interface Approval {
   id: string; task_id: string; session_id: string; tool: string; args: Record<string, any>; cwd: string; created_at: string;
-  /** Executor that created the request; decisions from another executor are rejected. */
   executor_id?: string;
 }
 export class ApprovalManager {
@@ -14,9 +13,6 @@ export class ApprovalManager {
   decide(id: string, allowed: boolean, executorId = ''): boolean {
     const entry = this.pending.get(id);
     if (!entry) return false;
-    // Only the executor that created a request may decide it, so one executor
-    // cannot batch-approve another's pending queue. Unidentified callers (Core
-    // fans decisions out without naming an executor) stay accepted.
     const owner = entry.value.executor_id;
     if (owner && executorId && owner !== executorId) return false;
     entry.settle(allowed);

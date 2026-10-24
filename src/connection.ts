@@ -3,19 +3,15 @@ import {readFileSync} from 'fs';
 import {timingSafeEqual} from 'crypto';
 import https from 'https';
 
-/** Per-plugin identity (name + service token) issued by Core at registration. */
 let pluginName='';
 let pluginToken='';
 export function setPluginIdentity(name:string,token:string):void{pluginName=name||'';pluginToken=token||''}
 export function pluginIdentity():{name:string;token:string}{return{name:pluginName,token:pluginToken}}
 
-/** Stable executor id (AGENT_EXECUTOR_ID or the persisted executor-id file);
- *  stamped onto approvals so decisions can be bound to their executor. */
 let executorIdentityValue='';
 export function setExecutorIdentity(id:string):void{executorIdentityValue=id||''}
 export function executorIdentity():string{return executorIdentityValue}
 
-/** Core HTTP base, used for the egress proxy (CORE_HTTP_ADDR/CORE_HTTP). */
 export function coreHttpBase():string{return (process.env.CORE_HTTP_ADDR||process.env.CORE_HTTP||'http://127.0.0.1:8080').replace(/\/$/,'')}
 
 export function coreCredentials():grpc.ChannelCredentials{return process.env.CORE_TLS_CA?grpc.credentials.createSsl(readFileSync(process.env.CORE_TLS_CA)):grpc.credentials.createInsecure()}
@@ -30,7 +26,6 @@ export function coreHeaders():Record<string,string>{
 export function authorized(call:{metadata:{get:(key:string)=>unknown[]}}):boolean{
  const tokens=[pluginToken,process.env.AGENT_GRPC_TOKEN,process.env.CORE_PAIR_TOKEN,process.env.CORE_API_TOKEN].filter((v):v is string=>!!v);
  const actual=Buffer.from(String(call.metadata.get('authorization')[0]||''));
- // 注册是出站操作，入站在凭据就绪前必须拒绝，不能用空令牌放行。
  return tokens.some(token=>{const expected=Buffer.from(`Bearer ${token}`);return actual.length===expected.length&&timingSafeEqual(actual,expected)});
 }
 export async function coreFetch(url:string,options:RequestInit={}):Promise<Response>{
@@ -42,9 +37,6 @@ export async function coreFetch(url:string,options:RequestInit={}):Promise<Respo
  })
 }
 
-/**
- * Invoke a plugin-contributed tool through Core. Returns the tool result.
- */
 export async function callPluginTool(tool:string,args:Record<string,any>={},sessionId='',caller='agent'):Promise<{success:boolean;result?:any;error?:string}>{
  try{
   const res=await coreFetch(`${coreHttpBase()}/api/tools/call`,{
@@ -61,7 +53,6 @@ export async function callPluginTool(tool:string,args:Record<string,any>={},sess
  }
 }
 
-/** List plugin tools Core offers for a consumer scope. */
 export async function listPluginTools(scope:'agent'|'life'='agent'):Promise<Array<{plugin:string;name:string;description:string;parameters?:Record<string,any>;dangerous?:boolean;scopes?:string[]}>>{
  try{
   const res=await coreFetch(`${coreHttpBase()}/api/tools?scope=${scope}`,{headers:coreHeaders(),signal:AbortSignal.timeout(10000)});
@@ -73,11 +64,6 @@ export async function listPluginTools(scope:'agent'|'life'='agent'):Promise<Arra
  }
 }
 
-/**
- * Perform an outbound HTTP request through Core's egress proxy so it is checked
- * against the plugin's declared egress allow-list. Returns a Response shaped
- * like fetch(), or throws when Core blocks/fails the request.
- */
 export async function egressFetch(url:string,options:RequestInit={},timeoutMs=60000):Promise<Response>{
  const headers=new Headers(options.headers);const requestHeaders:Record<string,string>={};headers.forEach((value,key)=>{if(key.toLowerCase()!=='host')requestHeaders[key]=value});
  const method=(options.method||'GET').toUpperCase();

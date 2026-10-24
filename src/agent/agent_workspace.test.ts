@@ -14,7 +14,6 @@ test('ensureAgentWorkspace creates the files and gitignores the dir', async () =
   }
   const ignore = await readFile(join(dir, '.gitignore'), 'utf8');
   assert.ok(ignore.includes('.0kay-agent/'));
-  // Idempotent: running again must not duplicate the entry.
   await ensureAgentWorkspace(dir);
   const again = await readFile(join(dir, '.gitignore'), 'utf8');
   assert.equal(again.split('.0kay-agent/').length - 1, 1);

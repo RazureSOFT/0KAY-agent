@@ -17,13 +17,9 @@ function gitTop(): string {
   }
 }
 
-// The agent is launched from <repo>/agent, so a cwd-only default root set makes
-// the repository the user is actually editing — the directory the WebUI offers
-// as the workspace — outside its own boundary, and every write fails with
-// "path not allowed: outside workspace roots".
 test('the repository containing cwd is an allowed workspace root', () => {
   const repo = gitTop();
-  if (!repo) return; // not a git checkout: nothing to assert
+  if (!repo) return;
   const resolved = path.resolve(repo);
   const roots = allowedWorkspaceRoots().map((root) => path.resolve(root));
   assert.ok(
@@ -35,20 +31,15 @@ test('the repository containing cwd is an allowed workspace root', () => {
 
 test('a path outside every root is still rejected', () => {
   const roots = allowedWorkspaceRoots().map((root) => path.resolve(root));
-  // Find a drive/dir no root covers; on POSIX this is outside home and temp too.
   const outside = process.platform === 'win32' ? 'Q:\\definitely-not-allowed\\x.ts' : '/definitely-not-allowed/x.ts';
   if (roots.some((root) => outside.toLowerCase().startsWith(root.toLowerCase() + path.sep))) return;
   assert.equal(isPathAllowed(outside), false);
 });
 
-// Settings → 工作区 is the UI-side allow-list. Core enforces it for git; the
-// agent has to read the same list or a folder allowed in the UI would still be
-// refused by write/edit ("path not allowed: outside workspace roots").
 test('roots allowed in Core settings widen the write policy', async () => {
   const extra = path.resolve(os.tmpdir(), 'okay-allowed-by-settings');
   const server = http.createServer((_req, res) => {
     res.setHeader('content-type', 'application/json');
-    // Comma + newline + padding: operators paste either form.
     res.end(JSON.stringify({ values: { allowed_roots: `/nope,\n  ${extra}  \n` } }));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

@@ -1,11 +1,3 @@
-/**
- * github_search — find open-source repositories on GitHub.
- *
- * Uses the public search API (10 requests/min unauthenticated). Set GITHUB_TOKEN
- * or GH_TOKEN for the higher authenticated rate limit. Routes through the same
- * egress path as the other web tools so a configured proxy is respected.
- */
-
 import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { clamp, egressOrDirect, failure, success } from './helpers.js';
 

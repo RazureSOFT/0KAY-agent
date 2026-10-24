@@ -1,22 +1,3 @@
-/**
- * `diagram` tool — let the model draw a picture the user can actually look at.
- *
- * Renders mind maps, flowcharts, trees, sequence diagrams and architecture
- * diagrams to a self-contained SVG plus a zoomable HTML viewer, using a
- * dependency-free layout engine (no Mermaid/Graphviz runtime required). Mermaid
- * source is also emitted so the result can be re-embedded anywhere.
- *
- * Layout strategies:
- *  - mindmap: radial, root at the center, children fanned around it.
- *  - tree:     layered top-down with tidy sibling packing.
- *  - flowchart/architecture: layered (longest-path ranking) with layered
- *    ordering to reduce crossings, edges drawn as routed polylines.
- *  - sequence: participants as columns, messages as ordered arrows.
- *
- * A plain outline (indented text or markdown headings) can be given instead of
- * a graph and is expanded into nodes/edges automatically.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Tool, type ToolContext, type ToolResult } from './types.js';
@@ -80,14 +61,12 @@ function slug(value: string, index: number): string {
   return base ? `${base}-${index}` : `n${index}`;
 }
 
-/** Approximate a text label's width: Latin ~0.62em, CJK ~1em per char. */
 function textWidth(label: string, fontSize: number): number {
   let units = 0;
   for (const ch of label) units += /[\u3000-\u9fff\uff00-\uffef]/.test(ch) ? 1 : 0.58;
   return units * fontSize;
 }
 
-/** Expand an indented outline (tabs/spaces or markdown headings) into a graph. */
 function outlineToGraph(outline: string): { nodes: DiagramNode[]; edges: DiagramEdge[] } {
   const nodes: DiagramNode[] = [];
   const edges: DiagramEdge[] = [];
@@ -105,8 +84,6 @@ function outlineToGraph(outline: string): { nodes: DiagramNode[]; edges: Diagram
     } else {
       const indent = raw.match(/^[\t ]*/)?.[0] || '';
       const indentDepth = Math.floor(indent.replace(/\t/g, '  ').length / 2);
-      // Bullets under a heading sit one level below it; without a heading they
-      // follow their own indentation.
       depth = currentHeading >= 0 ? currentHeading + 1 + indentDepth : indentDepth;
       label = raw.trim().replace(/^[-*+]\s+/, '');
     }
@@ -134,13 +111,10 @@ function normalizeSpec(spec: DiagramSpec): { nodes: Array<DiagramNode & { id: st
     if (!ids.has(edge.to)) { normalized.push({ id: edge.to, label: edge.to }); ids.add(edge.to); }
   }
   if (!edges.length && normalized.length > 1) {
-    // A flat node list with no edges is read as a root + children.
     for (let i = 1; i < normalized.length; i++) edges.push({ from: normalized[0].id, to: normalized[i].id });
   }
   return { nodes: normalized, edges };
 }
-
-// --- layout engines ---------------------------------------------------------
 
 function layoutMindmap(nodes: Array<DiagramNode & { id: string }>, edges: DiagramEdge[], loop = false): { placed: Placed[]; routed: Routed[]; width: number; height: number } {
   const children = new Map<string, string[]>();
@@ -179,8 +153,6 @@ function layoutMindmap(nodes: Array<DiagramNode & { id: string }>, edges: Diagra
       placed.set(gid, { id: gid, label: gnode.label, shape: 'rounded', x: gx, y: gy, width: gwidth, height: 40 });
     });
   });
-  // Any node not reached by the two-level fan-out is dropped in beside its parent
-  // so every edge still has both endpoints placed.
   for (const node of nodes) if (!placed.has(node.id)) {
     const parentEdge = edges.find((edge) => edge.to === node.id);
     const parent = parentEdge ? placed.get(parentEdge.from) : undefined;
@@ -214,7 +186,6 @@ function layoutLayered(nodes: Array<DiagramNode & { id: string }>, edges: Diagra
     adj.get(edge.from)!.push(edge.to);
     indeg.set(edge.to, (indeg.get(edge.to) || 0) + 1);
   }
-  // Longest-path ranking with a Kahn pass; cycles fall back to BFS depth.
   const rank = new Map<string, number>();
   const queue = nodes.filter((node) => (indeg.get(node.id) || 0) === 0).map((node) => node.id);
   for (const id of queue) rank.set(id, 0);
@@ -233,7 +204,6 @@ function layoutLayered(nodes: Array<DiagramNode & { id: string }>, edges: Diagra
     while (layers.length <= r) layers.push({ nodes: [] });
     layers[r].nodes.push(node.id);
   }
-  // Order within each layer by the barycenter of predecessors to reduce crossings.
   const posInLayer = new Map<string, number>();
   for (let i = 1; i < layers.length; i++) {
     const score = new Map<string, number>();
@@ -283,7 +253,6 @@ function layoutLayered(nodes: Array<DiagramNode & { id: string }>, edges: Diagra
 
 function center(p: Placed): { x: number; y: number } { return { x: p.x, y: p.y }; }
 
-/** Orthogonal-ish routing between two nodes with a mid bend. */
 function routeEdge(a: Placed, b: Placed, direction: 'TB' | 'LR'): Array<{ x: number; y: number }> {
   if (direction === 'TB') {
     const start = { x: a.x, y: a.y + a.height / 2 };
@@ -316,8 +285,6 @@ function layoutSequence(nodes: Array<DiagramNode & { id: string }>, edges: Diagr
   void theme;
   return { placed, routed, width: pad * 2 + columnWidth * participants.length, height: 170 + edges.length * 64 + 60, sequence: true };
 }
-
-// --- SVG rendering ----------------------------------------------------------
 
 function escapeXml(value: string): string {
   return value.replace(/[<>&"']/g, (ch) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[ch]!));
@@ -352,7 +319,6 @@ function wrapLabel(label: string, maxChars = 22): string[] {
   for (const word of words) {
     if ((current + ' ' + word).trim().length > maxChars && current) { lines.push(current.trim()); current = word; }
     else current = `${current} ${word}`.trim();
-    // Break CJK strings that have no spaces.
     while (current.length > maxChars) { lines.push(current.slice(0, maxChars)); current = current.slice(maxChars); }
   }
   if (current.trim()) lines.push(current.trim());
@@ -387,7 +353,6 @@ export function renderSvg(spec: DiagramSpec): { svg: string; width: number; heig
   const offsetX = 0, offsetY = titleHeight;
   parts.push(`<g transform="translate(${offsetX},${offsetY})">`);
 
-  // Group backgrounds for architecture/flowchart boxes.
   if ((kind === 'architecture' || kind === 'flowchart') && groupColor.size) {
     for (const [group, color] of groupColor) {
       const members = layout.placed.filter((p) => p.group === group);
@@ -401,7 +366,6 @@ export function renderSvg(spec: DiagramSpec): { svg: string; width: number; heig
     }
   }
 
-  // Edges first so nodes sit on top.
   for (const route of layout.routed) {
     const d = route.points.map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
     parts.push(`<path d="${d}" fill="none" stroke="${pal.line}" stroke-width="1.8"${route.dashed ? ' stroke-dasharray="6 5"' : ''} marker-end="url(#arrow)"/>`);
@@ -413,7 +377,6 @@ export function renderSvg(spec: DiagramSpec): { svg: string; width: number; heig
     }
   }
 
-  // Nodes.
   for (const node of layout.placed) {
     const color = (node.group && groupColor.get(node.group)) || pal.accent;
     parts.push(shapePath(node, color, theme));
@@ -426,7 +389,6 @@ export function renderSvg(spec: DiagramSpec): { svg: string; width: number; heig
     if (node.note) parts.push(`<text x="${node.x}" y="${node.y + node.height / 2 - 4}" text-anchor="middle" font-size="11" fill="${pal.muted}">${escapeXml(node.note)}</text>`);
   }
 
-  // Sequence lifelines.
   if (layout.sequence) {
     for (const participant of layout.placed) {
       parts.push(`<line x1="${participant.x}" y1="${participant.y + participant.height / 2}" x2="${participant.x}" y2="${layout.height - 20}" stroke="${pal.border}" stroke-dasharray="5 5"/>`);
@@ -437,7 +399,6 @@ export function renderSvg(spec: DiagramSpec): { svg: string; width: number; heig
   return { svg: parts.join('\n'), width: Math.ceil(layout.width), height: Math.ceil(layout.height + titleHeight) };
 }
 
-/** Mermaid source for the same graph, so it can be re-embedded elsewhere. */
 export function renderMermaid(spec: DiagramSpec): string {
   const kind = spec.kind || 'mindmap';
   const { nodes, edges } = normalizeSpec(spec);
@@ -474,7 +435,6 @@ export function renderMermaid(spec: DiagramSpec): string {
   return lines.join('\n');
 }
 
-/** A self-contained, zoomable HTML viewer around the SVG. */
 export function renderHtml(spec: DiagramSpec, svg: string, mermaid: string): string {
   const title = spec.title || 'Diagram';
   return `<!doctype html>

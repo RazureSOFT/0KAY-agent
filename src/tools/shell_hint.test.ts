@@ -2,8 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { windowsShellHint, withWindowsShellHint } from './shell_hint.js';
 
-// The hint is win32-only by design; on other platforms it must stay silent so it
-// cannot second-guess a working POSIX command.
 const onWindows = process.platform === 'win32';
 
 test('flags the exact command shape that failed in practice', { skip: !onWindows }, () => {
@@ -51,7 +49,6 @@ test('does not mistake a path or argument for a command', { skip: !onWindows }, 
 });
 
 test('handles quoted separators', { skip: !onWindows }, () => {
-  // The pipe inside the quoted argument is data, not a pipeline.
   assert.equal(windowsShellHint('echo "a | b"'), '');
 });
 

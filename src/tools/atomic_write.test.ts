@@ -36,9 +36,7 @@ test('writes buffers without corruption', async () => {
 });
 
 test('preserves the executable bit of an existing file', async () => {
-  // rewrite must not silently drop the mode: a shell script losing +x is a
-  // breakage that only surfaces when something tries to run it.
-  if (process.platform === 'win32') return; // POSIX modes only
+  if (process.platform === 'win32') return;
   const dir = await tempDir();
   const target = path.join(dir, 'run.sh');
   await fs.writeFile(target, '#!/bin/sh\necho one\n', { mode: 0o755 });
@@ -61,14 +59,11 @@ test('a failing write does not clobber the target and leaves no scratch file', a
   const target = path.join(dir, 'keep.txt');
   await writeFileAtomic(target, 'original');
 
-  // A directory at the target path makes the final rename fail.
   const blocked = path.join(dir, 'blocked');
   await fs.mkdir(blocked);
   await assert.rejects(() => writeFileAtomic(blocked, 'nope'));
 
-  // The pre-existing file is untouched.
   assert.equal(await fs.readFile(target, 'utf8'), 'original');
-  // And the failed target's parent has no leftover scratch files.
   const leftovers = (await fs.readdir(dir)).filter((name) => name.includes('.okay-tmp'));
   assert.deepEqual(leftovers, []);
 });
@@ -76,7 +71,6 @@ test('a failing write does not clobber the target and leaves no scratch file', a
 test('concurrent writes to the same path do not interleave', async () => {
   const dir = await tempDir();
   const target = path.join(dir, 'race.txt');
-  // Each write is all-or-nothing; whichever lands last must be complete.
   await Promise.all(
     Array.from({ length: 20 }, (_, i) => writeFileAtomic(target, `payload-${i}`.padEnd(4000, '.'))),
   );

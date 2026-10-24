@@ -1,13 +1,3 @@
-/**
- * Document and media extraction for the web/asset tools.
- *
- * Self-implements the common formats (PDF text layer, DOCX, XLSX, CSV, HTML)
- * in TypeScript, and falls back to an optional npm library or a system CLI
- * (pdftotext, tesseract, ffmpeg) when the pure path cannot do the job (scanned
- * PDFs, OCR, video frames). Every function degrades to a clear result rather
- * than throwing.
- */
-
 import { createRequire } from 'module';
 import { runCli, resolveCli, optionalImport } from './deps.js';
 import { buildZipRead } from './zip_read.js';
@@ -24,7 +14,6 @@ export interface ExtractionResult {
 function inflate(entry: { data: Buffer; method: number }): Buffer {
   if (entry.method === 0) return entry.data;
   try {
-    // Lazy import so the module stays usable in constrained runtimes.
     const zlib = require('zlib');
     return zlib.inflateRawSync(entry.data);
   } catch {
@@ -32,14 +21,11 @@ function inflate(entry: { data: Buffer; method: number }): Buffer {
   }
 }
 
-
-/** PDF: extract the text layer (and try optional libraries / pdftotext/OCR). */
 export async function extractPdf(buffer: Buffer, signal?: AbortSignal): Promise<ExtractionResult> {
   const meta: Record<string, any> = { bytes: buffer.length, version: /%PDF-(\d\.\d)/.exec(buffer.toString('latin1'))?.[1] };
   const pages = (buffer.toString('latin1').match(/\/Type\s*\/Page[^s]/g) || []).length;
   if (pages) meta.pages = pages;
 
-  // Pure-TS: pull text from uncompressed / FlateDecode content streams.
   let text = '';
   try {
     const raw = buffer.toString('latin1');
@@ -61,20 +47,18 @@ export async function extractPdf(buffer: Buffer, signal?: AbortSignal): Promise<
         if (chunk.endsWith('Tj')) text += '\n';
       }
     }
-  } catch { /* fall through */ }
+  } catch { }
   text = text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
   if (text.length > 40) return { kind: 'pdf', text, meta, via: 'builtin-pdf' };
 
-  // Optional npm library.
   const pdfParse = await optionalImport<any>('pdf-parse');
   if (pdfParse) {
     try {
       const parsed = await pdfParse(buffer);
       if (parsed?.text?.trim()) return { kind: 'pdf', text: parsed.text.trim(), meta: { ...meta, pages: parsed.numpages ?? meta.pages }, via: 'pdf-parse' };
-    } catch { /* try CLI */ }
+    } catch { }
   }
 
-  // pdftotext CLI.
   const pdftotext = await resolveCli('pdftotext');
   if (pdftotext.available) {
     const tmp = await writeTemp(buffer, '.pdf');
@@ -84,11 +68,10 @@ export async function extractPdf(buffer: Buffer, signal?: AbortSignal): Promise<
       const ext = (await import('fs/promises')).readFile;
       const cliText = await ext(out, 'utf8').catch(() => '');
       if (cliText.trim()) return { kind: 'pdf', text: cliText.trim(), meta, via: 'pdftotext' };
-    } catch { /* fall through */ }
+    } catch { }
     finally { cleanupTemp([tmp, out]); }
   }
 
-  // OCR (tesseract) when requested and available.
   const tesseract = await resolveCli('tesseract');
   if (tesseract.available && process.env.OKAY_PDF_OCR === '1') {
     const tmp = await writeTemp(buffer, '.pdf');
@@ -98,7 +81,7 @@ export async function extractPdf(buffer: Buffer, signal?: AbortSignal): Promise<
       const fs = await import('fs/promises');
       const ocr = await fs.readFile(`${outBase}.txt`, 'utf8').catch(() => '');
       if (ocr.trim()) return { kind: 'pdf', text: ocr.trim(), meta, via: 'tesseract-ocr' };
-    } catch { /* fall through */ }
+    } catch { }
     finally { cleanupTemp([tmp]); }
   }
 
@@ -112,14 +95,13 @@ function unescapePdfString(value: string): string {
   });
 }
 
-/** DOCX: read word/document.xml out of the OOXML zip and strip tags. */
 export async function extractDocx(buffer: Buffer): Promise<ExtractionResult> {
   const mammoth = await optionalImport<any>('mammoth');
   if (mammoth) {
     try {
       const result = await mammoth.extractRawText({ buffer });
       if (result?.value?.trim()) return { kind: 'docx', text: result.value.trim(), via: 'mammoth' };
-    } catch { /* builtin */ }
+    } catch { }
   }
   try {
     const entries = buildZipRead(buffer);
@@ -134,11 +116,10 @@ export async function extractDocx(buffer: Buffer): Promise<ExtractionResult> {
         .replace(/\n{3,}/g, '\n\n').trim();
       return { kind: 'docx', text, via: 'builtin-docx' };
     }
-  } catch { /* fall through */ }
+  } catch { }
   return { kind: 'docx', text: '', meta: { note: 'could not read word/document.xml; install mammoth' }, via: 'builtin-docx-empty' };
 }
 
-/** XLSX/CSV: read sheet data from the OOXML zip (sharedStrings + sheet1). */
 export async function extractXlsx(buffer: Buffer): Promise<ExtractionResult> {
   const exceljs = await optionalImport<any>('exceljs');
   if (exceljs) {
@@ -151,7 +132,7 @@ export async function extractXlsx(buffer: Buffer): Promise<ExtractionResult> {
         sheet.eachRow((row: any) => lines.push(row.values.slice(1).map((v: any) => (v == null ? '' : String(v))).join('\t')));
       });
       return { kind: 'xlsx', text: lines.join('\n'), via: 'exceljs' };
-    } catch { /* builtin */ }
+    } catch { }
   }
   try {
     const entries = buildZipRead(buffer);
@@ -180,7 +161,6 @@ export async function extractXlsx(buffer: Buffer): Promise<ExtractionResult> {
   }
 }
 
-/** Audio/video: probe metadata via ffprobe (ffmpeg) when available. */
 export async function probeMedia(buffer: Buffer, name: string, signal?: AbortSignal): Promise<ExtractionResult> {
   const ffmpeg = await resolveCli('ffmpeg');
   if (!ffmpeg.available) return { kind: 'media', text: '', meta: { file: name, bytes: buffer.length, note: 'install ffmpeg for media metadata and frames' }, via: 'none' };
@@ -188,12 +168,11 @@ export async function probeMedia(buffer: Buffer, name: string, signal?: AbortSig
   try {
     const probe = await runCli((process.platform === 'win32' ? 'ffprobe' : 'ffprobe'), ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', tmp], { signal });
     let meta: Record<string, any> = {};
-    try { meta = JSON.parse(probe.stdout); } catch { /* ignore */ }
+    try { meta = JSON.parse(probe.stdout); } catch { }
     return { kind: 'media', text: '', meta: { file: name, ...(meta.format || {}), streams: (meta.streams || []).map((s: any) => ({ codec_type: s.codec_type, codec_name: s.codec_name, width: s.width, height: s.height, duration: s.duration })) }, via: 'ffprobe' };
   } finally { cleanupTemp([tmp]); }
 }
 
-/** Extract N evenly-spaced frames from a video for screenshot_to_code video mode. */
 export async function extractVideoFrames(buffer: Buffer, name: string, count: number, signal?: AbortSignal): Promise<{ frames: string[]; via: string }> {
   const ffmpeg = await resolveCli('ffmpeg');
   if (!ffmpeg.available) return { frames: [], via: 'none' };
@@ -203,7 +182,6 @@ export async function extractVideoFrames(buffer: Buffer, name: string, count: nu
   const tmpIn = await writeTemp(buffer, `.${name.split('.').pop() || 'mp4'}`);
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-frames-'));
   try {
-    // Evenly spaced frames via fps filter or select; use thumbnail for uniformity.
     const outPattern = path.join(outDir, 'frame-%03d.png');
     await runCli(ffmpeg.command, ['-i', tmpIn, '-vf', `thumbnail=${Math.max(1, count)}`, '-frames:v', String(count), outPattern], { signal, timeout: 180_000 });
     const files = (await fs.readdir(outDir)).filter((f) => f.endsWith('.png')).sort();
@@ -228,11 +206,9 @@ async function writeTemp(buffer: Buffer, ext: string): Promise<string> {
 }
 
 function cleanupTemp(files: string[]): void {
-  // Fire-and-forget cleanup; a leaked temp file is harmless.
   import('fs/promises').then((fs) => Promise.all(files.map((file) => fs.rm(file, { force: true }).catch(() => {})))).catch(() => {});
 }
 
-/** Detect a document/media kind from bytes + filename for routing. */
 export function detectDocumentKind(buffer: Buffer, name = ''): string {
   const head = buffer.slice(0, 8).toString('latin1');
   const ext = name.toLowerCase().split('.').pop() || '';
@@ -244,7 +220,7 @@ export function detectDocumentKind(buffer: Buffer, name = ''): string {
       const entries = buildZipRead(buffer);
       if (entries.some((entry) => entry.name.startsWith('word/'))) return 'docx';
       if (entries.some((entry) => entry.name.startsWith('xl/'))) return 'xlsx';
-    } catch { /* generic zip */ }
+    } catch { }
     return 'zip';
   }
   if (head.startsWith('ID3') || head.startsWith('RIFF')) return 'media';

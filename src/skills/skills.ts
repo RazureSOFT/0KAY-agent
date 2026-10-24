@@ -1,11 +1,3 @@
-/**
- * Agent skill system — task procedures (separate from L.I.F.E skills).
- *
- * Skills are named prompt packages loaded from:
- *   - builtins (code / research / general)
- *   - AGENT_SKILLS_DIR/*.md
- */
-
 import * as fs from 'fs'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
@@ -147,7 +139,6 @@ export class SkillRegistry {
     if (envDir) {
       this.loadDir(envDir)
     } else {
-      // Package default: agent/skills/*.md (works from dist/skills → ../../skills)
       this.loadDir(path.resolve(__dirname, '../../skills'))
       this.loadDir(path.resolve(__dirname, '../../../skills'))
     }
@@ -167,7 +158,6 @@ export class SkillRegistry {
           this.skills.set(skill.name, skill)
           n++
         } catch {
-          /* skip unreadable */
         }
       }
       return n
@@ -180,17 +170,12 @@ export class SkillRegistry {
     this.skills.set(skill.name, skill)
   }
 
-  /** Directory used for saving/deleting skill files (first loaded dir or env). */
   writableDir(): string {
     const envDir = process.env.AGENT_SKILLS_DIR || ''
     if (envDir) return envDir
     return path.resolve(__dirname, '../../skills')
   }
 
-  /**
-   * Save or overwrite a skill markdown file and reload it into the registry.
-   * `name` becomes both the filename stem and the skill name (slash target).
-   */
   save(name: string, content: string, dirOverride?: string): AgentSkill {
     const clean = String(name || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
     if (!clean || clean.length > 64) throw new Error('invalid skill name')
@@ -205,7 +190,6 @@ export class SkillRegistry {
     return skill
   }
 
-  /** Delete a file-backed skill. Builtins cannot be removed. */
   remove(name: string, dirOverride?: string): boolean {
     const clean = String(name || '').trim().toLowerCase()
     const skill = this.skills.get(clean)
@@ -215,9 +199,8 @@ export class SkillRegistry {
     const dirs = [dirOverride || this.writableDir(), ...this.loadedDirs]
     for (const dir of dirs) {
       if (!dir) continue
-      try { fs.unlinkSync(path.join(dir, `${clean}.md`)) } catch { /* ignore missing */ }
+      try { fs.unlinkSync(path.join(dir, `${clean}.md`)) } catch { }
     }
-    // Same name as a builtin → restore the builtin definition.
     const builtin = BUILTIN.find((b) => b.name === clean)
     if (builtin) this.skills.set(builtin.name, builtin)
     return true
@@ -247,7 +230,6 @@ export class SkillRegistry {
     return bestScore >= 2 ? best : undefined
   }
 
-  /** Skill guidance block for the system prompt / task kickoff. */
   contextBlock(text = '', forceName?: string): string {
     const all = this.list()
     if (!all.length) return 'No agent skills loaded.'

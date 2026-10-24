@@ -1,11 +1,3 @@
-/**
- * Shared HTML/URL helpers for the web-facing tools (scrape, crawl, screentocode,
- * pentest). Pure TypeScript, no native or third-party parsing deps: the parser
- * is a small tolerant tokenizer that mirrors the subset of HTML the source
- * projects (Scrapling, Scrapy, Firecrawl) rely on for extraction and link
- * discovery.
- */
-
 export const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -39,7 +31,6 @@ function absolutize(raw: string, base: string): string {
   try { return new URL(raw, base).toString(); } catch { return raw; }
 }
 
-/** HTML → Markdown-ish text, preserving headings, lists and links. */
 export function htmlToMarkdown(html: string): string {
   let out = html
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -125,12 +116,6 @@ export function extractMeta(html: string): Record<string, string> {
   return meta;
 }
 
-/**
- * A tolerant CSS-subset selector engine. Supports tag, #id, .class, [attr],
- * [attr=value], descendant (space) and child (>) combinators, and the
- * pseudo-classes :first-child / :last-child / :nth-child(n). This covers the
- * selectors used by Scrapling/Scrapy examples without pulling in a DOM library.
- */
 export interface DomNode {
   tag: string;
   attrs: Record<string, string>;
@@ -213,13 +198,11 @@ function matchPseudo(node: DomNode, token: string): boolean {
   return true;
 }
 
-/** Query the parsed DOM with a CSS-subset selector. */
 export function queryAll(root: DomNode, selector: string): DomNode[] {
   const groups = selector.split(',').map((s) => s.trim()).filter(Boolean);
   const results: DomNode[] = [];
   const seen = new Set<DomNode>();
   for (const group of groups) {
-    // Walk combinators (descendant space, child >) left-to-right.
     let current: DomNode[] = [root];
     const tokens = group.replace(/\s*>\s*/g, ' > ').split(/\s+/).filter(Boolean);
     let expectChild = false;
@@ -272,7 +255,6 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** Run tasks with a bounded concurrency pool (mirrors Scrapy's CONCURRENT_REQUESTS). */
 export async function pool<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;

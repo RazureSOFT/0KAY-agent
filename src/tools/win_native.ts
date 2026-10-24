@@ -1,18 +1,3 @@
-/**
- * Native Windows backend for the computer-use tool.
- *
- * Uses `koffi` (a prebuilt FFI library — no compiler, no PowerShell, no process
- * spawn) to call user32/gdi32/gdiplus directly:
- *
- *  - screen capture: StretchBlt into a DIB + GDI+ JPEG encode (~30ms/frame),
- *  - mouse: SetCursorPos + mouse_event,
- *  - keyboard: SendInput (virtual-key hotkeys and unicode text),
- *  - window list: EnumWindows.
- *
- * `koffi` is an optional dependency and is loaded lazily, only on Windows, so
- * the package still installs and runs on macOS/Linux/CI without it.
- */
-
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import * as os from 'node:os';
@@ -41,13 +26,11 @@ interface NativeApi {
 let api: NativeApi | null = null;
 let failure: string | null = null;
 
-/** True when the native backend is available on this Windows host. */
 export function nativeAvailable(): boolean {
   if (process.platform !== 'win32') return false;
   try { ensureNative(); return true; } catch { return false; }
 }
 
-/** Lazily initialise (and cache) the native API; throws a clear error if unavailable. */
 export function ensureNative(): NativeApi {
   if (api) return api;
   if (failure) throw new Error(failure);
@@ -66,7 +49,6 @@ function init(): NativeApi {
   const gdi32 = koffi.load('gdi32.dll');
   const gdiplus = koffi.load('gdiplus.dll');
 
-  // --- GDI+ (JPEG encoder) -------------------------------------------------
   const GdiplusStartupInput = koffi.struct('GdiplusStartupInput', {
     GdiplusVersion: 'uint32', DebugEventCallback: 'void*', SuppressBackgroundThread: 'int32', SuppressExternalCodecs: 'int32',
   });
@@ -87,7 +69,6 @@ function init(): NativeApi {
   const JPEG_CLSID = { Data1: 0x557CF401, Data2: 0x1A04, Data3: 0x11D3, Data4: [0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E] };
   const QUALITY_GUID = { Data1: 0x1D5BE4B5, Data2: 0xFA4A, Data3: 0x452D, Data4: [0x9C, 0xDD, 0x5D, 0xB3, 0x51, 0x05, 0xE7, 0xEB] };
 
-  // --- GDI capture ---------------------------------------------------------
   const GetSystemMetrics = user32.func('int __stdcall GetSystemMetrics(int)');
   const GetDC = user32.func('void* __stdcall GetDC(void*)');
   const ReleaseDC = user32.func('int __stdcall ReleaseDC(void*, void*)');
@@ -100,7 +81,6 @@ function init(): NativeApi {
   const DeleteObject = gdi32.func('bool __stdcall DeleteObject(void*)');
   const SRCCOPY = 0x00CC0020;
 
-  // --- input ---------------------------------------------------------------
   const SetCursorPos = user32.func('bool __stdcall SetCursorPos(int, int)');
   const mouseEvent = user32.func('void __stdcall mouse_event(uint32, int32, int32, uint32, uintptr_t)');
   const MOUSEINPUT = koffi.struct('MOUSEINPUT', { dx: 'int32', dy: 'int32', mouseData: 'uint32', dwFlags: 'uint32', time: 'uint32', dwExtraInfo: 'uintptr_t' });
@@ -144,7 +124,6 @@ function init(): NativeApi {
     if (sent !== inputs.length) throw new Error(`SendInput failed (${sent}/${inputs.length})`);
   }
 
-  // Reused capture resources; rebuilt only when the target size changes.
   let cachedWidth = 0;
   let cachedHeight = 0;
   let cachedDc: any = null;
@@ -176,10 +155,10 @@ function init(): NativeApi {
   let cachedScreenH = 0;
 
   function cleanup(): void {
-    try { if (cachedDc && cachedOld) SelectObject(cachedDc, cachedOld); } catch { /* ignore */ }
-    try { if (cachedBitmap) DeleteObject(cachedBitmap); } catch { /* ignore */ }
-    try { if (cachedDc) DeleteDC(cachedDc); } catch { /* ignore */ }
-    try { if (cachedScreenDc) ReleaseDC(null, cachedScreenDc); } catch { /* ignore */ }
+    try { if (cachedDc && cachedOld) SelectObject(cachedDc, cachedOld); } catch { }
+    try { if (cachedBitmap) DeleteObject(cachedBitmap); } catch { }
+    try { if (cachedDc) DeleteDC(cachedDc); } catch { }
+    try { if (cachedScreenDc) ReleaseDC(null, cachedScreenDc); } catch { }
     cachedDc = cachedBitmap = cachedOld = cachedScreenDc = null;
     cachedWidth = cachedHeight = cachedScreenW = cachedScreenH = 0;
   }
@@ -243,7 +222,7 @@ function init(): NativeApi {
             if (title) titles.push(title);
           }
         }
-      } catch { /* skip window */ }
+      } catch { }
       return true;
     }, koffi.pointer(WNDENUMPROC));
     try {

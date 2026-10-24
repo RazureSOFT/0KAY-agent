@@ -1,18 +1,6 @@
-/**
- * Context ledger — a compact, dependency-free adaptation of billion-context's
- * idea: the *model* decides when and what to fold into a high-fidelity summary
- * (via the compress/decompress/search_context/acp_status tools) instead of a
- * hard truncation limit.
- *
- * A compressed range is replaced in the live history by a single summary
- * message carrying a stable marker; the original messages are kept so
- * decompress can restore them and search_context can look inside them.
- */
-
 export interface LedgerBlock {
   id: string
   summary: string
-  /** Index (in the live history) where the summary message currently sits. */
   index: number
   messages: unknown[]
   tokens: number
@@ -42,7 +30,6 @@ const MAX_LEDGER_BLOCKS = 100
 export class ContextLedger {
   private blocks: LedgerBlock[] = []
   private counter = 0
-  /** Last prompt token count reported by the model, when known. */
   lastPromptTokens = 0
 
   constructor(private readonly getHistory: () => any[]) {}
@@ -51,7 +38,6 @@ export class ContextLedger {
     return `[compressed ${id}]`
   }
 
-  /** Fold history[from..to] into one summary message. Returns the new block. */
   compress(from: number, to: number, summary: string): LedgerBlock | null {
     const history = this.getHistory()
     if (!Array.isArray(history) || from < 0 || to < from || to >= history.length || !summary.trim()) return null
@@ -74,7 +60,6 @@ export class ContextLedger {
     return block
   }
 
-  /** Restore a folded range in place. Accepts a block id or 1-based number. */
   decompress(blockRef: string): boolean {
     const block = this.findBlock(blockRef)
     if (!block) return false
@@ -95,7 +80,6 @@ export class ContextLedger {
     )
   }
 
-  /** Keyword search across folded summaries and the visible messages. */
   search(query: string, limit = 10): Array<{ where: string; id?: string; text: string }> {
     const needle = String(query || '').toLowerCase().trim()
     if (!needle) return []
@@ -118,7 +102,6 @@ export class ContextLedger {
     return out.slice(0, limit)
   }
 
-  /** Context-usage overview for the acp_status tool. */
   status(): Record<string, unknown> {
     const history = this.getHistory()
     const visibleTokens = Array.isArray(history)

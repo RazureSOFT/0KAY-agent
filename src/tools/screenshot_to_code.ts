@@ -1,21 +1,3 @@
-/**
- * `screenshot_to_code` tool — full reimplementation of abi/screenshot-to-code.
- *
- * Features:
- *  - Inputs: image file / data URL, HTML? no — screenshots, mockups, and (new)
- *    a screen recording via `video` (frames extracted with ffmpeg) or `frames`.
- *  - Stacks: html_tailwind, html_css, react_tailwind, vue_tailwind, bootstrap,
- *    ionic_tailwind.
- *  - Vision models: OpenAI / Anthropic / Gemini chosen from configured keys.
- *  - Asset extraction: reuse real logos/images cropped from the screenshot
- *    (Firecrawl-style asset pass) as a list the model can reference.
- *  - Self-check: when a browser is available, render the generated page and take
- *    a preview screenshot, feeding a structural diff back for one refinement
- *    pass (the source project's "screenshot preview" tool).
- *  - Variants: generate N independent candidates and return all.
- *  - Offline: with no key, returns a deterministic structural scaffold.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Tool, type ToolContext, type ToolResult, type LlmMessagePart } from './types.js';
@@ -117,19 +99,16 @@ function scaffold(stack: string, image: ImageInfo, prompt: string): string {
   return `<!doctype html>\n${header}\n${meta}\n<html lang="en">\n<head>\n  <meta charset="utf-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1" />\n  <title>Screenshot recreation</title>\n  <style>\n    :root { --bg: ${bg}; --accent: ${accent}; --text: ${text}; }\n    body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }\n    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }\n    .card { border: 1px solid var(--accent); border-radius: 16px; padding: 16px; margin-top: 24px; }\n  </style>\n</head>\n<body>\n  <div class="wrap">\n    <h1>Recreate this UI</h1>\n    <p>Offline scaffold — configure a vision key for a full conversion.</p>\n    <div class="card">layout region (aspect ${ratio})</div>\n  </div>\n</body>\n</html>\n`;
 }
 
-/** Vision call with one or more images (frames) attached. Routes through MOCR
- *  when the agent injected a model channel, else a directly configured provider. */
 async function visionCode(stack: string, images: ImageInfo[], prompt: string, extraText: string, context: ToolContext, model?: string): Promise<string | null> {
   const sys = systemPrompt(stack);
   const userText = `${prompt}\n\nExtra instructions: ${extraText || '(none)'}`;
 
-  // Preferred: the agent's MOCR channel (same route as the main loop).
   if (context.llm) {
     const parts: LlmMessagePart[] = images.map((image) => ({ type: 'image', imageUrl: `data:${image.mime};base64,${image.base64}`, mimeType: image.mime }));
     try {
       const text = await context.llm({ messages: [{ role: 'user', content: userText, parts }], systemPrompt: sys, maxTokens: 8192, model });
       if (text && text.trim()) return text;
-    } catch { /* fall through to a direct provider */ }
+    } catch { }
   }
 
   const provider = selectProvider(model);
@@ -228,7 +207,6 @@ export class ScreenshotToCodeTool extends Tool {
         variants.push({ index: i, provider: 'offline', code: scaffold(stack, images[0], extra) });
       }
 
-      // Self-check: render the first variant and refine once.
       let previewDataUrl: string | null = null;
       if (args.preview !== false && canGenerate && variants[0] && variants[0].provider !== 'offline' && STACKS[stack].file.endsWith('.html')) {
         previewDataUrl = await screenshotHtmlDataUrl(variants[0].code, { signal: context.signal }).catch(() => null);
@@ -266,8 +244,6 @@ export class ScreenshotToCodeTool extends Tool {
     } catch (error) { return failure(error); }
   }
 
-  /** Detect plausible asset regions: distinct-colour blocks and embedded images.
-   *  Pure TS — reports bounding hints the model/human can crop, not pixel crops. */
   private detectAssets(image: ImageInfo): Array<{ kind: string; hint: string }> {
     const assets: Array<{ kind: string; hint: string }> = [];
     for (const color of image.palette.slice(0, 4)) {

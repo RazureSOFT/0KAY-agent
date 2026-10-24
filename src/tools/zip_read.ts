@@ -1,10 +1,3 @@
-/**
- * Minimal ZIP reader used by the document extractors (DOCX/XLSX/APK/JAR) so the
- * built-in paths do not depend on an npm unzip library. Reads the central
- * directory and returns each entry's raw (still-compressed) bytes plus the
- * compression method, leaving inflation to the caller.
- */
-
 export interface ZipReadEntry {
   name: string;
   method: number;
@@ -25,8 +18,6 @@ function findEocd(buffer: Buffer): number {
   return -1;
 }
 
-/** Parse a ZIP archive's central directory into entries (fixed for WinZip
- *  ZIP64 sentinel by falling back to scanning local headers when needed). */
 export function buildZipRead(buffer: Buffer): ZipReadEntry[] {
   const entries: ZipReadEntry[] = [];
   const eocd = findEocd(buffer);

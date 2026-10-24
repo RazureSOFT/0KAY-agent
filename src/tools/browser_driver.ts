@@ -1,17 +1,3 @@
-/**
- * Headless-browser driver shared by scrape, crawl, pentest and
- * screenshot_to_code.
- *
- * Prefers the Node Playwright library when installed; falls back to a Python
- * Playwright script when only the system CLI is present; otherwise reports the
- * capability as unavailable so the caller can degrade to a static fetch.
- *
- * Supports the Firecrawl-style action list (wait, click, scroll, write, press,
- * screenshot) and page observation (network, console, screenshots), so JS-heavy
- * pages and interactions behave like Scrapling's DynamicFetcher / Firecrawl's
- * /scrape actions.
- */
-
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -132,7 +118,6 @@ with sync_playwright() as p:
 print(json.dumps(result))
 `;
 
-/** Drive the page with the Python Playwright driver. */
 async function runPythonBrowser(options: BrowserOptions): Promise<BrowserResult | null> {
   const python = await resolveCli('python');
   if (!python.available) return null;
@@ -167,7 +152,6 @@ async function runPythonBrowser(options: BrowserOptions): Promise<BrowserResult 
   }
 }
 
-/** Drive the page with the Node Playwright library. */
 async function runNodeBrowser(options: BrowserOptions): Promise<BrowserResult | null> {
   const playwright = await optionalImport<any>('playwright');
   if (!playwright) return null;
@@ -196,7 +180,7 @@ async function runNodeBrowser(options: BrowserOptions): Promise<BrowserResult | 
           if (action.path) { await page.screenshot({ path: action.path, fullPage: !!action.fullPage }); screenshots.push({ path: action.path }); }
           else { const data = await page.screenshot({ fullPage: !!action.fullPage }); screenshots.push({ dataUrl: `data:image/png;base64,${Buffer.from(data).toString('base64')}` }); }
         }
-      } catch { /* keep going through the action list */ }
+      } catch { }
     }
     if (options.screenshot) {
       const data = await page.screenshot({ fullPage: true });
@@ -209,11 +193,10 @@ async function runNodeBrowser(options: BrowserOptions): Promise<BrowserResult | 
   } catch {
     return null;
   } finally {
-    try { await browser?.close(); } catch { /* already closed */ }
+    try { await browser?.close(); } catch { }
   }
 }
 
-/** Render a page with any available browser; returns null when none works. */
 export async function renderWithBrowser(options: BrowserOptions): Promise<BrowserResult | null> {
   if (process.env.OKAY_NO_BROWSER === '1') return null;
   const node = await runNodeBrowser(options);
@@ -221,7 +204,6 @@ export async function renderWithBrowser(options: BrowserOptions): Promise<Browse
   return runPythonBrowser(options);
 }
 
-/** Screenshot a URL or an HTML string (used by screenshot_to_code preview). */
 export async function screenshotUrl(urlOrHtml: string, outPath: string, options: { timeoutMs?: number; fullPage?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
   const isUrl = /^https?:\/\//i.test(urlOrHtml);
   const timeoutMs = options.timeoutMs ?? 30_000;
@@ -235,7 +217,6 @@ export async function screenshotUrl(urlOrHtml: string, outPath: string, options:
   return !!result && result.screenshots.some((shot) => shot.path === outPath);
 }
 
-/** Render an HTML string and return a PNG data URL (for self-check previews). */
 export async function screenshotHtmlDataUrl(html: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string | null> {
   const result = await renderWithBrowser({
     url: `data:text/html;base64,${Buffer.from(html).toString('base64')}`,

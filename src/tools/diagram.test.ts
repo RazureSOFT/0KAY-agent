@@ -40,8 +40,6 @@ test('outline input is expanded into nodes', () => {
   assert.ok(svg.includes('Root') && svg.includes('Child A') && svg.includes('Child B'));
 });
 
-// The tool is what the agent calls; it must write both files next to each other
-// so the transcript card can preview the HTML.
 test('DiagramTool writes the svg and a self-contained html viewer', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'diagram-'));
   const tool = new DiagramTool();
@@ -58,7 +56,6 @@ test('DiagramTool writes the svg and a self-contained html viewer', async () => 
   assert.ok(html && existsSync(html), 'html viewer was not written');
   const markup = readFileSync(html!, 'utf8');
   assert.ok(markup.includes('<svg'), 'viewer does not embed the svg');
-  // Self-contained: no remote stylesheet or script may be required to render it.
   assert.ok(!/<script[^>]+src=/.test(markup), 'viewer pulls a remote script');
   assert.ok(!/<link[^>]+href="http/.test(markup), 'viewer pulls a remote stylesheet');
 });

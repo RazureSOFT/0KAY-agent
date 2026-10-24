@@ -1,8 +1,3 @@
-/**
- * Agent tool suite. The names and contracts follow the useful core of
- * opencode's tool set while keeping execution local to the Agent host.
- */
-
 import { exec as execCallback, execFile } from 'child_process';
 import { withWindowsShellHint } from './shell_hint.js';
 import { existsSync } from 'fs';
@@ -44,7 +39,6 @@ export type { ToolResult, ToolContext, TodoItem, McpClientLike };
 export type { JSONSchema, McpToolInfo } from './types.js';
 
 const exec = promisify(execCallback);
-// ESM has no __dirname; used to locate the sibling `life/src` package.
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const MAX_FILE_BYTES = MAX_FILE_BYTES_LIMIT;
 
@@ -55,9 +49,6 @@ export interface ToolSchema {
   dangerous?: boolean;
 }
 
-
-/** Reject `promise` as soon as `signal` aborts (the underlying work is abandoned,
- *  not interrupted). Resolves/rejects with the original promise otherwise. */
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
   if (!signal) return promise;
   const abortError = () => (signal.reason instanceof Error ? signal.reason : new Error(message));
@@ -130,9 +121,6 @@ export class WriteTool extends Tool {
         return success({ ...summary, streamed: false });
       }
 
-      // Streaming truncates the target immediately and appends over ~2.5s, so an
-      // observer sees it grow. The previous contents are restored if this fails
-      // or is cancelled (see stream_write.ts).
       const result = await streamWriteFile(filePath, args.content, context.signal);
       return success({ ...summary, streamed: result.paced, bytes: result.bytes });
     } catch (error) { return failure(error); }
@@ -200,9 +188,6 @@ export class ApplyPatchTool extends Tool {
           written.push(patch);
         }
       } catch (error) {
-        // Roll back what was already applied, and do not let a failing rollback
-        // replace the original error — the caller needs to know which write
-        // failed, not just that the undo failed too.
         const rollbackFailures: string[] = [];
         for (const patch of written.reverse()) {
           try {
@@ -282,7 +267,6 @@ interface ShellRequest {
   command: string;
   cwd?: string;
   timeout?: number;
-  /** Distinguishes spill files when several commands run in parallel. */
   label: string;
 }
 
@@ -357,8 +341,7 @@ export class ShellTool extends Tool {
               execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
             } else {
               child.kill('SIGTERM');
-              // Escalate in case the child ignores SIGTERM.
-              setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
+              setTimeout(() => { try { child.kill('SIGKILL'); } catch { } }, 5000);
             }
           };
           const timer = setTimeout(cancel, timeout);
@@ -370,10 +353,6 @@ export class ShellTool extends Tool {
         return success({ command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: 0, truncated: stdout.truncated || stderr.truncated, fullOutputPath: stdout.fullPath || stderr.fullPath });
       } catch (error: any) {
         const stdout = await spillOutput(String(error.stdout || ''), context.taskId, stdoutLabel);
-        // A failed command on Windows may have failed only because it used POSIX
-        // syntax; cmd.exe's "not recognized" names neither the token nor the
-        // equivalent, so the model retries with another POSIX spelling. Appending
-        // the translation here is purely additive — it runs after the failure.
         const rawStderr = withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'));
         const stderr = await spillOutput(rawStderr, context.taskId, stderrLabel);
         return { success: false, data: { command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
@@ -436,7 +415,6 @@ export class WebSearchTool extends Tool {
       endpoint.searchParams.set('n', String(limit));
       const timeout = AbortSignal.timeout(30000);
       const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
-      // Core owns the built-in search (no separate SearXNG service/port).
       const response = await coreFetch(endpoint.toString(), { headers: coreHeaders(), signal });
       if (!response.ok) throw new Error(`search returned ${response.status}`);
       const body: any = await response.json();
@@ -448,7 +426,6 @@ export class WebSearchTool extends Tool {
   }
 }
 
-/** Shared parser for Core's {results:[{title,url,snippet,engine}]} envelope. */
 function readSearchResults(body: any, limit: number): Array<Record<string, string>> {
   if (!Array.isArray(body?.results)) return [];
   return body.results.slice(0, limit).map((item: any) => ({
@@ -456,7 +433,6 @@ function readSearchResults(body: any, limit: number): Array<Record<string, strin
   }));
 }
 
-/** Academic paper search (arXiv / Crossref / OpenAlex), separate from websearch. */
 export class PaperSearchTool extends Tool {
   get name(): string { return 'papersearch'; }
   get description(): string { return 'Search academic papers (arXiv, Crossref, OpenAlex). Returns title, authors, year, venue, URL and an abstract snippet so results can be cited.'; }
@@ -481,7 +457,6 @@ export class PaperSearchTool extends Tool {
   }
 }
 
-/** API documentation search (MDN / MS Learn / Stack Overflow), separate from websearch. */
 export class ApiDocSearchTool extends Tool {
   get name(): string { return 'apidocsearch'; }
   get description(): string { return 'Search API documentation (MDN, Microsoft Learn, Stack Overflow, official doc sites). Use for library/API signatures, usage and examples.'; }
@@ -569,8 +544,6 @@ export class McpTool extends Tool {
       if (args.action === 'list') return success({ tools: context.mcp.listTools() });
       if (args.action !== 'call') throw new Error('action must be list or call');
       if (typeof args.server !== 'string' || typeof args.tool !== 'string') throw new Error('server and tool are required for a call');
-      // The manager's callTool takes no signal, so race the abort to stop waiting
-      // on a hung server when the task is cancelled.
       const call = context.mcp.callTool(args.server, args.tool, args.args && typeof args.args === 'object' ? args.args : {});
       const result = await raceAbort(call, context.signal, `MCP call ${args.server}:${args.tool} aborted`);
       return success({ server: args.server, tool: args.tool, result });
@@ -578,20 +551,17 @@ export class McpTool extends Tool {
   }
 }
 
-/** macOS virtual keycodes for special keys (used by `osascript ... key code N`). */
 const MAC_KEY_CODES: Record<string, number> = {
   return: 36, enter: 36, tab: 48, space: 49, delete: 51, backspace: 51, escape: 53, esc: 53,
   left: 123, right: 124, down: 125, up: 126, home: 115, end: 119, pageup: 116, pagedown: 121,
   f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97, f7: 98, f8: 100, f9: 101, f10: 109, f11: 103, f12: 111,
 };
 
-/** AppleScript modifier clauses for a leading hotkey token. */
 const MAC_MODIFIERS: Record<string, string> = {
   cmd: 'command down', command: 'command down', meta: 'command down', super: 'command down',
   ctrl: 'control down', control: 'control down', alt: 'option down', option: 'option down', shift: 'shift down',
 };
 
-/** xdotool keysym names for tokens that differ from the plain name. */
 const LINUX_KEYS: Record<string, string> = {
   cmd: 'super', command: 'super', meta: 'super', win: 'super',
   ctrl: 'ctrl', control: 'ctrl', alt: 'alt', shift: 'shift',
@@ -604,7 +574,6 @@ function appleScriptEscape(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n');
 }
 
-/** Build the AppleScript statement that emits a hotkey such as `cmd+shift+t` or `return`. */
 export function appleScriptForKey(raw: string): string {
   const parts = raw.split('+').map((part) => part.trim()).filter(Boolean);
   const key = parts.pop() || '';
@@ -621,16 +590,11 @@ export function appleScriptForKey(raw: string): string {
   throw new Error(`unsupported key: ${raw}`);
 }
 
-/** Map a canonical `ctrl+shift+t` hotkey to an xdotool key expression. */
 export function linuxKeyExpression(raw: string): string {
   return raw.split('+').map((part) => part.trim()).filter(Boolean)
     .map((part) => LINUX_KEYS[part.toLowerCase()] ?? part).join('+');
 }
 
-/**
- * One live desktop frame for the WebUI's "AI is using the computer" window.
- * `image` is base64 of a downscaled JPEG preview.
- */
 export interface DesktopFrame {
   image: string;
   mime: string;
@@ -639,19 +603,10 @@ export interface DesktopFrame {
   at: number;
 }
 
-/** Preview geometry and cadence for the live-view stream. */
 const STREAM_WIDTH = 1024;
 const STREAM_QUALITY = 50;
 const STREAM_MIN_INTERVAL_MS = 66;
 
-/**
- * Operate the host desktop (screenshot, list windows, mouse, keyboard).
- *
- * Backends: Windows native via `koffi` (user32/gdi32/gdiplus — no PowerShell),
- * macOS `screencapture` + `osascript` + `cliclick`, Linux
- * `grim`/`scrot`/ImageMagick + `xdotool`. A missing backend is reported as a
- * clear, actionable error.
- */
 export class ComputerUseTool extends Tool {
   private tail: Promise<unknown> = Promise.resolve();
   private streamFrameCache: DesktopFrame | null = null;
@@ -665,7 +620,6 @@ export class ComputerUseTool extends Tool {
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    // 桌面状态只有一个，批量工具调用不能让截图、移动、键盘互相抢占。
     const run = this.tail.then(() => this.executeDesktop(args, context));
     this.tail = run.catch(() => undefined);
     return run;
@@ -690,7 +644,6 @@ export class ComputerUseTool extends Tool {
     } catch (error) { return failure(error); }
   }
 
-  /** Run a command with a bounded lifetime and no console window. */
   private run(file: string, args: string[], context?: ToolContext, timeout = 30_000): Promise<{ stdout: string; stderr: string }> {
     return promisify(execFile)(file, args, { timeout, windowsHide: true, signal: context?.signal, maxBuffer: 32 << 20 }) as Promise<{ stdout: string; stderr: string }>;
   }
@@ -707,18 +660,12 @@ export class ComputerUseTool extends Tool {
     if (!(await this.hasCommand(name, context))) throw new Error(`computeruse needs \`${name}\` on this host (${hint})`);
   }
 
-  /** Run a native macOS/Linux input action; false when native is unavailable or
-   *  fails, so the caller falls back to the shell tools. */
   private tryNative(action: (native: PosixInput) => boolean | void): boolean {
     const native = posixInput();
     if (!native) return false;
     try { return action(native) !== false; } catch { return false; }
   }
 
-  /** Latest live frame for the WebUI stream. Windows captures natively through
-   *  koffi; other platforms capture on demand with their own tools. `after` is
-   *  the last frame timestamp the caller already has, so an unchanged frame is
-   *  returned with an empty `image` instead of re-sending the pixels. */
   async streamFrame(context?: ToolContext, after = 0): Promise<DesktopFrame | null> {
     const now = Date.now();
     if (!this.streamFrameCache || now - this.streamFrameAt >= STREAM_MIN_INTERVAL_MS) {
@@ -736,12 +683,10 @@ export class ComputerUseTool extends Tool {
     return frame.at <= after ? { ...frame, image: '' } : frame;
   }
 
-  /** True while a capture backend is up (lets a warming stream stay open). */
   streamAlive(): boolean {
     return process.platform === 'win32' ? nativeAvailable() : true;
   }
 
-  // --- screenshot -----------------------------------------------------------
   private async screenshot(context?: ToolContext) {
     if (process.platform === 'win32') {
       const shot = ensureNative().capture(0, 82);
@@ -824,7 +769,6 @@ export class ComputerUseTool extends Tool {
     throw new Error('computeruse screenshot needs grim, scrot, ImageMagick import, gnome-screenshot or spectacle on Linux');
   }
 
-  // --- windows list ---------------------------------------------------------
   private async listWindows(context?: ToolContext) {
     let windows: string[];
     if (process.platform === 'win32') {
@@ -852,7 +796,6 @@ export class ComputerUseTool extends Tool {
     return String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   }
 
-  // --- keyboard -------------------------------------------------------------
   private async typeText(args: Record<string, any>, context?: ToolContext) {
     const text = String(args.text ?? '');
     if (!text) throw new Error('text is required');
@@ -893,7 +836,6 @@ export class ComputerUseTool extends Tool {
     return { action: 'key', sent: raw };
   }
 
-  // --- pointer --------------------------------------------------------------
   private async scroll(args: Record<string, any>, context?: ToolContext) {
     const delta = args.delta;
     if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 20) throw new Error('delta must be a nonzero integer between -20 and 20');
@@ -966,7 +908,6 @@ export class ComputerUseTool extends Tool {
   }
 }
 
-/** Turn lightweight Markdown into structured doc blocks. */
 function parseDocBlocks(text: string): DocBlock[] {
   const blocks: DocBlock[] = [];
   for (const raw of String(text ?? '').split(/\r?\n/)) {
@@ -981,7 +922,6 @@ function parseDocBlocks(text: string): DocBlock[] {
   return blocks;
 }
 
-/** Write a .docx (default), .md or .txt document. */
 export class DocumentTool extends Tool {
   get name(): string { return 'document'; }
   get description(): string { return 'Create a Word document (.docx) or a Markdown/text file. Provide a title and the body as Markdown (headings #, ##, bullets -, paragraphs); it is converted to a real .docx by default.'; }
@@ -1026,7 +966,6 @@ export class DocumentTool extends Tool {
   }
 }
 
-/** Write a PowerPoint deck (.pptx). */
 export class SlidesTool extends Tool {
   get name(): string { return 'slides'; }
   get description(): string { return 'Create a PowerPoint presentation (.pptx) from a title and a list of slides (each with a title and bullet points).'; }
@@ -1057,7 +996,6 @@ export class SlidesTool extends Tool {
   }
 }
 
-/** Drive a real browser over the Chrome DevTools Protocol. */
 export class BrowserTool extends Tool {
   get name(): string { return 'browser'; }
   get description(): string { return 'Automate a real browser: goto/open a URL, screenshot, read text/html, click, type, press keys (combos like ctrl+a, shift+tab), run JavaScript, wait for a selector, go back/forward/reload, or start/stop the browser. Call action "status" for the live state.'; }
@@ -1081,7 +1019,6 @@ export class BrowserTool extends Tool {
   }
 }
 
-/** Locate the `life/src` package dir that hosts `life.tools.research`. */
 export function resolveResearchSrc(): string {
   const candidates: string[] = [];
   if (process.env.LIFE_SRC) candidates.push(process.env.LIFE_SRC);
@@ -1099,12 +1036,11 @@ export function resolveResearchSrc(): string {
   for (const candidate of candidates) {
     try {
       if (existsSync(path.join(candidate, 'life', 'tools', 'research', '__main__.py'))) return candidate;
-    } catch { /* keep looking */ }
+    } catch { }
   }
   throw new Error('life.tools.research not found — set LIFE_SRC to the life/src directory');
 }
 
-/** Generate publication artifacts with the standard `life.tools.research` toolkit. */
 export class ResearchTool extends Tool {
   get name(): string { return 'research'; }
   get description(): string {
@@ -1182,8 +1118,6 @@ export class ResearchTool extends Tool {
         if (spec.title) cliArgs.push('--title', String(spec.title));
         if (spec.stem) cliArgs.push('--stem', String(spec.stem));
         const output = await run(cliArgs);
-        // Surface the produced paths so the WebUI can open the .docx directly;
-        // `build_paper` prints "<kind>: <path>" for html and docx.
         const files: string[] = [];
         for (const line of output.split(/\r?\n/)) {
           const match = /^(?:html|docx):\s*(.+)$/i.exec(line.trim());
@@ -1218,7 +1152,6 @@ export class ToolRegistry {
   }
 }
 
-/** Model-driven context compression (adapted from the billion-context idea). */
 export class CompressContextTool extends Tool {
   get name(): string { return 'compress'; }
   get description(): string {
@@ -1270,7 +1203,6 @@ export class AcpStatusTool extends Tool {
   }
 }
 
-/** A tool contributed by a plugin; execution is routed through Core. */
 export interface PluginToolDef {
   plugin: string;
   name: string;
@@ -1297,7 +1229,6 @@ export class PluginTool extends Tool {
   }
 }
 
-/** Create the opencode-style built-in tool registry. */
 export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()): ToolRegistry {
   const registry = new ToolRegistry();
   for (const tool of [

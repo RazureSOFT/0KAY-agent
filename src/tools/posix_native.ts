@@ -1,19 +1,3 @@
-/**
- * Native macOS/Linux input backend for the computer-use tool.
- *
- * Mirrors the Windows backend in `win_native.ts`: it uses `koffi` (prebuilt
- * FFI, no compiler, no process spawn) to drive the pointer and keyboard
- * directly instead of shelling out to `osascript`/`cliclick`/`xdotool` for every
- * action, which is what made control feel sluggish.
- *
- *  - macOS: CoreGraphics (`CGEvent*`) — posts mouse/key events and unicode text.
- *  - Linux: X11 + XTest (`XTestFake*`) — works on X11 (not Wayland, where the
- *    caller falls back to `xdotool`/`ydotool`).
- *
- * Anything unsupported or unavailable returns `null`/`false`, and the tool
- * falls back to the previous shell-based implementation, so nothing regresses.
- */
-
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -23,16 +7,13 @@ export interface PosixInput {
   click(x: number, y: number, button: 'left' | 'right', double: boolean): void;
   drag(x1: number, y1: number, x2: number, y2: number, button: 'left' | 'right', durationMs: number): void;
   scroll(delta: number): void;
-  /** Returns false when this backend cannot type the text (caller falls back). */
   typeText(text: string): boolean;
-  /** Returns false when the spec/key is unsupported (caller falls back). */
   pressHotkey(spec: string): boolean;
 }
 
 let cached: PosixInput | null = null;
 let resolved = false;
 
-/** Native input backend for this platform, or null to use the shell fallback. */
 export function posixInput(): PosixInput | null {
   if (resolved) return cached;
   resolved = true;
@@ -45,10 +26,6 @@ export function posixInput(): PosixInput | null {
   }
   return cached;
 }
-
-// ---------------------------------------------------------------------------
-// macOS (CoreGraphics)
-// ---------------------------------------------------------------------------
 
 const MAC_KEYCODES: Record<string, number> = {
   a: 0, s: 1, d: 2, f: 3, h: 4, g: 5, z: 6, x: 7, c: 8, v: 9, b: 11, q: 12, w: 13, e: 14, r: 15,
@@ -149,7 +126,7 @@ function initMac(): PosixInput | null {
       postMouse(up, x2, y2, code, 1);
     },
     scroll: (delta) => {
-      const event = CGEventCreateScrollWheelEvent(null, 1, 1, -delta); // unit=line
+      const event = CGEventCreateScrollWheelEvent(null, 1, 1, -delta);
       if (!event) throw new Error('CGEventCreateScrollWheelEvent failed');
       try { CGEventPost(HID_TAP, event); } finally { CFRelease(event); }
     },
@@ -182,10 +159,6 @@ function initMac(): PosixInput | null {
     },
   };
 }
-
-// ---------------------------------------------------------------------------
-// Linux (X11 + XTest)
-// ---------------------------------------------------------------------------
 
 function initLinux(): PosixInput | null {
   if (!process.env.DISPLAY) return null;
@@ -254,14 +227,13 @@ function initLinux(): PosixInput | null {
       XFlush(display);
     },
     scroll: (delta) => {
-      const button = delta > 0 ? 5 : 4; // 5 = down, 4 = up
+      const button = delta > 0 ? 5 : 4;
       for (let i = 0; i < Math.abs(delta); i++) {
         XTestFakeButtonEvent(display, button, 1, 0);
         XTestFakeButtonEvent(display, button, 0, 0);
       }
       XFlush(display);
     },
-    // Arbitrary text needs the XKB layout; keep using `xdotool type` there.
     typeText: () => false,
     pressHotkey: (spec) => {
       const parts = spec.toLowerCase().split('+').map((value) => value.trim());
@@ -279,4 +251,3 @@ function initLinux(): PosixInput | null {
   };
 }
 
-// ---------------------------------------------------------------------------

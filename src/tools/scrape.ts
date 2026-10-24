@@ -1,21 +1,3 @@
-/**
- * `scrape` tool — full reimplementation of the Scrapling + Firecrawl scrape
- * pipelines in TypeScript.
- *
- * Features (matching the source projects):
- *  - Fetch modes: static (HTTP), js (headless browser), stealth (curl
- *    impersonation when available). Browser actions: wait/click/scroll/write/
- *    press/screenshot/goto (Firecrawl actions, Scrapling interactions).
- *  - Formats: markdown, text, html, links, metadata, screenshot, json
- *    (structured extraction), summary, rawHtml, changeTracking.
- *  - Selection: CSS and XPath subsets; adaptive selection with saved
- *    fingerprints (Scrapling auto_save/adaptive).
- *  - Structured extraction: a JSON schema with per-field css/xpath selectors or
- *    a natural-language prompt mapped to fields (Firecrawl extract).
- *  - Non-HTML payloads: PDF/DOCX/XLSX/CSV/media are detected and extracted.
- *  - Proxy rotation across a list of proxies; onlyMainContent; batch scrapes.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createHash } from 'crypto';
@@ -54,7 +36,7 @@ interface Fingerprint { url: string; selector: string; tag: string; text: string
 
 function requestHeaders(url: string, extra?: Record<string, string>): Record<string, string> {
   let origin = '';
-  try { const parsed = new URL(url); origin = `${parsed.protocol}//${parsed.host}`; } catch { /* blank */ }
+  try { const parsed = new URL(url); origin = `${parsed.protocol}//${parsed.host}`; } catch { }
   return {
     'User-Agent': DEFAULT_USER_AGENT,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -154,7 +136,6 @@ async function staticFetch(url: string, options: ScrapeOptions): Promise<Fetched
   return { html, status: response.status, contentType, finalUrl: response.url || url, rendered: false, via: 'static', kind };
 }
 
-/** Stealth fetch via curl-impersonate (TLS/JA3 impersonation) when available. */
 async function stealthFetch(url: string, options: ScrapeOptions): Promise<Fetched | null> {
   const curl = await resolveCli('curl-impersonate');
   if (!curl.available) return null;
@@ -173,10 +154,8 @@ async function fetchPage(url: string, options: ScrapeOptions): Promise<Fetched> 
   if (mode === 'stealth') {
     const stealth = await stealthFetch(url, options);
     if (stealth) return stealth;
-    // Fall through to static if impersonation is unavailable.
     return staticFetch(url, options);
   }
-  // auto | js: use the browser when possible.
   const wantScreenshot = options.formats.includes('screenshot');
   const browser = await renderWithBrowser({
     url, timeoutMs: options.timeoutMs, actions: options.actions, waitUntil: 'networkidle',
@@ -384,7 +363,7 @@ export class ScrapeTool extends Tool {
     const hash = createHash('sha1').update(url).digest('hex').slice(0, 16);
     const file = path.join(dir, `${hash}.txt`);
     let previous = '';
-    try { previous = await fs.readFile(file, 'utf8'); } catch { /* first run */ }
+    try { previous = await fs.readFile(file, 'utf8'); } catch { }
     await fs.writeFile(file, markdown, 'utf8');
     if (!previous) return { changed: true, firstRun: true, bytes: markdown.length };
     const changed = previous !== markdown;
@@ -392,7 +371,6 @@ export class ScrapeTool extends Tool {
   }
 }
 
-/** Quick Dice coefficient over 4-gram shingles for a change score. */
 function similarity(a: string, b: string): number {
   if (!a || !b) return 0;
   const grams = (s: string) => { const set = new Set<string>(); for (let i = 0; i + 4 <= s.length; i++) set.add(s.slice(i, i + 4)); return set; };

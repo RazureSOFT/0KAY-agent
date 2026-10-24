@@ -7,22 +7,6 @@ import { success, failure } from './helpers.js';
 
 const run = promisify(execFile);
 
-/**
- * Self-iteration: the agent edits its own repository without ever touching the
- * checkout the user is working in.
- *
- * The whole design is one rule — **every write happens in a git worktree on a
- * `self/<slug>` branch**, never in the main working tree. That is what makes the
- * "don't open a PR and nothing changes for me" requirement true: an iteration
- * that is never finished simply sits on a branch. When upstream moves, the
- * branch is brought forward with a merge, so the iteration is an incremental
- * delta against whatever the repository looks like now instead of a snapshot
- * that rots.
- *
- * Four tools, used in order: begin → (agent edits files) → commit → upstream
- * (optional, when the base moved) → finish (asks about the PR).
- */
-
 interface EvolveState {
   slug: string;
   repo: string;
@@ -31,7 +15,6 @@ interface EvolveState {
   commits: number;
 }
 
-/** One iteration per session: a second `begin` would silently orphan the first. */
 const sessions = new Map<string, EvolveState>();
 
 function keyOf(context: ToolContext): string {
@@ -56,10 +39,8 @@ async function git(repo: string, args: string[], timeout = 60_000): Promise<{ ok
   }
 }
 
-/** The repository an iteration targets: the agent's own checkout by default. */
 function repoRoot(context: ToolContext, configured: string): string {
   if (configured && configured.trim()) return path.resolve(configured.trim());
-  // tools/ lives at <repo>/src/tools, so two levels up is the repository.
   const candidate = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '../..');
   return existsSync(path.join(candidate, '.git')) ? candidate : context.cwd;
 }
@@ -178,8 +159,6 @@ export class EvolveUpstreamTool extends Tool {
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     const state = sessions.get(keyOf(context));
     if (!state) return failure('no open iteration; call evolve_begin first');
-    // `remote: ''` merges the local branch directly — the normal case for a repo
-    // that has no remote yet, and what the tests use.
     const remote = String(args.remote ?? 'origin').trim();
     const branch = String(args.branch || 'main');
 
@@ -192,7 +171,6 @@ export class EvolveUpstreamTool extends Tool {
     if (merged.ok) {
       return success({ merged: true, branch: state.branch, output: merged.out.split(/\r?\n/).slice(-5).join('\n') });
     }
-    // Conflicts are information, not a failure: the model resolves them by hand.
     const conflicted = await git(state.worktree, ['diff', '--name-only', '--diff-filter=U']);
     return success({
       merged: false,
@@ -264,5 +242,4 @@ export class EvolveFinishTool extends Tool {
   }
 }
 
-/** Test seam: forget every open iteration (no git side effects). */
 export function resetEvolveSessions(): void { sessions.clear(); }

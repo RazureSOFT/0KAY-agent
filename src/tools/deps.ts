@@ -1,52 +1,27 @@
-/**
- * Capability registry + dependency bootstrapper shared by the full-feature web,
- * reverse-engineering and pentest tools.
- *
- * The tools self-implement in TypeScript first; when a heavier engine is needed
- * (a headless browser, a decompiler, PDF rasterizer, media probe) they fall back
- * to an external capability discovered here. `setup_deps` performs the one-click
- * install of the optional npm libraries and reports which system CLIs are
- * present, so a missing capability is a clear, actionable message rather than a
- * silent degrade.
- */
-
 import { exec, execFile } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
 export interface CliCapability {
-  /** Human name, also the key in the setup report. */
   name: string;
-  /** Candidate executables, tried in order. */
   commands: string[];
-  /** A short probe arg that exits 0 when present (e.g. --version). */
   versionArg: string[];
-  /** What this capability unlocks. */
   purpose: string;
-  /** Optional env var that overrides the executable path. */
   envVar?: string;
-  /** Install recipes per platform (best-effort, idempotent). */
   install?: InstallRecipe;
 }
 
-/** How to install a CLI. Each step is tried in order until one succeeds. */
 export interface InstallRecipe {
-  /** Package manager recipes: {manager, args}. `{name}` is substituted. */
   packages?: Array<{ manager: 'npm' | 'pip' | 'pipx' | 'winget' | 'choco' | 'scoop' | 'brew' | 'apt' | 'cargo' | 'go' | 'script'; args: string[] }>;
-  /** Free-form notes shown to the user when only manual steps exist. */
   manual?: string;
 }
 
 export interface NpmCapability {
-  /** Package name to install. */
   pkg: string;
-  /** What it unlocks. */
   purpose: string;
-  /** Whether the tools can run without it (pure-TS fallback exists). */
   optional: boolean;
 }
 
-/** System CLIs the tools may call. Absence never crashes a tool. */
 export const CLI_CAPABILITIES: CliCapability[] = [
   { name: 'python', commands: ['python', 'python3'], versionArg: ['--version'], purpose: 'Runner for Playwright/Turnstile/asset extraction scripts', envVar: 'PYTHON',
     install: { packages: [
@@ -136,7 +111,6 @@ export const CLI_CAPABILITIES: CliCapability[] = [
     ] } },
 ];
 
-/** Optional npm libraries the tools can use when installed. */
 export const NPM_CAPABILITIES: NpmCapability[] = [
   { pkg: 'playwright', purpose: 'JS rendering + browser actions for scrape/crawl/pentest/screenshot', optional: true },
   { pkg: 'cheerio', purpose: 'Faster, more complete HTML parsing than the built-in tokenizer', optional: true },
@@ -158,7 +132,6 @@ function shellQuote(value: string): string {
   return /[\s"^&|<>()]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
 }
 
-/** Build a single command string for shell execution (Windows .cmd/.bat shims). */
 function shellCommand(command: string, args: string[]): string {
   return [command, ...args.map(shellQuote)].join(' ');
 }
@@ -167,8 +140,6 @@ function runProbe(command: string, args: string[], timeout = 8000): Promise<{ co
   return new Promise((resolve) => {
     const finish = (error: any, stdout: string, stderr: string) => resolve({ code: error ? (error.code ?? 1) : 0, output: `${stdout || ''}${stderr || ''}`.trim() });
     try {
-      // Use a shell only for Windows .cmd/.bat shims, passing one command string
-      // (no arg array) to avoid the DEP0190 warning.
       if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
         exec(shellCommand(command, args), { windowsHide: true, timeout, maxBuffer: 1 << 20 }, finish);
       } else {
@@ -180,7 +151,6 @@ function runProbe(command: string, args: string[], timeout = 8000): Promise<{ co
   });
 }
 
-/** Resolve a capability from its candidates (respecting an env override). */
 export async function resolveCli(name: string, options: { refresh?: boolean } = {}): Promise<ResolvedCli> {
   const spec = CLI_CAPABILITIES.find((item) => item.name === name);
   if (!spec) return { name, command: name, available: false };
@@ -195,9 +165,6 @@ export async function resolveCli(name: string, options: { refresh?: boolean } = 
   for (const candidate of candidates) {
     const [bin, ...pre] = candidate.split(' ');
     const { code, output } = await runProbe(bin, [...pre, ...spec.versionArg]);
-    // A failed probe is not evidence of availability. execFile reports a
-    // missing executable as ENOENT (a string), not shell exit code 127/9009.
-    // Requiring success also rejects timeout, permission and startup failures.
     if (code === 0) {
       resolved = { name, command: candidate, available: true, version: output.split(/\r?\n/)[0].slice(0, 80) };
       break;
@@ -207,7 +174,6 @@ export async function resolveCli(name: string, options: { refresh?: boolean } = 
   return resolved;
 }
 
-/** Report every capability and whether it is present. */
 export async function probeCapabilities(refresh = false): Promise<{
   cli: ResolvedCli[];
   npm: Array<{ pkg: string; purpose: string; optional: boolean; installed: boolean }>;
@@ -217,9 +183,6 @@ export async function probeCapabilities(refresh = false): Promise<{
   return { cli, npm };
 }
 
-/** True when an npm module can be resolved from here. Uses require.resolve
- *  first (fresh each call, no dynamic-import cache) so a package installed
- *  mid-process is detected immediately. */
 export async function moduleAvailable(pkg: string): Promise<boolean> {
   try {
     const { createRequire } = await import('module');
@@ -236,7 +199,6 @@ export async function moduleAvailable(pkg: string): Promise<boolean> {
   }
 }
 
-/** Dynamically import an optional module, returning null when it is absent. */
 export async function optionalImport<T = any>(pkg: string): Promise<T | null> {
   try {
     const mod = await import(pkg);
@@ -246,7 +208,6 @@ export async function optionalImport<T = any>(pkg: string): Promise<T | null> {
   }
 }
 
-/** Run an external command and capture stdout/stderr, with an optional abort. */
 export function runCli(command: string, args: string[], options: { cwd?: string; timeout?: number; signal?: AbortSignal; input?: string; env?: Record<string, string>; maxBuffer?: number } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const common = {
@@ -259,7 +220,6 @@ export function runCli(command: string, args: string[], options: { cwd?: string;
     } as const;
     const finish = (error: any, stdout: string, stderr: string) => resolve({ code: error ? (error.code ?? 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     try {
-      // `command` is the executable path (may contain spaces); args are separate.
       if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
         exec(shellCommand(command, args), { ...common }, (error: any, stdout: string, stderr: string) => finish(error, stdout, stderr));
       } else {
@@ -273,12 +233,10 @@ export function runCli(command: string, args: string[], options: { cwd?: string;
   });
 }
 
-/** Install optional npm libraries (used by the setup_deps tool). */
 export function npmInstall(pkgs: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; stdout: string; stderr: string }> {
   return runCli(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund', ...pkgs], { cwd, timeout: 600_000, signal, maxBuffer: 8 * 1024 * 1024 });
 }
 
-/** Ensure a persistent data directory exists (dedup stores, fingerprints, runs). */
 export async function ensureDataDir(sub: string): Promise<string> {
   const base = process.env.AGENT_DATA_DIR || path.join(process.cwd(), 'data', 'agent');
   const dir = path.join(base, sub);
@@ -291,7 +249,6 @@ export function capabilityHint(names: string[]): string {
   return specs.map((spec) => `${spec.name}: ${spec.purpose}`).join('; ');
 }
 
-/** Package-manager executables per platform. */
 const MANAGER_BIN: Record<string, { win?: string; posix?: string }> = {
   npm: { win: 'npm.cmd', posix: 'npm' },
   pip: { win: 'pip', posix: 'pip3' },
@@ -311,7 +268,6 @@ function managerCommand(manager: string): string | null {
   return (process.platform === 'win32' ? spec.win : spec.posix) || null;
 }
 
-/** Resolve the executable for a package manager, or null when not on this host. */
 export async function packageManagerAvailable(manager: string): Promise<string | null> {
   const command = managerCommand(manager);
   if (!command) return null;
@@ -323,7 +279,6 @@ export async function packageManagerAvailable(manager: string): Promise<string |
 export interface CliInstallPlanItem { manager: string; command: string; args: string[]; }
 export interface CliInstallPlan { name: string; purpose: string; steps: CliInstallPlanItem[]; manual?: string; }
 
-/** Build the install plan for a capability (the steps that would run). */
 export async function planCliInstall(name: string): Promise<CliInstallPlan | null> {
   const spec = CLI_CAPABILITIES.find((item) => item.name === name);
   if (!spec) return null;
@@ -337,7 +292,6 @@ export async function planCliInstall(name: string): Promise<CliInstallPlan | nul
 
 export interface CliInstallResult { name: string; ok: boolean; usedManager?: string; command?: string; exitCode?: number; output?: string; note?: string; }
 
-/** Install one CLI by running its recipe steps until the probe succeeds. */
 export async function installCli(name: string, options: { signal?: AbortSignal; refresh?: boolean } = {}): Promise<CliInstallResult> {
   const spec = CLI_CAPABILITIES.find((item) => item.name === name);
   if (!spec) return { name, ok: false, note: `unknown capability: ${name}` };
@@ -354,7 +308,6 @@ export async function installCli(name: string, options: { signal?: AbortSignal; 
       return { name, ok: true, usedManager: step.manager, command: `${step.command} ${step.args.join(' ')}`, exitCode: 0, output: (result.stdout || result.stderr).slice(-4000) };
     }
   }
-  // Playwright needs its browser binaries after the package install.
   if (name === 'playwright') {
     const cli = await resolveCli('playwright', { refresh: true });
     if (cli.available) {

@@ -1,8 +1,3 @@
-/**
- * Retry/backoff and stream idle-timeout helpers, adapted (not copied) from
- * ZCode's retry-policy and stream-idle-timeout modules. Bounds are env-tunable
- * so a deployment can widen or disable retries without a code change.
- */
 import { classifyFailure, type ClassifiedFailure } from './failure.js'
 
 export interface RetryOptions {
@@ -14,7 +9,7 @@ export interface RetryOptions {
 }
 
 const DEFAULTS: RetryOptions = {
-  maxAttempts: 6, // includes the first attempt
+  maxAttempts: 6,
   baseDelayMs: 1000,
   backoffFactor: 2,
   maxDelayMs: 30_000,
@@ -30,7 +25,6 @@ function positiveInt(value: string | undefined, fallback: number): number {
   return Math.floor(parsed)
 }
 
-/** Resolve retry bounds from options/env (OKAY_AGENT_MODEL_RETRY_*). */
 export function resolveRetryOptions(env: Record<string, string | undefined> = process.env): RetryOptions {
   return {
     maxAttempts: positiveInt(env.OKAY_AGENT_MODEL_RETRY_MAX_RETRIES, DEFAULTS.maxAttempts - 1) + 1,
@@ -44,14 +38,12 @@ export function resolveRetryOptions(env: Record<string, string | undefined> = pr
   }
 }
 
-/** Delay before the next attempt, honouring Retry-After when present. */
 export function retryDelayMs(attempt: number, options: RetryOptions, retryAfterMs?: number): number {
   if (retryAfterMs && retryAfterMs > 0) return Math.min(retryAfterMs, options.maxDelayMs)
   const base = Math.min(options.baseDelayMs * options.backoffFactor ** attempt, options.maxDelayMs)
   return options.jitter ? Math.floor(base * (0.5 + Math.random() * 0.5)) : base
 }
 
-/** Idle timeout for stream attempt N (grows so long generations are not cut). */
 export function streamIdleTimeoutMs(retryNumber = 0, env: Record<string, string | undefined> = process.env): number {
   const base = Number(env.OKAY_AGENT_STREAM_IDLE_MS)
   const baseMs = Number.isFinite(base) && base >= 0 ? base : DEFAULT_STREAM_IDLE_MS
@@ -85,7 +77,6 @@ export class ModelStreamIdleTimeoutError extends Error {
   }
 }
 
-/** A completion with no text and no tool calls; worth one clean retry. */
 export class ModelEmptyCompletionError extends Error {
   readonly code = 'MODEL_EMPTY_COMPLETION'
   constructor() {
@@ -94,11 +85,6 @@ export class ModelEmptyCompletionError extends Error {
   }
 }
 
-/**
- * Await the next value from an async iterator, aborting when it stalls longer
- * than `idleMs`. On timeout it invokes `onTimeout` (e.g. stream.cancel) and
- * throws ModelStreamIdleTimeoutError.
- */
 export async function nextWithIdleTimeout<T>(
   iterator: AsyncIterator<T>,
   idleMs: number,
@@ -119,14 +105,12 @@ export async function nextWithIdleTimeout<T>(
   }
 }
 
-/** Decide whether a failed stream attempt should be retried. */
 export function shouldRetry(
   failure: ClassifiedFailure,
   attempt: number,
   options: RetryOptions,
   emitted: boolean,
 ): boolean {
-  // Never retry after partial output (would duplicate tokens) or on cancel/auth.
   return failure.retryable && !emitted && attempt + 1 < options.maxAttempts
 }
 

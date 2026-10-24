@@ -7,10 +7,6 @@ import * as path from 'node:path';
 import { EvolveBeginTool, EvolveCommitTool, EvolveFinishTool, EvolveUpstreamTool, resetEvolveSessions } from './self_evolve.js';
 import type { ToolContext } from './types.js';
 
-// The one property that matters: an iteration never writes to the checkout the
-// user is working in. Everything else (branch naming, commits) is in service of
-// that, so the tests assert it directly.
-
 function gitRepo(): string {
   const root = mkdtempSync(path.join(tmpdir(), 'evolve-'));
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
@@ -36,13 +32,11 @@ test('an iteration lands on its own branch and leaves the checkout alone', async
   assert.equal(begin.data.branch, 'self/faster-startup');
   assert.ok(existsSync(worktree));
 
-  // The agent edits inside the worktree.
   writeFileSync(path.join(worktree, 'feature.txt'), 'hello\n');
   const commit = await new EvolveCommitTool().execute({ message: 'feat: add a feature' }, ctx());
   assert.equal(commit.success, true, commit.error);
   assert.deepEqual(commit.data.files, ['feature.txt']);
 
-  // The user's checkout never saw it.
   assert.equal(existsSync(path.join(repo, 'feature.txt')), false);
   assert.equal(readFileSync(path.join(repo, 'README.md'), 'utf8'), '# base\n');
 
@@ -50,7 +44,6 @@ test('an iteration lands on its own branch and leaves the checkout alone', async
   assert.equal(finish.success, true, finish.error);
   assert.equal(finish.data.pushed, false);
   assert.equal(finish.data.commits, 1);
-  // Still only on the branch.
   assert.equal(existsSync(path.join(repo, 'feature.txt')), false);
 });
 
@@ -79,10 +72,8 @@ test('upstream merge brings the branch forward and keeps local work', async () =
   await new EvolveBeginTool().execute({ slug: 'merge-me', repo }, ctx('m'));
   const worktree: string = (await new EvolveCommitTool().execute({ message: 'x' }, ctx('m'))).error ? '' : '';
 
-  // A local commit on the branch…
   writeFileSync(path.join(repo, '.evolve', 'merge-me', 'local.txt'), 'mine\n');
   await new EvolveCommitTool().execute({ message: 'feat: local work' }, ctx('m'));
-  // …and a new commit upstream.
   writeFileSync(path.join(repo, 'upstream.txt'), 'theirs\n');
   git('add', '-A');
   git('commit', '-q', '-m', 'chore: upstream');

@@ -1,34 +1,13 @@
-/**
- * JAR / Android-container analysis for the `reverse_engineer` tool.
- *
- * Why this exists: `reverse_engineer` used to route `.jar` through `parseZip`,
- * which only listed entry names. Nothing was decompiled, the manifest was
- * ignored, and a nested `META-INF/jars/*.jar` was invisible. So a jar "analysis"
- * returned a file listing and looked, correctly, as though the RE path had not
- * run at all.
- *
- * This module is the self-implemented path (no external decompiler): it reads the
- * JVM class-file constant pool, which yields the class name, superclass,
- * interfaces, field/method names and descriptors, and every class referenced by
- * name. That is the structural map a human reads first, and it works offline.
- * `jadx` is still used when present for full source recovery.
- */
-
 import { inflateRawSync } from 'zlib';
 import { buildZipRead, type ZipReadEntry } from './zip_read.js';
 
 export interface Finding { kind: string; detail: any; }
 
-/** Entries we are willing to inflate while analysing one archive. */
 const MAX_INFLATED_ENTRIES = 400;
-/** Classes parsed per archive (constant-pool parsing is cheap but unbounded input is not). */
 const MAX_CLASSES = 250;
-/** Nested jars followed inside one archive. */
 const MAX_NESTED_JARS = 8;
-/** Bytes per entry we will inflate. A jar bomb is otherwise trivial. */
 const MAX_ENTRY_BYTES = 8 * 1024 * 1024;
 
-/** Return an entry's uncompressed bytes, or null when it is not worth inflating. */
 export function entryBytes(entry: ZipReadEntry): Buffer | null {
   if (entry.size > MAX_ENTRY_BYTES) return null;
   if (entry.method === 0) return entry.data;
@@ -41,7 +20,6 @@ export function entryBytes(entry: ZipReadEntry): Buffer | null {
 }
 
 export interface ClassFileInfo {
-  /** Internal name, e.g. `tech/arrbrants/MioFucker`. */
   name: string;
   superName: string;
   interfaces: string[];
@@ -50,9 +28,7 @@ export interface ClassFileInfo {
   minor: number;
   fields: Array<{ name: string; descriptor: string; access: number }>;
   methods: Array<{ name: string; descriptor: string; access: number }>;
-  /** Classes referenced from the constant pool, de-duplicated and sorted. */
   references: string[];
-  /** Utf8 constants that look like URLs / hosts / paths rather than identifiers. */
   interestingStrings: string[];
 }
 
@@ -77,10 +53,6 @@ const CP_PACKAGE = 20;
 const UTF8_MODIFIED = 2;
 
 function readUtf8(data: Buffer, start: number, length: number): string {
-  // Modified UTF-8 (JVMS 4.4.7) differs from standard UTF-8 only for NUL
-  // (encoded as C0 80) and supplementary characters (surrogate pairs). For the
-  // identifiers and descriptors we extract, a lenient decode is sufficient and
-  // cannot throw.
   try {
     return data.toString('utf8', start, start + length).replace(/\u0000/g, '');
   } catch {
@@ -88,10 +60,6 @@ function readUtf8(data: Buffer, start: number, length: number): string {
   }
 }
 
-/**
- * Parse a JVM class file's constant pool and structure.
- * Returns null for anything that is not a well-formed class file.
- */
 export function parseClassFile(data: Buffer): ClassFileInfo | null {
   if (data.length < 10) return null;
   if (data.readUInt32BE(0) !== 0xcafebabe) return null;
@@ -101,7 +69,6 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
   const count = data.readUInt16BE(8);
   if (count < 1 || count > 0xffff) return null;
 
-  // Constant pool: index 1..count-1. Long/Double occupy two slots.
   const utf8: string[] = new Array(count);
   const classIndex: number[] = new Array(count);
   const stringIndex: number[] = new Array(count);
@@ -128,7 +95,7 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
       case CP_LONG:
       case CP_DOUBLE:
         offset += 8;
-        i++; // takes two slots
+        i++;
         break;
       case CP_CLASS:
       case CP_STRING:
@@ -156,7 +123,6 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
         offset += 3;
         break;
       default:
-        // Unknown tag: the stream is no longer trustworthy.
         return null;
     }
     if (offset > data.length) return null;
@@ -226,8 +192,6 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
   const references = new Set<string>();
   const addReference = (candidate: string) => {
     if (!candidate || candidate === className(thisClass)) return;
-    // Array types (`[B`, `[J`, `[Ljava/lang/Class;`) are Class entries too, but
-    // they say nothing about what the class talks to.
     if (candidate.startsWith('[')) return;
     references.add(candidate);
   };
@@ -238,7 +202,6 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
     const pair = nameAndType[i];
     if (!pair) continue;
     const descriptor = utf8[pair[1]] || '';
-    // A method descriptor embeds its parameter/return types: Lfoo/Bar;.
     for (const match of descriptor.matchAll(/L([\w$/]+);/g)) addReference(match[1]);
   }
 
@@ -267,12 +230,11 @@ export function parseClassFile(data: Buffer): ClassFileInfo | null {
   };
 }
 
-/** Parse `META-INF/MANIFEST.MF` into its main-section attributes. */
 export function parseManifest(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   let lastKey = '';
   for (const rawLine of text.split(/\r?\n/)) {
-    if (!rawLine.trim()) break; // end of the main section
+    if (!rawLine.trim()) break;
     if (/^\s/.test(rawLine) && lastKey) {
       out[lastKey] += rawLine.trim();
       continue;
@@ -286,10 +248,7 @@ export function parseManifest(text: string): Record<string, string> {
   return out;
 }
 
-/** Markers that mean the payload is deliberately protected. */
 const PROTECTION_MARKERS = [
-  // The observed mod ships `.PROTECTED BY ARRSHIELD.class`; the product name is
-  // spelled with and without the space depending on the file.
   'ARR SHIELD',
   'ARRSHIELD',
   'PROTECTED BY',
@@ -321,7 +280,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
   const nestedJars = entries.filter((entry) => /\.jar$/i.test(entry.name));
   const manifestEntry = entries.find((entry) => /^META-INF\/MANIFEST\.MF$/i.test(entry.name));
 
-  // --- manifest -------------------------------------------------------------
   if (manifestEntry) {
     const bytes = entryBytes(manifestEntry);
     if (bytes) {
@@ -332,7 +290,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
         'Fabric-Loom-Version', 'Fabric-Minecraft-Version', 'Fabric-Loader-Version'];
       const picked: Record<string, string> = {};
       for (const key of wanted) if (attributes[key]) picked[key] = attributes[key];
-      // Fabric/Mixin metadata is useful even when it is not on the wanted list.
       for (const [key, value] of Object.entries(attributes)) {
         if (/^(Fabric|Mixin|Automatic-Module-Name)/i.test(key) && !picked[key]) picked[key] = value;
       }
@@ -340,7 +297,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
     }
   }
 
-  // --- mod / plugin descriptors --------------------------------------------
   for (const name of ['fabric.mod.json', 'quilt.mod.json', 'plugin.yml', 'paper-plugin.yml', 'mods.toml', 'META-INF/neoforge.mods.toml']) {
     const entry = entries.find((candidate) => candidate.name === name);
     if (!entry) continue;
@@ -376,7 +332,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
     }
   }
 
-  // --- class files ----------------------------------------------------------
   if (classes.length) {
     const parsed: ClassFileInfo[] = [];
     for (const entry of classes.slice(0, MAX_CLASSES)) {
@@ -394,7 +349,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
           count: classes.length,
           parsed: parsed.length,
           classVersions: versions,
-          // A short structural map: the classes a human reads first.
           summary: parsed.slice(0, 120).map((info) => ({
             name: info.name,
             extends: info.superName || undefined,
@@ -405,7 +359,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
         },
       });
 
-      // Entry points named in the mod descriptor are the interesting ones.
       const manifestBytes = manifestEntry ? entryBytes(manifestEntry) : null;
       const manifest = manifestBytes ? parseManifest(manifestBytes.toString('utf8')) : {};
       const entryPoints = new Set<string>();
@@ -425,8 +378,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
         }
       }
 
-      // Bytecode-level class references, which is how you find what a class
-      // actually talks to when the source is absent.
       const referenced = new Set<string>();
       for (const info of parsed) for (const ref of info.references) referenced.add(ref);
       const external = [...referenced]
@@ -442,14 +393,12 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
     }
   }
 
-  // --- protection / obfuscation markers ------------------------------------
   const allText = buffer.toString('latin1');
   const detected = PROTECTION_MARKERS.filter((marker) => allText.includes(marker));
   if (detected.length) {
     findings.push({ kind: `${label}.protection`, detail: { markers: detected, note: 'class names/strings may be encrypted or renamed' } });
   }
 
-  // A cluster of opaque binaries is the signature of an encrypted payload.
   const opaque = entries.filter((entry) => /\.bin$/i.test(entry.name));
   if (opaque.length >= 5) {
     findings.push({
@@ -462,7 +411,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
     });
   }
 
-  // --- nested jars ----------------------------------------------------------
   if (nestedJars.length && depth < 1) {
     const names: string[] = [];
     for (const entry of nestedJars.slice(0, MAX_NESTED_JARS)) {
@@ -475,7 +423,6 @@ function analyseArchive(buffer: Buffer, findings: Finding[], label: string, dept
   }
 }
 
-/** Analyse a JAR/APK/ZIP-shaped container. */
 export function analyzeJar(buffer: Buffer, findings: Finding[], label = 'jar'): void {
   analyseArchive(buffer, findings, label);
 }

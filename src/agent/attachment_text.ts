@@ -1,23 +1,5 @@
-/**
- * Turn an attached file into text the model can actually read.
- *
- * Images and plain text used to be the only uploads that reached the model;
- * everything else was reduced to "name (mime, size)", so a PDF, spreadsheet or
- * slide deck was effectively unreadable even though its bytes had just been
- * downloaded. This module extracts text without adding a dependency:
- *
- *   .doc/.docx                word-extractor (already a dependency)
- *   .xlsx/.pptx/.odt/.ods/.odp ZIP + XML (OOXML/ODF are zip containers)
- *   .pdf                      the text layer, best effort
- *
- * Extraction is deliberately conservative: it returns '' rather than mojibake
- * when the result does not look like text, and the caller then falls back to the
- * saved file path so the agent can use a tool instead.
- */
-
 import { inflateRawSync, inflateSync } from 'zlib';
 
-/** Extensions we can turn into text. Anything else gets path-only treatment. */
 const DOCUMENT_EXTENSIONS = new Set([
   'pdf',
   'doc',
@@ -43,12 +25,6 @@ function extensionOf(name: string): string {
   const match = /\.([a-z0-9]+)$/i.exec(name.trim());
   return match ? match[1].toLowerCase() : '';
 }
-
-// --- ZIP reader -------------------------------------------------------------
-//
-// A minimal central-directory reader. Only what the extractor needs: entry names
-// plus their uncompressed bytes, deflate or stored. ZIP64 is ignored (an office
-// document that large is not an attachment).
 
 interface ZipEntry {
   name: string;
@@ -84,23 +60,18 @@ function readZipEntries(buffer: Buffer): ZipEntry[] {
     try {
       entries.push({ name, data: method === 0 ? Buffer.from(raw) : inflateRawSync(raw) });
     } catch {
-      // A corrupt member must not sink the whole document.
     }
   }
   return entries;
 }
 
 function findEocd(buffer: Buffer): number {
-  // The comment field is at most 65535 bytes, so the signature can only be that
-  // far from the end.
   const stop = Math.max(0, buffer.length - 65_557);
   for (let i = buffer.length - 22; i >= stop; i--) {
     if (buffer.readUInt32LE(i) === EOCD_SIGNATURE) return i;
   }
   return -1;
 }
-
-// --- XML to text ------------------------------------------------------------
 
 const ENTITIES: Record<string, string> = {
   amp: '&',
@@ -121,7 +92,6 @@ function decodeEntities(value: string): string {
   });
 }
 
-/** Flatten an XML fragment to text, keeping paragraph/row boundaries. */
 function xmlToText(xml: string): string {
   const withBreaks = xml
     .replace(/<w:p\b[^>]*\/>/g, '\n')
@@ -137,14 +107,11 @@ function xmlToText(xml: string): string {
   return text.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-// --- Office packages --------------------------------------------------------
-
 function extractDocxPackage(buffer: Buffer): string {
   const entries = readZipEntries(buffer);
   const pick = (name: string): string => entries.find((entry) => entry.name === name)?.data.toString('utf8') ?? '';
   const body = pick('word/document.xml');
   if (body) return xmlToText(body);
-  // Fall back to every part that looks like document text.
   return entries
     .filter((entry) => /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(entry.name))
     .map((entry) => xmlToText(entry.data.toString('utf8')))
@@ -157,7 +124,6 @@ function extractSpreadsheet(buffer: Buffer): string {
   const shared = new Map<number, string>();
   const sharedXml = entries.find((entry) => entry.name === 'xl/sharedStrings.xml')?.data.toString('utf8');
   if (sharedXml) {
-    // Each <si> is one string; a rich-text run may split it across several <t>.
     const items = sharedXml.match(/<si\b[\s\S]*?<\/si>/g) ?? [];
     items.forEach((item, index) => {
       const text = (item.match(/<t\b[^>]*>([\s\S]*?)<\/t>/g) ?? [])
@@ -191,7 +157,6 @@ function extractSpreadsheet(buffer: Buffer): string {
       if (cells.some(Boolean)) rows.push(cells.join('\t').replace(/\t+$/, ''));
     }
     if (rows.length) {
-      // `xl/worksheets/sheet3.xml` is "Sheet 3" to a reader.
       const number = /sheet(\d+)/.exec(sheet.name)?.[1];
       blocks.push(`# Sheet ${number ?? 1}\n${rows.join('\n')}`);
     }
@@ -219,9 +184,6 @@ function extractOdf(buffer: Buffer): string {
   return content ? xmlToText(content) : '';
 }
 
-// --- PDF --------------------------------------------------------------------
-
-/** Read a PDF literal string starting at `(`; returns the decoded value. */
 function readPdfLiteral(source: string, start: number): { value: string; next: number } {
   let depth = 0;
   let out = '';
@@ -239,7 +201,7 @@ function readPdfLiteral(source: string, start: number): { value: string; next: n
         out += String.fromCharCode(parseInt(octal, 8));
         i += octal.length;
       } else if (next === '\n' || next === '\r') {
-        i += 1; // line continuation
+        i += 1;
       } else {
         out += next;
         i += 1;
@@ -268,15 +230,12 @@ function readPdfHex(source: string, start: number): { value: string; next: numbe
   const hex = source.slice(start + 1, end).replace(/[^0-9a-fA-F]/g, '');
   const bytes: number[] = [];
   for (let i = 0; i + 1 < hex.length; i += 2) bytes.push(parseInt(hex.slice(i, i + 2), 16));
-  // Two-byte codes are common (CID fonts); UTF-16BE decoding is a better guess
-  // than latin1 and is validated by the caller's quality gate.
   const text = hex.length % 4 === 0 && hex.length > 2
     ? Buffer.from(hex, 'hex').swap16().toString('utf16le')
     : Buffer.from(bytes).toString('latin1');
   return { value: text, next: end + 1 };
 }
 
-/** Collect the strings shown by Tj/TJ/'/" inside one decoded content stream. */
 function pdfContentText(content: string): string {
   let out = '';
   const pending: string[] = [];
@@ -296,7 +255,7 @@ function pdfContentText(content: string): string {
       continue;
     }
     if (ch === '<' && content[i + 1] === '<') {
-      i += 2; // dictionary
+      i += 2;
       continue;
     }
     if (/[A-Za-z'"]/.test(ch)) {
@@ -331,9 +290,6 @@ function extractPdfText(buffer: Buffer): string {
     const header = source.slice(Math.max(0, match.index - 800), match.index);
     if (!/\/FlateDecode/.test(header) && !/\bTj\b|\bTJ\b/.test(source.slice(start, end))) continue;
     const raw = Buffer.from(source.slice(start, end), 'latin1');
-    // Most producers compress content streams, but an uncompressed one is valid
-    // (and is what hand-written/test PDFs look like), so a failed inflate is not
-    // a reason to skip the stream.
     let decoded: string | null = null;
     try {
       decoded = inflateSync(raw).toString('latin1');
@@ -353,19 +309,11 @@ function extractPdfText(buffer: Buffer): string {
   return joined.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-// --- Entry point ------------------------------------------------------------
-
 export interface ExtractedText {
-  /** Extracted text, or '' when nothing usable came out. */
   text: string;
-  /** Human-readable note when extraction failed or was skipped. */
   note?: string;
 }
 
-/**
- * Extract text from a document buffer. Never throws: a parser failure becomes a
- * `note`, and the caller keeps the saved file path as the fallback.
- */
 export async function extractDocumentText(
   filePath: string,
   name: string,
@@ -375,8 +323,6 @@ export async function extractDocumentText(
   const ext = extensionOf(name) || extensionOf(filePath);
   try {
     if (ext === 'doc' || ext === 'dot' || ext === 'wps' || ext === 'docx') {
-      // word-extractor handles both the OOXML and the legacy binary formats and
-      // is already a dependency (used by workspace_extract_text).
       // @ts-ignore - word-extractor ships no type declarations
       const WordExtractor = (await import('word-extractor')).default;
       const document = await new WordExtractor().extract(filePath);
@@ -396,13 +342,6 @@ export async function extractDocumentText(
   }
 }
 
-/**
- * Reject output that is not really text.
- *
- * A scanned PDF or a CID-keyed CJK font yields glyph garbage rather than
- * nothing; inlining that would poison the prompt worse than saying "no text".
- * The bar is low but decisive: enough printable characters and few controls.
- */
 function gate(text: string, failureNote: string): ExtractedText {
   const trimmed = text.trim();
   if (trimmed.length < 24) return { text: '', note: failureNote };

@@ -1,8 +1,3 @@
-/**
- * Pure helpers shared by the tool suite. Kept free of imports from `tools.ts`
- * so concrete tool modules can use them without an import cycle.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -31,8 +26,6 @@ export function limitOutput(value: string): { text: string; truncated: boolean }
   return { text: `${value.slice(0, MAX_OUTPUT)}\n\n[output truncated]`, truncated: true };
 }
 
-// Above this many characters a command's output is spilled to a file and only a
-// preview is returned, so the model can read the rest in chunks (ZCode-style).
 const SPILL_THRESHOLD = Number(process.env.OKAY_AGENT_OUTPUT_SPILL_BYTES || 30_000);
 
 export async function spillOutput(value: string, taskId: string, label: string): Promise<{ text: string; truncated: boolean; fullPath?: string }> {
@@ -41,7 +34,6 @@ export async function spillOutput(value: string, taskId: string, label: string):
   try {
     const dir = path.join(os.tmpdir(), '0kay-agent-output');
     await fs.mkdir(dir, { recursive: true });
-    // A random suffix keeps parallel commands from overwriting each other's spill files.
     const file = path.join(dir, `${(taskId || 'task').replace(/[^\w.-]+/g, '_')}-${label}-${randomUUID()}.log`);
     await fs.writeFile(file, value, 'utf8');
     return { text: `${capped.text}\n\n[full ${label} (${value.length} chars) saved to ${file}]`, truncated: true, fullPath: file };
@@ -103,8 +95,6 @@ export function simpleDiff(filePath: string, original: string, updated: string):
   const oldLines = original.split(/\r?\n/); const newLines = updated.split(/\r?\n/);
   const limit = 400; const out = [`--- a/${filePath}`, `+++ b/${filePath}`];
   const max = Math.max(oldLines.length, newLines.length);
-  // Aligned comparison (writes are positional): group consecutive changes into a
-  // hunk and emit `@@ -old +new @@` so the UI can show the changed line numbers.
   let oldNo = 1, newNo = 1, inHunk = false;
   for (let i = 0; i < max && out.length < limit; i++) {
     const before = oldLines[i]; const after = newLines[i];
@@ -119,20 +109,12 @@ export function simpleDiff(filePath: string, original: string, updated: string):
 
 export { MAX_OUTPUT, MAX_FILE_BYTES };
 
-/**
- * Fetch a URL through Core's egress proxy, falling back to a direct fetch when
- * Core is unreachable (e.g. running a tool standalone). The egress proxy is the
- * preferred path because it enforces the plugin's allow-list; the fallback keeps
- * the web tools usable in local/dev contexts.
- */
 export async function egressOrDirect(url: string, options: RequestInit = {}, timeoutMs = 60000): Promise<Response> {
   const { egressFetch } = await import('../connection.js');
   try {
     return await egressFetch(url, options, timeoutMs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // Only fall back when the failure is Core being unreachable, not an egress
-    // policy denial or an upstream HTTP error.
     if (!/egress HTTP|not allowed|blocked/i.test(message)) {
       const timeout = AbortSignal.timeout(timeoutMs);
       const signal = options.signal ? AbortSignal.any([timeout, options.signal]) : timeout;

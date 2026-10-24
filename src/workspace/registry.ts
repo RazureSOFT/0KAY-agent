@@ -1,25 +1,3 @@
-/**
- * Workspace entity registry, ported from deepseek-harness's
- * `@deepseek-ai/dsh-workspace`.
- *
- * A workspace is a stable generated id over an existing directory whose
- * `fs.realpath` canonical string is the single uniqueness rule, a display
- * title (defaults to the directory basename; duplicates allowed), and an
- * ordered account of session ids validated against the session's canonical
- * cwd. Registry order is durable; deleting only drops the registration (the
- * directory, user files and session logs are never touched) and its sessions
- * fall into Ungrouped. Archiving is a registry-global set layered over that
- * accounting, so an archived session keeps its slot and can be restored.
- *
- * State is one atomically-written JSON file under the agent data dir
- * (AGENT_DATA_DIR || ./data/agent): `{ version, state, workspaces }`, where
- * `state` carries the authoritative order, the archive set, the one-time
- * `initialized` bootstrap marker and the crash-recovery `pendingMutation`.
- *
- * Managed through the `workspace_admin` direct tool
- * (list/create/get/resolve/delete/reorder/rename/attach/detach/status/archive).
- */
-
 import { randomUUID } from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -27,7 +5,6 @@ import * as path from 'path';
 export type WorkspaceId = string;
 
 export interface WorkspaceRecord {
-  /** Canonical (`fs.realpath`) absolute directory; the uniqueness key. */
   path: string;
   title: string;
   sessionIds: string[];
@@ -35,15 +12,12 @@ export interface WorkspaceRecord {
   updatedAt: string;
 }
 
-/** One stored session's identity facts, as read from the host's session store. */
 export interface SessionHeader {
   id: string;
-  /** Working directory captured with the session; the membership check uses it. */
   cwd?: string;
   createdAt?: string;
 }
 
-/** Host-provided session facts; the registry never stores session bodies. */
 export interface SessionSource {
   list(): Promise<SessionHeader[]>;
   get(id: string): Promise<SessionHeader | undefined>;
@@ -67,7 +41,6 @@ interface RegistryFile {
   workspaces: Record<WorkspaceId, WorkspaceRecord>;
 }
 
-/** A reorder named a source or anchor absent from the durable registry order. */
 export class WorkspaceOrderInvalidError extends Error {
   constructor(readonly workspaceId: WorkspaceId) {
     super(`cannot reorder unknown workspace '${workspaceId}'`);
@@ -75,7 +48,6 @@ export class WorkspaceOrderInvalidError extends Error {
   }
 }
 
-/** An insertSessionBefore request named a session or anchor not on the account. */
 export class WorkspaceMoveInvalidError extends Error {
   constructor(message: string) {
     super(message);
@@ -83,7 +55,6 @@ export class WorkspaceMoveInvalidError extends Error {
   }
 }
 
-/** An archiveSession request named a session the host does not know. */
 export class WorkspaceUnknownSessionError extends Error {
   constructor(readonly sessionId: string) {
     super(`cannot archive session '${sessionId}': no such session`);
@@ -94,16 +65,10 @@ export class WorkspaceUnknownSessionError extends Error {
 const sameIds = (left: readonly string[], right: readonly string[]): boolean =>
   left.length === right.length && left.every((id, index) => id === right[index]);
 
-/** Canonicalize a directory path through `fs.realpath` (the single identity rule). */
 export async function realpathNormalize(rawPath: string): Promise<string> {
   return fs.realpath(path.resolve(String(rawPath)));
 }
 
-/**
- * One workspace: a stable id, its canonical directory, a display title and a
- * manually ordered account of sessions. Mutations funnel through the registry
- * so validation, pruning, `updatedAt` stamping and durability happen once.
- */
 export class Workspace {
   private record: WorkspaceRecord;
 
@@ -120,22 +85,14 @@ export class Workspace {
   get createdAt(): string { return this.record.createdAt; }
   get updatedAt(): string { return this.record.updatedAt; }
 
-  /** Header-validated sessions in manual order (canonical cwd must equal `path`). */
   get sessionIds(): readonly string[] {
     return this.record.sessionIds.filter((id) => this.registry.sessionPath(id) === this.record.path);
   }
 
-  /** Replace the display title durably. */
   async setTitle(title: string): Promise<void> {
     this.record = await this.registry.updateRecord(this.id, (record) => ({ ...record, title: String(title).trim() || record.title }));
   }
 
-  /**
-   * Prepend a session to this workspace's account. An explicit `cwd` is used
-   * when the caller already knows it, otherwise the host session store is
-   * consulted. The canonical cwd must resolve to an existing directory equal
-   * to {@link path}; unknown/invalid/mismatched sessions reject without writing.
-   */
   async attachSession(sessionId: string, cwd?: string): Promise<void> {
     const resolved = cwd ?? (await this.registry.readSessionCwd(sessionId));
     if (resolved == null) {
@@ -156,16 +113,11 @@ export class Workspace {
       record.sessionIds.includes(sessionId) ? record : { ...record, sessionIds: [sessionId, ...record.sessionIds] });
   }
 
-  /** Remove a session from this workspace's account. Idempotent; the log is untouched. */
   async detachSession(sessionId: string): Promise<void> {
     this.record = await this.registry.updateRecord(this.id, (record) =>
       record.sessionIds.includes(sessionId) ? { ...record, sessionIds: record.sessionIds.filter((id) => id !== sessionId) } : record);
   }
 
-  /**
-   * Move an accounted session within the manual order, DOM-insertBefore-like:
-   * before `beforeSessionId`, or appended when omitted.
-   */
   async insertSessionBefore(sessionId: string, beforeSessionId?: string): Promise<void> {
     this.record = await this.registry.updateRecord(this.id, (record) => {
       if (!record.sessionIds.includes(sessionId)) throw new WorkspaceMoveInvalidError(`cannot move session '${sessionId}' in workspace '${record.path}': the session is not accounted`);
@@ -178,7 +130,6 @@ export class Workspace {
     });
   }
 
-  /** Live directory check, uncached: `ok` or `missing-dir`. */
   async status(): Promise<'ok' | 'missing-dir'> {
     try {
       return (await fs.stat(this.path)).isDirectory() ? 'ok' : 'missing-dir';
@@ -188,10 +139,6 @@ export class Workspace {
   }
 }
 
-/**
- * Durable workspace registry: workspaces, authoritative order, archive set and
- * header-validated session membership over one atomic JSON file.
- */
 export class WorkspaceRegistry {
   private file: string;
   private sessions: SessionSource | null;
@@ -207,7 +154,6 @@ export class WorkspaceRegistry {
     this.sessions = options.sessions || null;
   }
 
-  /** Load durable state, recover an interrupted mutation, validate and bootstrap once. */
   async init(): Promise<void> {
     if (this.started) return;
     const raw = await fs.readFile(this.file, 'utf8').catch(() => null);
@@ -226,7 +172,6 @@ export class WorkspaceRegistry {
     this.started = true;
   }
 
-  /** Create or reuse a workspace for an existing directory (canonical path is the key). */
   async create(rawPath: string, title?: string): Promise<Workspace> {
     await this.init();
     const canonical = await realpathNormalize(rawPath);
@@ -256,12 +201,10 @@ export class WorkspaceRegistry {
     });
   }
 
-  /** Look up a workspace by id. */
   get(id: WorkspaceId): Workspace | undefined {
     return this.entities.get(id);
   }
 
-  /** All workspaces in durable registry order. */
   list(): Workspace[] {
     return this.state.workspaceIds.map((id) => {
       const entity = this.entities.get(id);
@@ -270,7 +213,6 @@ export class WorkspaceRegistry {
     });
   }
 
-  /** Resolve a workspace by canonical directory without creating one. */
   async resolveByPath(rawPath: string): Promise<Workspace | undefined> {
     await this.init();
     const canonical = await realpathNormalize(rawPath);
@@ -278,7 +220,6 @@ export class WorkspaceRegistry {
     return undefined;
   }
 
-  /** Resolve by id first, then by an exact title match (first in registry order). */
   async resolve(selector: string): Promise<Workspace | undefined> {
     await this.init();
     const value = String(selector ?? '').trim();
@@ -290,10 +231,6 @@ export class WorkspaceRegistry {
     return undefined;
   }
 
-  /**
-   * Delete one registration while retaining its directory and every session.
-   * Unknown ids are a no-op. Its sessions become Ungrouped.
-   */
   async delete(id: WorkspaceId): Promise<boolean> {
     await this.init();
     return this.enqueue(async () => {
@@ -314,10 +251,6 @@ export class WorkspaceRegistry {
     });
   }
 
-  /**
-   * Move one workspace within the durable order, DOM-insertBefore-like: before
-   * `beforeId`, or appended when omitted. Returns the full committed order.
-   */
   async insertBefore(id: WorkspaceId, beforeId?: WorkspaceId): Promise<WorkspaceId[]> {
     await this.init();
     return this.enqueue(async () => {
@@ -335,12 +268,10 @@ export class WorkspaceRegistry {
     });
   }
 
-  /** The registry-global archive set: sessions hidden from every grouping surface. */
   get archivedSessionIds(): readonly string[] {
     return this.state.archivedSessionIds;
   }
 
-  /** Archive one session durably. It must be known; already-archived is a no-op. */
   async archiveSession(sessionId: string): Promise<void> {
     await this.init();
     return this.enqueue(async () => {
@@ -351,12 +282,6 @@ export class WorkspaceRegistry {
     });
   }
 
-  /**
-   * Explicit human move: detach a session from every account and prepend it to
-   * `toId`. Unlike `attachSession` this deliberately skips the cwd==path check,
-   * because a manual cross-workspace move is an explicit override (the session
-   * keeps its own recorded cwd but is filed under the chosen workspace).
-   */
   async moveSession(sessionId: string, toId: WorkspaceId): Promise<void> {
     await this.init();
     return this.enqueue(async () => {
@@ -374,15 +299,12 @@ export class WorkspaceRegistry {
         changed = true;
       }
       if (!changed) return;
-      // Explicit override: re-index the session's canonical path to the target
-      // so the cwd-filtered projection keeps it visible under the new workspace.
       this.rememberSessionPath(sessionId, target.path);
       await this.persist();
       this.rebuildEntities();
     });
   }
 
-  /** Remove a session from the archive set (restores its slot in accounting). */
   async unarchiveSession(sessionId: string): Promise<void> {
     await this.init();
     return this.enqueue(async () => {
@@ -392,24 +314,20 @@ export class WorkspaceRegistry {
     });
   }
 
-  /** Internal: canonical cwd indexed for a session, or undefined. */
   sessionPath(id: string): string | undefined {
     return this.sessionPaths.get(id);
   }
 
-  /** Internal: record a validated canonical cwd after an attach. */
   rememberSessionPath(id: string, canonical: string): void {
     this.sessionPaths.set(id, canonical);
   }
 
-  /** Internal: read a session cwd from the host source (undefined when unknown). */
   async readSessionCwd(id: string): Promise<string | undefined> {
     if (!this.sessions) return undefined;
     const header = await this.sessions.get(id);
     return header?.cwd;
   }
 
-  /** Internal: serialized durable record mutation with pruning + updatedAt. */
   async updateRecord(id: WorkspaceId, fn: (record: WorkspaceRecord) => WorkspaceRecord): Promise<WorkspaceRecord> {
     return this.enqueue(async () => {
       const current = this.workspaces.get(id);
@@ -444,11 +362,10 @@ export class WorkspaceRegistry {
       try {
         const canonical = await realpathNormalize(header.cwd);
         if ((await fs.stat(canonical)).isDirectory()) this.sessionPaths.set(header.id, canonical);
-      } catch { /* cwd does not resolve: stays Ungrouped */ }
+      } catch { }
     }
   }
 
-  /** One-time history bootstrap: group known session cwds into workspaces. */
   private async bootstrap(): Promise<void> {
     const headers = this.sessions ? await this.sessions.list() : [];
     const groups = new Map<string, SessionHeader[]>();
@@ -475,7 +392,6 @@ export class WorkspaceRegistry {
     await this.persist();
   }
 
-  /** Complete the single mutation named by a durable pending marker. */
   private async recoverPendingMutation(): Promise<void> {
     const pending = this.state.pendingMutation;
     if (!pending) return;
@@ -488,7 +404,6 @@ export class WorkspaceRegistry {
     await this.persist();
   }
 
-  /** One path owner, one session owner, order matches the table. */
   private validate(): void {
     const order = new Set<WorkspaceId>();
     for (const id of this.state.workspaceIds) {

@@ -1,12 +1,3 @@
-/**
- * Structured task handoff — a 0kay adaptation of Tianshu-harness's /handoff.
- *
- * Where the existing agent handoff is a small JSON blob for in-run compaction,
- * this renders a durable, human-readable handoff document (goal / result /
- * artifacts / evidence / blockers / next) that can be archived and injected
- * into a later session. Pure and dependency-free.
- */
-
 export interface HandoffArtifact {
   path: string;
   usage?: string;
@@ -29,7 +20,6 @@ function clip(text: string, max: number): string {
   return value.length > max ? `${value.slice(0, max)}\n…(truncated)` : value;
 }
 
-/** Render a structured handoff document as markdown. */
 export function buildHandoffDoc(input: HandoffInput): string {
   const when = new Date(input.createdAt ?? Date.now()).toISOString();
   const lines: string[] = [];
@@ -79,10 +69,6 @@ export function buildHandoffDoc(input: HandoffInput): string {
   return lines.join('\n');
 }
 
-/**
- * Convert the compact JSON handoff the agent already produces into a HandoffInput
- * (so both stay in sync). Unknown/missing fields degrade gracefully.
- */
 export function fromHandoffJson(taskId: string, prompt: string, json: string): HandoffInput {
   let parsed: any = {};
   try {

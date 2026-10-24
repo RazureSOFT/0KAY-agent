@@ -51,7 +51,6 @@ test('computeruse live view is gated and reports status without capturing', asyn
   const status = JSON.parse((await agent.runDirect('computeruse_status', '{}')).result);
   assert.equal(status.enabled, false);
   assert.equal(status.supported, ['win32', 'darwin', 'linux'].includes(process.platform));
-  // While disabled the frame tool must not capture the screen.
   const frame = JSON.parse((await agent.runDirect('computeruse_frame', '{}')).result);
   assert.equal(frame.running, false);
   assert.equal(frame.enabled, false);
@@ -240,13 +239,11 @@ test('workspace_admin manages dsh-style workspaces and tasks resolve them', asyn
     const listed = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'list' }))).result);
     assert.equal(listed.workspaces.length, 1);
     assert.equal(listed.workspaces[0].exists, true);
-    // Legacy `projects_admin` alias still resolves by title (case-insensitive).
     const used = JSON.parse((await agent.runDirect('projects_admin', JSON.stringify({ action: 'use', name: 'demo app' }))).result);
     assert.equal(used.path, await fs.realpath(dir));
     const persisted = JSON.parse(await fs.readFile(path.join(dir, 'data', 'workspaces.json'), 'utf8'));
     assert.equal(persisted.state.initialized, true);
     assert.equal(persisted.state.workspaceIds.length, 1);
-    // realpath is the identity rule: a symlink to the same directory reuses the record.
     const link = path.join(os.tmpdir(), `0kay-ws-link-${Date.now()}`);
     await fs.symlink(dir, link, 'junction');
     try {
@@ -260,18 +257,15 @@ test('workspace_admin manages dsh-style workspaces and tasks resolve them', asyn
     } finally {
       await fs.rm(link, { recursive: true, force: true });
     }
-    // Session accounting: attach validates canonical cwd equals the workspace path.
     await agent.runDirect('workspace_admin', JSON.stringify({ action: 'attach', name: 'Demo App', session: 'sess-1', cwd: dir }));
     const attached = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'get', name: 'Demo App' }))).result);
     assert.deepEqual(attached.workspace.sessionIds, ['sess-1']);
     const badAttach = await agent.runDirect('workspace_admin', JSON.stringify({ action: 'attach', name: 'Demo App', session: 'sess-bad', cwd: os.tmpdir() }));
     assert.equal(badAttach.success, false);
-    // Archive is a registry-global set; unknown sessions are rejected.
     const archived = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'archive', session: 'sess-1' }))).result);
     assert.deepEqual(archived.archived, ['sess-1']);
     const badArchive = await agent.runDirect('workspace_admin', JSON.stringify({ action: 'archive', session: 'nope' }));
     assert.equal(badArchive.success, false);
-    // Rename keeps the registration; reorder is DOM insertBefore semantics.
     await agent.runDirect('workspace_admin', JSON.stringify({ action: 'rename', name: 'Demo App', to: 'Demo' }));
     const second = path.join(dir, 'second');
     await fs.mkdir(second);
@@ -280,7 +274,6 @@ test('workspace_admin manages dsh-style workspaces and tasks resolve them', asyn
     assert.deepEqual(reordered.order, ['Second', 'Demo']);
     const status = JSON.parse((await agent.runDirect('workspace_admin', JSON.stringify({ action: 'status', name: 'Demo' }))).result);
     assert.equal(status.status, 'ok');
-    // A task started with a workspace title runs inside it and attaches its session.
     let request: any;
     (agent as any).mocr = {
       async *generate(value: any) { if (value.toolChoice !== 'none') request = value; yield { chunk: 'ok', done: true }; },
@@ -485,7 +478,6 @@ test('computeruse exposes every action and rejects unknown ones', async () => {
   for (const delta of [0, 21, -21, 0.5, '1']) {
     assert.equal((await tool.execute({ action: 'scroll', delta })).success, false);
   }
-  // Drag without an end point is rejected before any native input is sent.
   assert.equal((await tool.execute({ action: 'drag', x: 10, y: 10 })).success, false);
 });
 
@@ -507,7 +499,6 @@ test('attachment metadata becomes inlined text and multimodal image parts', asyn
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address() as { port: number };
-  // Attachment URLs resolve against the Core base, so point Core at the mock.
   const savedCoreHttp = process.env.CORE_HTTP_ADDR;
   process.env.CORE_HTTP_ADDR = `http://127.0.0.1:${address.port}`;
   try {
@@ -519,13 +510,13 @@ test('attachment metadata becomes inlined text and multimodal image parts', asyn
       { name: 'evil.txt', url: 'http://evil.example.com/file.txt', mime: 'text/plain', size: 0 },
     ]), new AbortController().signal);
     assert.match(text, /notes\.txt/);
-    assert.match(text, /```\nATTACH-BYTES\n```/); // text inlined into the prompt
+    assert.match(text, /```\nATTACH-BYTES\n```/);
     assert.match(text, /download failed/);
-    assert.match(text, /evil\.txt .*attachment rejected/); // absolute URL outside Core is refused
+    assert.match(text, /evil\.txt .*attachment rejected/);
     assert.equal(images.length, 1);
     assert.equal(images[0].type, 'image');
     assert.equal(images[0].mimeType, 'image/png');
-    assert.match(images[0].imageUrl || '', /^data:image\/png;base64,/); // image handed straight to the model
+    assert.match(images[0].imageUrl || '', /^data:image\/png;base64,/);
     assert.ok(seen.every((url) => url === '/nope' || url.startsWith('/api/files')), 'no request may leave the Core host');
   } finally {
     if (savedCoreHttp === undefined) delete process.env.CORE_HTTP_ADDR; else process.env.CORE_HTTP_ADDR = savedCoreHttp;
@@ -554,7 +545,7 @@ test('vision fallback retries on the configured vision model when images are rej
 
   calls.length = 0;
   await assert.rejects(async () => {
-    for await (const _chunk of (agent as any).generateWithVisionFallback({ modelId: 'text-x', messages: [{ role: 'user', content: 'hi' }] })) { /* noop */ }
+    for await (const _chunk of (agent as any).generateWithVisionFallback({ modelId: 'text-x', messages: [{ role: 'user', content: 'hi' }] })) { }
   }, /support image/);
   assert.deepEqual(calls, ['text-x']);
 });
@@ -569,7 +560,6 @@ test('agent parses a provider context window and detects overflow', async () => 
   assert.equal((agent as any).mocr.parseContextLength(payload, 'm1'), 131072);
   assert.equal((agent as any).mocr.parseContextLength(payload, ''), 0);
 });
-
 
 test('thinking intensity maps to distinct prompt directives', () => {
   const agent = new Agent();

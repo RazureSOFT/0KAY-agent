@@ -17,12 +17,6 @@ function save(name: string, data: Buffer | string): string {
   return target;
 }
 
-/**
- * Minimal one-page PDF with a real text layer.
- *
- * `compress` exercises both branches of the stream decoder: producers usually
- * Flate-compress content streams, but an uncompressed stream is equally valid.
- */
 function buildPdf(lines: string[], compress: boolean): Buffer {
   const content = `BT /F1 18 Tf 60 760 Td 22 TL\n${lines.map((line) => `(${line}) Tj T*`).join('\n')}\nET`;
   const body = compress ? deflateSync(Buffer.from(content, 'latin1')) : Buffer.from(content, 'latin1');
@@ -31,7 +25,7 @@ function buildPdf(lines: string[], compress: boolean): Buffer {
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
     '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
-    null, // stream object, written as bytes below
+    null,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
   ];
   let out = Buffer.from('%PDF-1.4\n', 'latin1');
@@ -79,9 +73,6 @@ async function extract(name: string, mime: string, data: Buffer): Promise<string
   return text || `«${note}»`;
 }
 
-// Every non-text, non-image upload used to reach the model as "name (mime, size)"
-// only: a PDF or a spreadsheet was unreadable even though its bytes had just
-// been downloaded.
 test('docx text is extracted', async () => {
   const docx = buildDocx({
     title: 'Quarterly report',
@@ -122,8 +113,6 @@ test('pdf text layer is extracted from an uncompressed stream', async () => {
   assert.match(text, /Second line of the page\./);
 });
 
-// A scanned PDF has no text layer. Returning glyph garbage would poison the
-// prompt, so the extractor must say so and let the caller fall back to the path.
 test('a PDF without a text layer reports a note instead of garbage', async () => {
   const pdf = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n', 'latin1');
   const text = await extract('scan.pdf', 'application/pdf', pdf);
@@ -138,10 +127,6 @@ test('a binary container is not treated as a document', () => {
   assert.equal(isDocumentAttachment('x.docx', ''), true);
 });
 
-// The extractor is only useful if the wiring actually reaches it: the bytes are
-// downloaded from Core, written to a scratch file, and the extracted text plus
-// that absolute path end up in the prompt. Before this, the prompt line was just
-// "name (mime, size)".
 test('collectAttachments saves the file and inlines the extracted text', async () => {
   const { Agent } = await import('./agent.js');
   const docx = buildDocx({ title: 'Contract', blocks: [{ type: 'paragraph', text: 'Payment is due in 30 days.' }] });

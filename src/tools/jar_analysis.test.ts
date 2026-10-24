@@ -4,11 +4,6 @@ import { deflateRawSync } from 'zlib';
 import { analyzeJar, entryBytes, parseClassFile, parseManifest } from './jar_analysis.js';
 import { buildZipRead } from './zip_read.js';
 
-/**
- * Build a structurally valid JVM class file. Enough of one for the constant-pool
- * parser: this/super class, one field, one method, and a couple of interesting
- * strings. Hand-built so the test needs no JDK.
- */
 function buildClassFile(options: {
   name?: string;
   superName?: string;
@@ -23,10 +18,9 @@ function buildClassFile(options: {
   const utf8s: string[] = [];
   const addUtf8 = (value: string): number => {
     utf8s.push(value);
-    return utf8s.length; // pool index of the Utf8 (offset by +1 below)
+    return utf8s.length;
   };
 
-  // Reserve pool layout: Utf8 entries first, then Class/NameAndType/Methodref.
   const superUtf8 = addUtf8(superName);
   const thisUtf8 = addUtf8(name);
   const methodUtf8 = addUtf8(methodName);
@@ -34,7 +28,7 @@ function buildClassFile(options: {
   const runtimeUtf8 = addUtf8('java/lang/Runtime');
   const stringUtf8s = interesting.map((value) => addUtf8(value));
 
-  const base = utf8s.length; // next index after the Utf8 block
+  const base = utf8s.length;
   const superClassIdx = base + 1;
   const thisClassIdx = base + 2;
   const runtimeClassIdx = base + 3;
@@ -50,13 +44,13 @@ function buildClassFile(options: {
     const bytes = Buffer.from(value, 'utf8');
     pool.push(Buffer.concat([u1(1), u2(bytes.length), bytes]));
   }
-  pool.push(Buffer.concat([u1(7), u2(superUtf8)]));              // Class super
-  pool.push(Buffer.concat([u1(7), u2(thisUtf8)]));               // Class this
-  pool.push(Buffer.concat([u1(7), u2(runtimeUtf8)]));            // Class Runtime
-  pool.push(Buffer.concat([u1(12), u2(methodUtf8), u2(descriptorUtf8)])); // NameAndType
-  pool.push(Buffer.concat([u1(10), u2(runtimeClassIdx), u2(nameAndTypeIdx)])); // Methodref
+  pool.push(Buffer.concat([u1(7), u2(superUtf8)]));
+  pool.push(Buffer.concat([u1(7), u2(thisUtf8)]));
+  pool.push(Buffer.concat([u1(7), u2(runtimeUtf8)]));
+  pool.push(Buffer.concat([u1(12), u2(methodUtf8), u2(descriptorUtf8)]));
+  pool.push(Buffer.concat([u1(10), u2(runtimeClassIdx), u2(nameAndTypeIdx)]));
   for (const stringUtf8 of stringUtf8s) {
-    pool.push(Buffer.concat([u1(8), u2(stringUtf8)]));           // String
+    pool.push(Buffer.concat([u1(8), u2(stringUtf8)]));
   }
   void stringClassIdxs;
 
@@ -64,17 +58,14 @@ function buildClassFile(options: {
   const count = 1 + pool.length;
 
   const header = Buffer.concat([u2(0xCAFE), u2(0xBABE), u2(0), u2(52), u2(count)]);
-  const classInfo = Buffer.concat([u2(0x0021), u2(thisClassIdx), u2(superClassIdx), u2(0)]); // no interfaces
+  const classInfo = Buffer.concat([u2(0x0021), u2(thisClassIdx), u2(superClassIdx), u2(0)]);
 
-  // one field: private static String key;
   const field = Buffer.concat([u2(0x000A), u2(methodUtf8), u2(descriptorUtf8), u2(0)]);
-  // one method: public void exec(String)
   const method = Buffer.concat([u2(0x0001), u2(methodUtf8), u2(descriptorUtf8), u2(0)]);
 
   return Buffer.concat([header, constantPool, classInfo, u2(1), field, u2(1), method, u2(0)]);
 }
 
-/** Build a ZIP archive with stored (uncompressed) entries. */
 function buildZip(entries: Array<{ name: string; data: Buffer; deflate?: boolean }>): Buffer {
   const locals: Buffer[] = [];
   const centrals: Buffer[] = [];
@@ -90,7 +81,7 @@ function buildZip(entries: Array<{ name: string; data: Buffer; deflate?: boolean
     local.writeUInt16LE(20, 4);
     local.writeUInt16LE(0, 6);
     local.writeUInt16LE(method, 8);
-    local.writeUInt32LE(0, 14); // crc (unchecked by the reader)
+    local.writeUInt32LE(0, 14);
     local.writeUInt32LE(payload.length, 18);
     local.writeUInt32LE(entry.data.length, 22);
     local.writeUInt16LE(nameBytes.length, 26);
@@ -137,7 +128,6 @@ test('parseClassFile reads the structure the analyser needs', () => {
   assert.equal(info.methods.length, 1);
   assert.equal(info.methods[0].name, 'exec');
   assert.equal(info.fields.length, 1);
-  // Referenced classes come from Class entries AND from method descriptors.
   assert.ok(info.references.includes('java/lang/Runtime'));
   assert.ok(info.interestingStrings.includes('https://example.test/beacon'));
 });
@@ -145,7 +135,6 @@ test('parseClassFile reads the structure the analyser needs', () => {
 test('parseClassFile rejects non-class data instead of throwing', () => {
   assert.equal(parseClassFile(Buffer.from('not a class')), null);
   assert.equal(parseClassFile(Buffer.alloc(0)), null);
-  // Correct magic, truncated body.
   const truncated = buildClassFile().slice(0, 40);
   assert.equal(parseClassFile(truncated), null);
 });
@@ -205,7 +194,6 @@ test('analyzeJar extracts manifest, class structure and entry points', () => {
   assert.equal(classes.detail.parsed, 1);
   assert.equal(classes.detail.summary[0].name, 'tech/arrbrants/MioFucker');
 
-  // The manifest's Main-Class must be surfaced with its methods.
   const entrypoint = findings.find((finding) => finding.kind === 'jar.entrypoint');
   assert.ok(entrypoint, 'Main-Class should be reported as an entry point');
   assert.ok(entrypoint!.detail.methods.some((method: string) => method.startsWith('exec')));
@@ -230,7 +218,6 @@ test('analyzeJar follows a nested jar and analyses its classes', () => {
   const nested = findings.find((finding) => finding.kind === 'jar.nested')!;
   assert.deepEqual(nested.detail, ['META-INF/jars/mio.jar']);
 
-  // The nested archive's class is parsed, not just listed.
   const nestedClasses = findings.find((finding) => finding.kind === 'jar.nested:META-INF/jars/mio.jar.classes');
   assert.ok(nestedClasses, `got: ${findings.map((f) => f.kind).join(', ')}`);
   assert.equal(nestedClasses!.detail.summary[0].name, 'com/hidden/Payload');
@@ -247,7 +234,6 @@ test('analyzeJar reports protection markers and opaque payloads', () => {
 
   const protection = findings.find((finding) => finding.kind === 'jar.protection');
   assert.ok(protection, 'ARR SHIELD marker should be reported');
-  // The entry name spells it without a space; both spellings are markers.
   assert.ok(protection!.detail.markers.some((marker: string) => /ARRSHIELD|ARR SHIELD/.test(marker)));
 
   const payload = findings.find((finding) => finding.kind === 'jar.payload');
@@ -258,6 +244,5 @@ test('analyzeJar reports protection markers and opaque payloads', () => {
 test('analyzeJar survives a corrupt archive', () => {
   const findings: Array<{ kind: string; detail: any }> = [];
   analyzeJar(Buffer.from('PK\x03\x04 but not really a zip'), findings);
-  // Must not throw; reporting nothing useful is acceptable, crashing is not.
   assert.ok(Array.isArray(findings));
 });

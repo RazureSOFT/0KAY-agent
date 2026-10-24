@@ -1,13 +1,3 @@
-/**
- * Model bridge for the web/vision tools.
- *
- * Preferred path: the agent injects `context.llm`, which routes through MOCR
- * (the same channel as the main loop). When a tool runs without that channel
- * (standalone, or before injection), this falls back to a directly configured
- * provider (OpenAI / Anthropic / Gemini) and finally returns null so the tool
- * uses its deterministic path.
- */
-
 import { egressOrDirect } from './helpers.js';
 import type { ToolContext, LlmMessagePart } from './types.js';
 
@@ -22,8 +12,6 @@ export function pickProvider(env: NodeJS.ProcessEnv = process.env, modelOverride
   return null;
 }
 
-/** Chat through MOCR when the agent injected a model channel, else a direct
- *  provider, else null. `context` is optional so pure helpers can call this. */
 export async function chatVia(context: ToolContext | undefined, messages: ChatMessage[], options: { signal?: AbortSignal; maxTokens?: number; model?: string; temperature?: number; parts?: LlmMessagePart[] } = {}): Promise<string | null> {
   const signal = options.signal || context?.signal;
   if (context?.llm) {
@@ -34,7 +22,7 @@ export async function chatVia(context: ToolContext | undefined, messages: ChatMe
     try {
       const text = await context.llm({ messages: withParts, systemPrompt, maxTokens: options.maxTokens, model: options.model, temperature: options.temperature });
       if (text != null) return text;
-    } catch { /* fall through to a direct provider */ }
+    } catch { }
   }
   return providerChat(messages, { ...options, signal });
 }

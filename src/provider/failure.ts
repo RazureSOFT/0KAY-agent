@@ -1,10 +1,3 @@
-/**
- * Model failure classification, adapted (not copied) from ZCode's
- * failure-classifier: turn any thrown provider/gRPC error into a stable
- * {retryable, reason, retryAfterMs, statusCode} so the retry layer and the
- * agent loop can make consistent decisions.
- */
-
 export type FailureReason =
   | 'cancelled'
   | 'timeout'
@@ -31,21 +24,20 @@ export interface ClassifiedFailure {
 const CONTEXT_EXCEEDED = /context length|context window|maximum context|exceeded.*token|too many tokens|context_exceeded|reduce the length|prompt is too long/i
 const NETWORK = /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|connection refused|connection reset|network error|fetch failed|TLS|certificate/i
 
-// gRPC status codes (numeric) → retry behaviour.
 function classifyGrpcCode(code: number): Omit<ClassifiedFailure, 'message'> | null {
   switch (code) {
-    case 1: // CANCELLED
+    case 1:
       return { reason: 'cancelled', retryable: false }
-    case 4: // DEADLINE_EXCEEDED
+    case 4:
       return { reason: 'timeout', retryable: true }
-    case 8: // RESOURCE_EXHAUSTED
+    case 8:
       return { reason: 'rate-limited', retryable: true }
-    case 10: // ABORTED
+    case 10:
       return { reason: 'server', retryable: true }
-    case 13: // INTERNAL
-    case 15: // DATA_LOSS
+    case 13:
+    case 15:
       return { reason: 'server', retryable: true }
-    case 14: // UNAVAILABLE
+    case 14:
       return { reason: 'network', retryable: true }
     default:
       return null
@@ -88,7 +80,6 @@ function classifyStatus(status: number): Omit<ClassifiedFailure, 'message'> | nu
   }
 }
 
-/** Classify a thrown error into a stable failure descriptor. */
 export function classifyFailure(error: unknown, signal?: AbortSignal): ClassifiedFailure {
   const err = error as { code?: unknown; name?: string; message?: string; statusCode?: number; details?: string } | undefined
   const message = String(err?.message || err?.details || error || 'model request failed')
@@ -106,7 +97,6 @@ export function classifyFailure(error: unknown, signal?: AbortSignal): Classifie
     return { reason: 'context-exceeded', retryable: false, message }
   }
 
-  // gRPC numeric status codes.
   if (typeof err?.code === 'number') {
     const classified = classifyGrpcCode(err.code)
     if (classified) return { ...classified, message }

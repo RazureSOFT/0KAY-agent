@@ -1,20 +1,3 @@
-/**
- * `crawl` tool — full reimplementation of the Scrapy crawl engine + Firecrawl
- * crawl/map features in TypeScript.
- *
- * Features:
- *  - Spider traversal: start URLs, allowedDomains, include/exclude regexes,
- *    maxDepth, maxPages, BFS/DFS, follow modes (links/sitemap/all).
- *  - robots.txt (fuller parser incl. Crawl-delay), autothrottle (adaptive delay
- *    from response latency), concurrency, per-domain limits.
- *  - Duplicate filtering persisted across runs (Scrapy dupefilter + Firecrawl
- *    dedup), plus URL canonicalisation.
- *  - Extraction pipeline: per-page markdown/text/html/links/metadata, plus an
- *    item extractor (schema) that runs over every page (Scrapy Item Pipeline).
- *  - Sitemap discovery & traversal, JS rendering for SPA routes, proxy rotation.
- *  - mapOnly (Firecrawl /map), changeTracking per page, and a run report.
- */
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createHash } from 'crypto';
@@ -35,7 +18,6 @@ function allowedHost(host: string, allowed: Set<string>): boolean {
   return false;
 }
 
-/** Canonicalise a URL for dedup: drop fragment, sort query, strip trailing slash. */
 function canonical(url: string): string {
   try {
     const u = new URL(url);
@@ -137,8 +119,8 @@ export class CrawlTool extends Tool {
       const dedupDir = await ensureDataDir('crawl-dedup');
       const dedupFile = path.join(dedupDir, `${runId}.json`);
       let seen = new Set<string>();
-      try { seen = new Set(JSON.parse(await fs.readFile(dedupFile, 'utf8'))); } catch { /* fresh run */ }
-      const persistDedup = async () => { try { await fs.writeFile(dedupFile, JSON.stringify([...seen]), 'utf8'); } catch { /* best effort */ } };
+      try { seen = new Set(JSON.parse(await fs.readFile(dedupFile, 'utf8'))); } catch { }
+      const persistDedup = async () => { try { await fs.writeFile(dedupFile, JSON.stringify([...seen]), 'utf8'); } catch { } };
 
       const robotsCache = new Map<string, Robots>();
       const robotsRules = async (url: string): Promise<Robots> => {
@@ -146,7 +128,7 @@ export class CrawlTool extends Tool {
         if (robotsCache.has(host)) return robotsCache.get(host)!;
         let rules: Robots = { disallow: [], allow: [] };
         if (!ignoreRobots) {
-          try { const res = await egressOrDirect(`${new URL(url).protocol}//${host}/robots.txt`, { headers: { 'User-Agent': DEFAULT_USER_AGENT }, signal: context.signal }, 15000); if (res.ok) rules = parseRobots(await res.text(), '0kay-agent'); } catch { /* none */ }
+          try { const res = await egressOrDirect(`${new URL(url).protocol}//${host}/robots.txt`, { headers: { 'User-Agent': DEFAULT_USER_AGENT }, signal: context.signal }, 15000); if (res.ok) rules = parseRobots(await res.text(), '0kay-agent'); } catch { }
         }
         robotsCache.set(host, rules);
         return rules;
@@ -174,7 +156,7 @@ export class CrawlTool extends Tool {
           try {
             const res = await egressOrDirect(`${new URL(start).protocol}//${host}/sitemap.xml`, { headers: { 'User-Agent': DEFAULT_USER_AGENT }, signal: context.signal }, 15000);
             if (res.ok) for (const m of (await res.text()).matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) { discovered.add(canonical(m[1])); push(m[1], 1); }
-          } catch { /* no sitemap */ }
+          } catch { }
         }
       }
 
@@ -197,7 +179,7 @@ export class CrawlTool extends Tool {
       const trackChange = async (url: string, markdown: string): Promise<boolean | null> => {
         if (!changeTracking) return null;
         const file = path.join(changeDir, `${createHash('sha1').update(url).digest('hex').slice(0, 16)}.txt`);
-        let previous = ''; try { previous = await fs.readFile(file, 'utf8'); } catch { /* first */ }
+        let previous = ''; try { previous = await fs.readFile(file, 'utf8'); } catch { }
         await fs.writeFile(file, markdown, 'utf8');
         return previous ? previous !== markdown : null;
       };

@@ -1,13 +1,3 @@
-/**
- * Minimal LSP client + tool — a 0kay adaptation of Tianshu-harness's deep LSP
- * integration: language-server definition / references / diagnostics become
- * agent capabilities, and post-edit diagnostics can be fed back into the loop.
- *
- * Dependency-free: speaks LSP (JSON-RPC 2.0, Content-Length framed) over the
- * server's stdio. Servers are resolved from the file extension; a missing
- * server degrades to a clear error rather than throwing.
- */
-
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { readFile } from 'fs/promises';
 import { extname } from 'path';
@@ -19,7 +9,6 @@ export interface LspServerSpec {
   languageId: string;
 }
 
-/** Extension → language server. Commands are looked up on PATH at spawn time. */
 const SERVERS: Record<string, LspServerSpec> = {
   '.ts': { command: 'typescript-language-server', args: ['--stdio'], languageId: 'typescript' },
   '.tsx': { command: 'typescript-language-server', args: ['--stdio'], languageId: 'typescriptreact' },
@@ -34,13 +23,11 @@ export function resolveServerForFile(file: string): LspServerSpec | null {
   return SERVERS[extname(String(file || '')).toLowerCase()] || null;
 }
 
-/** Frame a JSON-RPC payload with a Content-Length header. */
 export function encodeMessage(payload: unknown): string {
   const body = JSON.stringify(payload);
   return `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`;
 }
 
-/** Pull as many complete Content-Length framed messages out of a buffer. */
 export function decodeMessages(buffer: string): { messages: any[]; rest: string } {
   const messages: any[] = [];
   let rest = buffer;
@@ -61,13 +48,11 @@ export function decodeMessages(buffer: string): { messages: any[]; rest: string 
     try {
       messages.push(JSON.parse(body));
     } catch {
-      // Skip a malformed frame rather than desyncing the whole stream.
     }
   }
   return { messages, rest };
 }
 
-/** A live language-server session over stdio. */
 export class LspClient {
   private buffer = '';
   private nextId = 1;
@@ -139,13 +124,11 @@ export class LspClient {
       await this.request('shutdown', null);
       this.notify('exit', null);
     } catch {
-      // Server already gone; fall through to a hard kill.
     }
     this.proc.kill();
   }
 }
 
-/** Agent tool: definition / references / diagnostics for one file. */
 export class LspTool extends Tool {
   get name(): string {
     return 'lsp';
@@ -190,7 +173,6 @@ export class LspTool extends Tool {
       });
 
       if (action === 'diagnostics') {
-        // Diagnostics arrive asynchronously; give the server a brief window.
         await new Promise((resolve) => setTimeout(resolve, 400));
         return ok({ file, diagnostics: client.getDiagnostics(uri) });
       }

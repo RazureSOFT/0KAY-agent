@@ -3,12 +3,6 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import {coreHeaders,coreFetch} from '../connection.js';
 
-/**
- * Drop large base64/image payloads from a tool result before it is recorded.
- * The ledger is polled by the WebUI (short deadlines), so embedding a full
- * computeruse screenshot made /api/tasks multi-megabyte and slow. The file
- * path and geometry are kept; only the inline pixels are removed.
- */
 function redactRecord(value: any, depth = 0): any {
   if (depth > 8 || value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((entry) => redactRecord(entry, depth + 1));
@@ -33,8 +27,6 @@ export class TaskRecorder {
         try { this.pending = JSON.parse(await fs.readFile(this.file, 'utf8')); }
         catch (error: any) {
           if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
-          // A torn write (e.g. NUL bytes after a crash) must not wedge the
-          // recorder: the outbox is disposable, so start over and overwrite.
           if (error.code !== 'ENOENT') console.warn('[Agent] task outbox unreadable, resetting:', error.message);
           this.pending = [];
         }

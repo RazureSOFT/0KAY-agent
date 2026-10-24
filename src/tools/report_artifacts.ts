@@ -13,27 +13,12 @@ interface ArtifactInput {
   description?: unknown;
 }
 
-/** Human-readable size for the chip label; keeps the list scannable. */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/**
- * Declare the deliverables of a turn.
- *
- * The model is asked to call this before its final answer whenever the turn
- * produced files. The Agent page renders the returned list under the answer, so
- * the user gets a clickable summary instead of hunting through the tool log.
- *
- * Two details matter:
- *   - the paths are resolved against the task cwd, because a model often writes
- *     "report.md" when it means "D:\\work\\report.md";
- *   - a path that does not exist is reported back to the model (and dropped from
- *     the list) rather than silently accepted — a list of lies is worse than no
- *     list, and the model gets a chance to correct itself.
- */
 export class ReportArtifactsTool extends Tool {
   get name(): string { return 'report_artifacts'; }
 

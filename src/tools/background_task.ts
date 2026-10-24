@@ -1,10 +1,3 @@
-/**
- * background_task — run long-lived commands without blocking the turn.
- *
- * Actions: start / list / output / kill. Jobs live in this agent process; output
- * is buffered per job (capped) so the model can poll it between other tool calls.
- */
-
 import { spawn, type ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import { Tool, type ToolContext, type ToolResult } from './types.js';

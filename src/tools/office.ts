@@ -1,12 +1,3 @@
-/**
- * Zero-dependency Office document generation.
- *
- * Both .docx and .pptx are OOXML packages: a ZIP container of XML parts. The
- * helper below writes a minimal, spec-valid package (stored, uncompressed ZIP
- * entries) so the Agent can produce documents and slide decks without pulling
- * in python-docx / python-pptx or any npm dependency.
- */
-
 import { deflateRawSync } from 'zlib';
 
 export interface DocBlock {
@@ -30,8 +21,6 @@ export interface DeckSpec {
   slides: SlideSpec[];
 }
 
-// --- minimal ZIP writer -----------------------------------------------------
-
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -53,7 +42,6 @@ interface ZipEntry {
   data: Buffer;
 }
 
-/** Build a ZIP archive; entries are DEFLATE-compressed (method 8). */
 export function buildZip(entries: ZipEntry[]): Buffer {
   const localParts: Buffer[] = [];
   const centralParts: Buffer[] = [];
@@ -69,11 +57,11 @@ export function buildZip(entries: ZipEntry[]): Buffer {
 
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4); // version needed
-    local.writeUInt16LE(0x0800, 6); // UTF-8 name flag
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
     local.writeUInt16LE(method, 8);
-    local.writeUInt16LE(0, 10); // time
-    local.writeUInt16LE(0, 12); // date
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0, 12);
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(size, 18);
     local.writeUInt32LE(raw.length, 22);
@@ -123,20 +111,15 @@ function xmlEscape(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
-    // strip control characters that are illegal in XML 1.0
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
 }
 
 const enc = (value: string): Buffer => Buffer.from(value, 'utf8');
 
-// --- DOCX -------------------------------------------------------------------
-
 function docxParagraph(block: DocBlock): string {
   const text = block.text ?? '';
   const type = block.type || 'paragraph';
   const style = type === 'title' ? 'Title' : type === 'heading' ? 'Heading1' : type === 'subheading' ? 'Heading2' : null;
-  // Bullets reference the numbering list so Word/WPS treat them as real list
-  // items (indentable), not literal "• " text.
   const pPr = type === 'bullet'
     ? '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>'
     : style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : '';
@@ -154,13 +137,11 @@ function docxStyles(): string {
 </w:styles>`;
 }
 
-/** One bullet list definition shared by every bullet paragraph in the document. */
 function docxNumbering(): string {
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="hybridMultilevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/></w:rPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>`;
 }
 
-/** Build a minimal valid .docx from a title and block list. */
 export function buildDocx(spec: DocSpec): Buffer {
   const blocks: DocBlock[] = [];
   if (spec.title && spec.title.trim()) blocks.push({ type: 'title', text: spec.title });
@@ -186,8 +167,6 @@ export function buildDocx(spec: DocSpec): Buffer {
     { name: 'word/numbering.xml', data: enc(docxNumbering()) },
   ]);
 }
-
-// --- PPTX -------------------------------------------------------------------
 
 const EMU_W = 12192000;
 const EMU_H = 6858000;
@@ -221,7 +200,6 @@ function slideXml(slide: SlideSpec, index: number): string {
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr><p:sp><p:nvSpPr><p:cNvPr id="2" name="Title ${index + 1}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="838200" y="365125"/><a:ext cx="10515600" cy="1325563"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>${titlePara}</p:txBody></p:sp><p:sp><p:nvSpPr><p:cNvPr id="3" name="Content ${index + 1}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="838200" y="1825625"/><a:ext cx="10515600" cy="4351338"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>${bodyParas}</p:txBody></p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
 }
 
-/** Build a minimal valid .pptx from a title and slide list. */
 export function buildPptx(spec: DeckSpec): Buffer {
   const slides = (spec.slides || []).filter((s) => s && (String(s.title ?? '').trim() || (s.bullets || []).some((b) => String(b ?? '').trim())));
   if (!slides.length) slides.push({ title: spec.title || 'Slide', bullets: [] });
