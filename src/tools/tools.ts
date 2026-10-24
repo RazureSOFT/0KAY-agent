@@ -426,10 +426,18 @@ export class WebSearchTool extends Tool {
   }
 }
 
-function readSearchResults(body: any, limit: number): Array<Record<string, string>> {
+function readSearchResults(body: any, limit: number): Array<Record<string, any>> {
   if (!Array.isArray(body?.results)) return [];
   return body.results.slice(0, limit).map((item: any) => ({
-    title: item.title || '', url: item.url || '', snippet: item.snippet || '', source: item.engine || '',
+    title: item.title || '',
+    url: item.url || '',
+    snippet: item.snippet || '',
+    source: item.engine || '',
+    // Papers come back with the citation parts split out; keep them when the
+    // engine supplied them instead of flattening everything into the snippet.
+    ...(item.authors?.length ? { authors: item.authors } : {}),
+    ...(item.year ? { year: item.year } : {}),
+    ...(item.venue ? { venue: item.venue } : {}),
   }));
 }
 
@@ -947,15 +955,36 @@ export class DocumentTool extends Tool {
       const title = String(args.title ?? '').trim();
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       if (format === 'md' || format === 'txt') {
-        const lines: string[] = [];
-        if (title) lines.push(`# ${title}`);
+        const chunks: string[] = [];
+        if (title) chunks.push(`# ${title}`);
+        let bullets: string[] = [];
+        const flushBullets = () => {
+          if (bullets.length) {
+            chunks.push(bullets.join('\n'));
+            bullets = [];
+          }
+        };
+        // The caller usually repeats the title as the first heading. Print it
+        // once — twice looks like a template that failed.
+        let droppedDuplicateTitle = !title;
         for (const block of blocks) {
-          if (block.type === 'heading') lines.push(`## ${block.text}`);
-          else if (block.type === 'subheading') lines.push(`### ${block.text}`);
-          else if (block.type === 'bullet') lines.push(`- ${block.text}`);
-          else lines.push(block.text);
+          if (!droppedDuplicateTitle && (block.type === 'title' || block.type === 'heading') && block.text.trim() === title.trim()) {
+            droppedDuplicateTitle = true;
+            continue;
+          }
+          if (block.type === 'bullet') {
+            bullets.push(`- ${block.text}`);
+            continue;
+          }
+          flushBullets();
+          if (block.type === 'heading') chunks.push(`## ${block.text}`);
+          else if (block.type === 'subheading') chunks.push(`### ${block.text}`);
+          else chunks.push(block.text);
         }
-        const text = lines.join('\n') + '\n';
+        flushBullets();
+        // Markdown needs a blank line between a paragraph and the next block, or
+        // the renderer glues them into one wall of text.
+        const text = chunks.join('\n\n') + '\n';
         await fs.writeFile(filePath, text, 'utf8');
         return success({ path: filePath, format, bytes: Buffer.byteLength(text), blocks: blocks.length });
       }
