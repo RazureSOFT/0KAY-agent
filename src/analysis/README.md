@@ -65,6 +65,21 @@ The Java script is the only file here that runs inside Ghidra; it uses the
 standard script API (`FunctionManager`, `DataIterator`) and emits nothing but the
 framed JSON.
 
+## The tools they became
+
+| Tool | From | Group |
+|---|---|---|
+| `recon_graph` | ARTEX (assets vs. exploration, `overview` = its graph_overview prefetch, `prove` = prove_goal) | analysis |
+| `validate_finding` | strix (PoC verdict) | analysis |
+| `http_request` | strix (interception proxy, reduced to control over one request) | analysis |
+| `vuln_kb` | strix (CVSS 3.1 base score computed from the vector; OWASP Top 10 mapping) | analysis |
+| `osint` | strix (recon: DNS + edge fingerprint) | analysis |
+| `ghidra_analyze` | Ghidra (`facts` and `decompile`) | analysis |
+
+CVSS is computed, not looked up: a table is wrong the moment the vector is
+unusual, and the arithmetic is published. `vuln_kb` also refuses to guess a
+category when no keyword matches.
+
 ## Tests
 
 All three are testable without the originals: the graph is pure data, the

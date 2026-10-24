@@ -52,7 +52,7 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
 // call just makes the whole agent look broken.
 // Tools that cannot touch the world, so an approval prompt would only be noise.
 // `tools` lists and loads tool groups: it mutates an in-memory set and nothing else.
-const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools', 'recon_graph']);
+const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools', 'recon_graph', 'vuln_kb']);
 
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);

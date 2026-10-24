@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { findGhidra, parseFacts, analyzeBinary, missingGhidraHint } from './ghidra.js'
+import { findGhidra, parseFacts, analyzeBinary, decompileFunction, missingGhidraHint } from './ghidra.js'
 
 // Ghidra is not installed on most machines, so the interesting cases are the
 // ones without it: a clear refusal, and a parser that survives the analyzer's log
@@ -82,4 +82,32 @@ test('the missing-install message says what to do and what still works', () => {
   const hint = missingGhidraHint()
   assert.match(hint, /GHIDRA_HOME/)
   assert.match(hint, /reverse_engineer/)
+})
+
+test('decompileFunction extracts the C between its markers', async () => {
+  const output = [
+    'INFO  analyzing',
+    '0KAY-C-BEGIN',
+    '// main @ 00401000',
+    'undefined4 main(void) { return 0; }',
+    '0KAY-C-END',
+  ].join('\n')
+  const result = await decompileFunction(
+    { home: 'C:\ghidra', headless: 'analyzeHeadless.bat', version: '11.1' },
+    'C:\samples\a.exe',
+    { symbol: 'main', runner: async () => ({ code: 0, stdout: output, stderr: '' }), workDir: process.cwd() },
+  )
+  assert.equal(result.symbol, 'main')
+  assert.match(result.code, /undefined4 main/)
+})
+
+test('a script-level error is surfaced, not swallowed', async () => {
+  await assert.rejects(
+    decompileFunction(
+      { home: 'C:\ghidra', headless: 'analyzeHeadless.bat', version: '11.1' },
+      'C:\samples\a.exe',
+      { symbol: 'nope', runner: async () => ({ code: 0, stdout: '0KAY-ERROR function not found: nope', stderr: '' }), workDir: process.cwd() },
+    ),
+    /function not found: nope/,
+  )
 })

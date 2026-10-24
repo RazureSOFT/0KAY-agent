@@ -2,6 +2,9 @@ import { exec as execCallback, execFile } from 'child_process';
 import { SubAgentTool } from './packages/subagent.js';
 import { ToolsTool } from './packages/tools_meta.js';
 import { ReconGraphTool, ValidateFindingTool, GhidraAnalyzeTool } from './packages/analysis.js';
+import { HttpRequestTool } from './packages/http.js';
+import { VulnKbTool } from './packages/vuln.js';
+import { OsintTool } from './packages/recon.js';
 import { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
@@ -1249,7 +1252,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
-    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(),
+    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(),
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),

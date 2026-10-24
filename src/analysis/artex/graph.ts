@@ -199,6 +199,46 @@ export class ReconGraph {
     return [...this.nodes.values()].filter((node) => node.kind === 'intent' && node.status === 'open')
   }
 
+  /**
+   * The planner's situation report, in one call: how far along we are, what is
+   * open, and what we learned most recently. ARTEX calls this the graph_overview
+   * prefetch — the point is that reading the situation costs one tool call, not
+   * five queries.
+   */
+  overview(limit = 10) {
+    const coverage = this.coverage()
+    const byKind: Record<string, number> = {}
+    for (const asset of this.assets.values()) byKind[asset.kind] = (byKind[asset.kind] || 0) + 1
+    const nodes = [...this.nodes.values()]
+    const recent = nodes.filter((node) => node.kind === 'fact' || node.kind === 'finding').slice(-limit)
+    return {
+      coverage: { total: coverage.total, tested: coverage.tested, untested: coverage.untested.length },
+      assetsByKind: byKind,
+      goals: nodes.filter((node) => node.kind === 'goal').map((node) => ({ id: node.id, text: node.text, status: node.status })),
+      openIntents: this.openIntents().slice(0, limit).map((node) => ({ id: node.id, text: node.text, assets: node.assetIds })),
+      findings: nodes.filter((node) => node.kind === 'finding').length,
+      recent: recent.map((node) => ({ id: node.id, kind: node.kind, text: node.text })),
+    }
+  }
+
+  /**
+   * A goal is proven by evidence, not by assertion. Without a finding anchored to
+   * the same assets the call fails — that is the whole difference between a scan
+   * that finished and a scan that got tired.
+   */
+  prove(goalId: string): ExplorationNode {
+    const goal = this.nodes.get(goalId)
+    if (!goal) throw new Error(`unknown node: ${goalId}`)
+    if (goal.kind !== 'goal') throw new Error(`${goalId} is not a goal (kind: ${goal.kind})`)
+    const targets = new Set(goal.assetIds)
+    const evidence = [...this.nodes.values()].some(
+      (node) => node.kind === 'finding' && node.assetIds.some((assetId) => targets.has(assetId)),
+    )
+    if (!evidence) throw new Error('no finding is anchored to this goal: record one before proving it')
+    goal.status = 'done'
+    return goal
+  }
+
   toJSON() {
     return {
       assets: [...this.assets.values()],

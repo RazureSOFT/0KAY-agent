@@ -1,7 +1,7 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
-import { findGhidra, analyzeBinary, missingGhidraHint } from '../../analysis/ghidra/ghidra.js'
+import { findGhidra, analyzeBinary, decompileFunction, missingGhidraHint } from '../../analysis/ghidra/ghidra.js'
 import { validatePoc, verdictLine } from '../../analysis/strix/validate.js'
 import type { PocSpec } from '../../analysis/strix/validate.js'
 
@@ -20,6 +20,7 @@ export class ReconGraphTool extends Tool {
       'action=add assets:["https://a.example/x","10.0.0.5:443","a.example"] — the kind and parent are inferred, you just submit what you saw.',
       'action=intent opens a direction against assets; action=fact/finding records a result (facts and findings are what mark an asset tested).',
       'action=coverage lists untested assets; action=history shows everything tried against one asset.',
+      'action=overview is the one-call situation report (coverage, open intents, recent facts); action=prove closes a goal and refuses without a finding anchored to it.',
     ].join(' ')
   }
   get parameters(): Record<string, any> {
@@ -27,7 +28,7 @@ export class ReconGraphTool extends Tool {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['add', 'intent', 'fact', 'finding', 'coverage', 'history', 'export'] },
+        action: { type: 'string', enum: ['add', 'intent', 'fact', 'finding', 'coverage', 'history', 'overview', 'prove', 'export'] },
         assets: { type: 'array', items: { type: 'string' }, description: 'Raw observations: URL, host:port, IP, or hostname.' },
         text: { type: 'string', description: 'intent/fact/finding: what it is, in one sentence.' },
         asset: { type: 'string', description: 'history: the asset to look up.' },
@@ -72,10 +73,16 @@ export class ReconGraphTool extends Tool {
             nodes: graph.history(asset.id).map((node) => ({ id: node.id, kind: node.kind, status: node.status, text: node.text })),
           })
         }
+        case 'overview':
+          return success(graph.overview())
+        case 'prove': {
+          const goal = graph.prove(String(args.id || ''))
+          return success({ id: goal.id, status: goal.status, text: goal.text })
+        }
         case 'export':
           return success(graph.toJSON())
         default:
-          throw new Error('action must be add, intent, fact, finding, coverage, history or export')
+          throw new Error('action must be add, intent, fact, finding, coverage, history, overview, prove or export')
       }
     } catch (error) {
       return failure(error)
@@ -139,7 +146,7 @@ export class GhidraAnalyzeTool extends Tool {
   get name(): string { return 'ghidra_analyze'; }
   get description(): string {
     return [
-      'Analyze a binary with a local Ghidra install (headless): function list, decoded strings, sizes.',
+      'Analyze a binary with a local Ghidra install (headless): action=facts lists functions and strings; action=decompile returns the C for one function (symbol or entry address, empty = entry point).',
       'Requires Ghidra with a JDK 17+; set GHIDRA_HOME if it is not in a standard location.',
       'Without Ghidra this reports what is missing instead of guessing — use reverse_engineer for headers, imports and entropy.',
     ].join(' ')
@@ -150,6 +157,8 @@ export class GhidraAnalyzeTool extends Tool {
       required: ['path'],
       properties: {
         path: { type: 'string', description: 'Binary to analyze.' },
+        action: { type: 'string', enum: ['facts', 'decompile'], description: 'facts (default) lists functions and strings; decompile returns C for one function.' },
+        symbol: { type: 'string', description: 'decompile: function name or entry address; empty means the program entry point.' },
         maxFunctions: { type: 'integer', minimum: 1, maximum: 5000 },
         maxStrings: { type: 'integer', minimum: 0, maximum: 2000 },
         timeoutMs: { type: 'integer', minimum: 10000, maximum: 900000 },
@@ -162,6 +171,14 @@ export class GhidraAnalyzeTool extends Tool {
       if (!install) return failure(missingGhidraHint())
       const target = String(args.path || '')
       if (!target) throw new Error('path is required')
+      if (args.action === 'decompile') {
+        const result = await decompileFunction(install, target, {
+          symbol: typeof args.symbol === 'string' ? args.symbol : undefined,
+          timeoutMs: args.timeoutMs,
+          workDir: context.cwd,
+        })
+        return success({ ghidra: install.version, ...result })
+      }
       const report = await analyzeBinary(install, target, {
         maxFunctions: args.maxFunctions,
         maxStrings: args.maxStrings,

@@ -148,6 +148,64 @@ export function parseFacts(stdout: string): GhidraFacts | null {
   }
 }
 
+const C_BEGIN = '0KAY-C-BEGIN'
+const C_END = '0KAY-C-END'
+
+export interface DecompileOptions extends AnalyzeOptions {
+  /** Function name or entry address. Empty means the program entry point. */
+  symbol?: string
+}
+
+export interface Decompilation {
+  binary: string
+  symbol: string
+  code: string
+  elapsedMs: number
+}
+
+/** Decompile one function to C. The script prints the code between two markers. */
+export async function decompileFunction(
+  install: GhidraInstall,
+  binaryPath: string,
+  options: DecompileOptions = {},
+): Promise<Decompilation> {
+  const started = Date.now()
+  const workDir = options.workDir || await fs.mkdtemp(path.join(os.tmpdir(), '0kay-ghidra-dec-'))
+  const projectDir = path.join(workDir, 'project')
+  await fs.mkdir(projectDir, { recursive: true })
+
+  const args = [
+    projectDir,
+    '0kay',
+    '-import', binaryPath,
+    '-scriptPath', scriptPath(),
+    '-postScript', 'DecompileFunction.java', options.symbol || '',
+    '-deleteProject',
+  ]
+
+  const runFn = options.runner || run
+  const result = await runFn(install.headless, args, options.timeoutMs ?? 300_000)
+  const output = `${result.stdout}
+${result.stderr}`
+
+  const failure = /0KAY-ERROR (.+)/.exec(output)
+  if (failure) throw new Error(`Ghidra: ${failure[1].trim()}`)
+
+  const start = output.indexOf(C_BEGIN)
+  const end = output.indexOf(C_END)
+  if (start < 0 || end < start) {
+    const tail = output.trim().split('\n').slice(-10).join('\n')
+    throw new Error(`Ghidra produced no ${C_BEGIN} block. Last output:\n${tail}`)
+  }
+
+  return {
+    binary: binaryPath,
+    symbol: options.symbol || '(entry)',
+    code: output.slice(start + C_BEGIN.length, end).trim(),
+    elapsedMs: Date.now() - started,
+  }
+}
+
 /** What to tell the user when there is no Ghidra, and why it matters. */
 export function missingGhidraHint(): string {
   return [

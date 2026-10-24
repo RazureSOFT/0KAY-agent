@@ -98,3 +98,37 @@ test('provenance survives the round trip', () => {
   assert.deepEqual(finding.derivedFrom, [fact.id])
   assert.ok(graph.toJSON().nodes.some((node) => node.id === finding.id && node.derivedFrom.includes(fact.id)))
 })
+
+test('overview is the whole situation in one call', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('api.example.com')
+  const goal = graph.addNode({ kind: 'goal', text: 'find auth bypass', assets: ['api.example.com'] })
+  graph.addNode({ kind: 'intent', text: 'try default creds', assets: ['api.example.com'] })
+  graph.addNode({ kind: 'fact', text: 'login is at /auth', assets: ['api.example.com'] })
+
+  const overview = graph.overview()
+  assert.equal(overview.coverage.total, 2)
+  assert.equal(overview.coverage.tested, 1)
+  assert.equal(overview.openIntents.length, 1)
+  assert.equal(overview.recent[0].text, 'login is at /auth')
+  assert.deepEqual(overview.goals.map((entry) => entry.id), [goal.id])
+  assert.equal(overview.assetsByKind.root_domain, 1)
+})
+
+test('a goal cannot be proven without a finding anchored to it', () => {
+  const graph = new ReconGraph()
+  const goal = graph.addNode({ kind: 'goal', text: 'prove the login is bypassable', assets: ['api.example.com'] })
+  graph.addNode({ kind: 'fact', text: 'login is at /auth', assets: ['api.example.com'] })
+  assert.throws(() => graph.prove(goal.id), /no finding is anchored/)
+
+  graph.addNode({ kind: 'finding', text: 'auth bypass with empty password', assets: ['api.example.com'] })
+  const proven = graph.prove(goal.id)
+  assert.equal(proven.status, 'done')
+})
+
+test('proving a node that is not a goal is refused', () => {
+  const graph = new ReconGraph()
+  const fact = graph.addNode({ kind: 'fact', text: 'x', assets: ['api.example.com'] })
+  assert.throws(() => graph.prove(fact.id), /is not a goal/)
+  assert.throws(() => graph.prove('nope'), /unknown node/)
+})
