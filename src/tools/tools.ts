@@ -7,6 +7,7 @@ export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { withWindowsShellHint } from './shell_hint.js';
 import { shellChoice } from './shell_choice.js';
+import { compactOutput, compactionNote } from './compact.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -246,6 +247,7 @@ export class GrepTool extends Tool {
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['pattern'], properties: {
       pattern: { type: 'string' }, path: { type: 'string' }, include: { type: 'string', description: 'Optional glob filter, for example *.ts.' },
+      maxMatches: { type: 'integer', minimum: 1, maximum: 500, description: 'How many matches to return (default 200). The response always reports the total and the per-file counts.' },
     }};
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
@@ -254,6 +256,12 @@ export class GrepTool extends Tool {
       const root = args.path ? resolvePath(args.path, context.cwd) : context.cwd;
       const pattern = new RegExp(args.pattern, 'i');
       const include = typeof args.include === 'string' && args.include ? globToRegex(args.include) : null;
+      // 500 matches of a long line is ~50k characters, most of it the same file
+      // repeated. Cap lower, cut each line, and report where the hits are so the
+      // model can narrow the pattern instead of reading a wall of them.
+      const limit = clamp(args.maxMatches, 200, 1, 500);
+      const perFile = new Map<string, number>();
+      let total = 0;
       const matches: Array<{ path: string; line: number; text: string }> = [];
       await walk(root, async (fullPath, relative) => {
         if (include && !include.test(relative)) return true;
@@ -262,12 +270,32 @@ export class GrepTool extends Tool {
         const text = await fs.readFile(fullPath, 'utf8').catch(() => '');
         for (const [index, line] of text.split(/\r?\n/).entries()) {
           pattern.lastIndex = 0;
-          if (pattern.test(line)) matches.push({ path: fullPath, line: index + 1, text: line });
-          if (matches.length >= 500) return false;
+          if (!pattern.test(line)) continue;
+          total++;
+          perFile.set(relative, (perFile.get(relative) || 0) + 1);
+          if (matches.length < limit) {
+            matches.push({
+              path: fullPath,
+              line: index + 1,
+              text: line.length > 400 ? `${line.slice(0, 400)}… (+${line.length - 400} chars)` : line,
+            });
+          }
+          if (total >= 2000) return false;
         }
-        return matches.length < 500;
+        return total < 2000;
       });
-      return success({ root, pattern: args.pattern, matches, truncated: matches.length >= 500 });
+      return success({
+        root,
+        pattern: args.pattern,
+        matches,
+        total,
+        files: [...perFile.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 20)
+          .map(([file, count]) => ({ file, count })),
+        truncated: total > matches.length,
+        ...(total > matches.length ? { note: `showing ${matches.length} of ${total} matches; narrow the pattern or raise maxMatches` } : {}),
+      });
     } catch (error) { return failure(error); }
   }
 }
@@ -375,15 +403,24 @@ export class ShellTool extends Tool {
           context.signal?.addEventListener('abort', cancel, { once: true });
           if (context.signal?.aborted) cancel();
         });
-        const stdout = await spillOutput(result.stdout || '', context.taskId, stdoutLabel);
-        const stderr = await spillOutput(result.stderr || '', context.taskId, stderrLabel);
+        // Spill first (that keeps the full text on disk), then compact what the
+        // model sees. Colour codes and the middle of a long list are most of a
+        // build log's token cost and none of its information.
+        const rawOut = result.stdout || '';
+        const rawErr = result.stderr || '';
+        const stdout = await spillOutput(rawOut, context.taskId, stdoutLabel);
+        const stderr = await spillOutput(rawErr, context.taskId, stderrLabel);
+        const compactOut = compactOutput(rawOut);
+        const compactErr = compactOutput(rawErr, { maxChars: 8_000 });
+        const notes = [compactionNote(compactOut), compactionNote(compactErr)].filter(Boolean) as string[];
         return success({
           command: request.command,
           cwd,
-          stdout: stdout.text,
-          stderr: stderr.text,
+          stdout: compactOut.text,
+          stderr: compactErr.text,
           exitCode: 0,
           truncated: stdout.truncated || stderr.truncated,
+          ...(notes.length ? { outputNotes: notes } : {}),
           fullOutputPath: stdout.fullPath || stderr.fullPath,
           ...(launch ? { sandbox: launch.backend, ...(launch.notes.length ? { sandboxNotes: launch.notes } : {}) } : {}),
         });
@@ -394,7 +431,18 @@ export class ShellTool extends Tool {
           ? withWindowsShellHint(request.command, String(error.stderr || error.message || 'command failed'))
           : String(error.stderr || error.message || 'command failed');
         const stderr = await spillOutput(rawStderr, context.taskId, stderrLabel);
-        return { success: false, data: { command: request.command, cwd, stdout: stdout.text, stderr: stderr.text, exitCode: Number(error.code) || 1 }, error: stderr.text };
+        const compactErr = compactOutput(rawStderr, { maxChars: 8_000 });
+        return {
+          success: false,
+          data: {
+            command: request.command,
+            cwd,
+            stdout: compactOutput(String(error.stdout || '')).text,
+            stderr: compactErr.text,
+            exitCode: Number(error.code) || 1,
+          },
+          error: compactErr.text,
+        };
       }
     } catch (error) { return failure(error); }
   }
