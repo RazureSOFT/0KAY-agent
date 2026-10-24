@@ -184,6 +184,10 @@ export interface AgentSettings {
   enable_slides_tool?: boolean;
   /** Allow the WebUI terminal to run shell commands on this host. */
   enable_terminal?: boolean;
+  /** Self-iteration: edit this repository inside a `self/*` worktree. */
+  self_evolve_enabled?: boolean;
+  /** Repository to evolve; empty = the agent's own checkout. */
+  self_evolve_repo?: string;
   vision_model?: string;
   /** Manual context window in tokens (0 = auto from the provider). */
   context_window?: number;
@@ -288,6 +292,8 @@ export class Agent {
       enable_document_tool: true,
       enable_slides_tool: true,
       enable_terminal: false,
+      self_evolve_enabled: false,
+      self_evolve_repo: '',
       vision_model: '',
       context_window: 0,
       enable_mcp_tool: true,
@@ -338,6 +344,11 @@ export class Agent {
     if (typeof partial.enable_filesystem_tool === 'boolean') {
       this.settings.enable_filesystem_tool = partial.enable_filesystem_tool;
     }
+    if (typeof partial.self_evolve_enabled === 'boolean') {
+      this.settings.self_evolve_enabled = partial.self_evolve_enabled;
+      this.applyToolToggles();
+    }
+    if (typeof partial.self_evolve_repo === 'string') this.settings.self_evolve_repo = partial.self_evolve_repo;
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
     if (typeof partial.enable_browser_tool === 'boolean') this.settings.enable_browser_tool = partial.enable_browser_tool;
@@ -400,9 +411,15 @@ export class Agent {
     return tool === 'computeruse' && ['screenshot', 'listwindows'].includes(String(args?.action || ''));
   }
 
+  /** Register/unregister the optional tools according to the current settings.
+   *  Called on construction and whenever a toggle changes, so flipping a switch
+   *  in the settings pane does not need a restart. */
   private applyToolToggles(): void {
     // Rebuild registry so disabled tools are absent from listTools / call().
     this.tools = createDefaultRegistry(this.skills);
+    if (!this.settings.self_evolve_enabled) {
+      for (const name of ['evolve_begin', 'evolve_commit', 'evolve_upstream', 'evolve_finish']) this.tools.unregister(name);
+    }
     if (!this.settings.enable_filesystem_tool) {
       for (const name of ['read', 'write', 'edit', 'apply_patch', 'glob', 'grep']) this.tools.unregister(name);
     }
@@ -1170,6 +1187,13 @@ export class Agent {
       ? `\n\n${this.skills.contextBlock(taskPrompt || '', forceSkill)}`
       : '';
 
+    // Self-iteration is a workflow, not a single call, so the model needs the
+    // order and the one hard rule: never touch the user's checkout, and never
+    // open a PR without asking.
+    const evolveBlock = this.settings.self_evolve_enabled
+      ? '\n\nSelf-iteration (this repository): call evolve_begin to get a worktree on a self/<slug> branch, edit files ONLY inside that worktree, then evolve_commit. If the base moved, evolve_upstream merges origin/main into the branch and reports conflicts for you to resolve. Finish with evolve_finish — but ask the user first with the question tool whether they want a pull request, and pass open_pr=true only when they said yes. If they decline, the branch stays local and their working checkout is untouched, which is the point.'
+      : '';
+
     if (minimal) {
       return `You are an AI agent that can use tools to complete tasks.
 Host OS: ${process.platform}. Working directory: ${cwd}.
@@ -1179,7 +1203,7 @@ Verify every factual claim against evidence you retrieved and cite its source (f
 
 Available tools:
 ${toolDescriptions}
-${skillBlock}
+${skillBlock}${evolveBlock}
 
 Use native tool calls when your model supports them; batch independent calls. Without native function calling, output exactly one JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}
@@ -1199,7 +1223,7 @@ Verification: back every factual claim with evidence you retrieved (tool result,
 
 Available tools:
 ${toolDescriptions}
-${skillBlock}
+${skillBlock}${evolveBlock}
 
 Use native tool calls when supported; batch independent calls (they run in parallel). Without native function calling, output exactly one JSON object:
 {"tool": "tool_name", "args": {"param": "value"}}

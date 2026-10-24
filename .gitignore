@@ -39,3 +39,6 @@ github_check.py
 
 # Ad-hoc probes left behind by manual debugging (tmp_shot.png, tmp_ocr.txt …).
 /tmp_*
+
+# Self-iteration worktrees (evolve_begin creates one per iteration).
+/.evolve/

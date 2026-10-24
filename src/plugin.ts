@@ -165,6 +165,20 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: 'ExecuteTask 未指定类型时使用',
           },
           {
+            key: 'self_evolve_enabled',
+            type: 'bool',
+            label: '允许自我迭代',
+            defaultValue: 'false',
+            help: '打开后 agent 可以在独立的 git worktree（分支 self/*）里改自己的代码；不提 PR 就只留在分支上，不动你的工作区',
+          },
+          {
+            key: 'self_evolve_repo',
+            type: 'text',
+            label: '自我迭代仓库',
+            defaultValue: '',
+            help: '留空 = agent 自己的仓库；填绝对路径可让它在别的仓库里迭代',
+          },
+          {
             key: 'enable_shell_tool',
             type: 'bool',
             label: 'Shell 工具',
