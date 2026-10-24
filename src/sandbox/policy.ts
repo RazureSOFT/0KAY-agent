@@ -133,8 +133,11 @@ export class SandboxPolicy {
       if (binary === 'go' && sub && !READ_ONLY_GO.has(sub)) {
         return { allowed: false, reason: `sandbox is read-only: "go ${sub}" is not read-only` }
       }
-      if (binary === 'node' && sub && !READ_ONLY_NODE.has(sub)) {
-        return { allowed: false, reason: 'sandbox is read-only: running a script can write' }
+      // Any interpreter with a script or -c argument can write, so read-only mode
+      // only lets it print its version. Node was the original case; python and
+      // sh are the same problem.
+      if ((binary === 'node' || binary === 'python' || binary === 'python3' || binary === 'sh' || binary === 'bash') && sub && !READ_ONLY_NODE.has(sub)) {
+        return { allowed: false, reason: `sandbox is read-only: running ${binary} can write` }
       }
       return ALLOWED
     }

@@ -65,6 +65,31 @@ The Java script is the only file here that runs inside Ghidra; it uses the
 standard script API (`FunctionManager`, `DataIterator`) and emits nothing but the
 framed JSON.
 
+## artex/ — the loop itself
+
+`engine.ts` is the part that makes it ARTEX rather than a bag of tools: planner
+reads the situation → dispatches intents → workers claim one each → results go
+back into the graph → repeat. Three things make it terminate instead of spinning:
+
+1. **a round that dispatches zero intents ends the run** — that is the normal way
+   to finish, not an error;
+2. **a round that changes nothing ends the run** — otherwise a planner with a
+   favourite idea runs until the budget;
+3. **a budget** on rounds and intents, because "the model felt thorough" is not a
+   stopping condition.
+
+A worker that throws is a *failed intent*, not a dead run: the failure is recorded,
+the intent is closed as failed, and the planner gets one more chance to try
+something else.
+
+`plan.ts` is the shared todolist — every planner wake-up is a fresh conversation,
+so the chain has to live outside the model. Steps name their prerequisites; each
+round only the ready ones are offered.
+
+`traces.ts` is the cross-worker sharing: workers search each other's *steps*, not
+just their conclusions. "Someone already tried `sqlmap -u .../id=1` and got a 500"
+is more useful than a formalised fact.
+
 ## The tools they became
 
 | Tool | From | Group |
@@ -75,6 +100,8 @@ framed JSON.
 | `vuln_kb` | strix (CVSS 3.1 base score computed from the vector; OWASP Top 10 mapping) | analysis |
 | `osint` | strix (recon: DNS + edge fingerprint) | analysis |
 | `ghidra_analyze` | Ghidra (`facts` and `decompile`) | analysis |
+| `deep_scan` | ARTEX's engine, driven by the agent's own model (planner + workers + budget) | analysis |
+| `exploit_runtime` | strix's Python PoC runtime, run under the sandbox policy | analysis |
 
 CVSS is computed, not looked up: a table is wrong the moment the vector is
 unusual, and the arithmetic is published. `vuln_kb` also refuses to guess a
