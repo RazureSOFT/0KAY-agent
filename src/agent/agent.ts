@@ -22,6 +22,7 @@ import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
 import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
 import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/groups.js';
+import { ReconGraph } from '../analysis/artex/graph.js';
 import { shellChoice } from '../tools/shell_choice.js';
 import { DeliverySupervisor, supervisionDirective } from './supervision.js';
 import { resolvePosture, postureDirective } from './posture.js';
@@ -51,7 +52,7 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
 // call just makes the whole agent look broken.
 // Tools that cannot touch the world, so an approval prompt would only be noise.
 // `tools` lists and loads tool groups: it mutates an in-memory set and nothing else.
-const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools']);
+const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools', 'recon_graph']);
 
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -217,6 +218,8 @@ export class Agent {
   private subagents = new SubAgentRegistry();
   /** Groups a task has pulled into its prompt. */
   private taskGroups = new Map<string, Set<string>>();
+  /** Asset + exploration graphs, one pair per task (the recon_graph tool). */
+  private reconGraphs = new Map<string, ReconGraph>();
   /** The configured sandbox mode; tasks inherit it unless they pass their own. */
   get sandboxMode(): string { return this.settings.sandbox_mode || 'workspace-write' }
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
@@ -1058,6 +1061,15 @@ export class Agent {
     return `\n\nMore tools, not loaded (call one by name and it works; or tools(action:"load", group:"<name>") to add the whole group):\n${lines.join('\n')}`;
   }
 
+  private reconFor(taskId: string): ReconGraph {
+    let graph = this.reconGraphs.get(taskId);
+    if (!graph) {
+      graph = new ReconGraph();
+      this.reconGraphs.set(taskId, graph);
+    }
+    return graph;
+  }
+
   /** The view of the groups a tool sees. */
   private toolGroupsApi(taskId: string) {
     return {
@@ -1215,6 +1227,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // workspace-write; a task can only widen it by saying so in its metadata.
       sandbox: new SandboxPolicy(parseSandboxMode(context.options.sandbox_mode), allowedWorkspaceRoots()),
       toolGroups: this.toolGroupsApi(context.taskId),
+      recon: this.reconFor(context.taskId),
       // Same depth rule as runSubAgent: a child two levels down gets no
       // sub-agent tool, so the tree cannot grow past depth 2.
       subagents: depth >= 2 || context.options.no_subagents === '1'
@@ -1406,7 +1419,10 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     }
   }
 
-  async runDirect(tool: string, args: string): Promise<{ success: boolean; result: string; error: string }> {
+  async runDirect(tool: string, args: string, sessionId = ''): Promise<{ success: boolean; result: string; error: string }> {
+    // Per-session, not per-call: a recon graph or a loaded tool group that resets
+    // on every direct call is not state, it is decoration.
+    const stateKey = sessionId || sessionIdOrEmpty();
     if (tool === 'computeruse' && !this.settings.enable_computer_use) {
       return { success: false, result: '', error: 'computer-use-disabled: enable it in Agent settings' };
     }
@@ -1648,7 +1664,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         const after = Number(parsed.after) || 0;
         const frame = await capture.streamFrame(isWin ? undefined : {
           cwd: process.cwd(),
-          taskId: sessionIdOrEmpty(),
+          taskId: stateKey,
           agentType: this.settings.default_agent_type,
           todo: [],
           mcp: this.mcp,
@@ -1700,7 +1716,8 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // The direct path used to skip the sandbox entirely, which made /api/run a
       // way around the policy the loop enforces.
       sandbox: new SandboxPolicy(parseSandboxMode(this.settings.sandbox_mode), allowedWorkspaceRoots()),
-      toolGroups: this.toolGroupsApi(sessionIdOrEmpty()),
+      toolGroups: this.toolGroupsApi(stateKey),
+      recon: this.reconFor(stateKey),
     })
     if (res.success) {
       let result = ''

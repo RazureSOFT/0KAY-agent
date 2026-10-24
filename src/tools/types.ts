@@ -1,5 +1,6 @@
 import type { SubAgentRunner } from '../agent/subagents.js'
 import type { SandboxPolicy } from '../sandbox/policy.js'
+import type { ReconGraph } from '../analysis/artex/graph.js'
 export interface ToolResult {
   success: boolean;
   data: any;
@@ -50,6 +51,8 @@ export interface ToolContext {
   subagents?: SubAgentRunner;
   /** What this task may touch. Absent means "no policy", used only by tests. */
   sandbox?: SandboxPolicy;
+  /** Asset + exploration graphs for this task (the recon_graph tool). */
+  recon?: ReconGraph;
   /** Which tool groups this task has loaded into its prompt. */
   toolGroups?: {
     list(): Array<{ group: string; hint: string; loaded: boolean; tools: string[] }>;

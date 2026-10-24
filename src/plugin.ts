@@ -521,7 +521,7 @@ function startAgentService(proto: any): Promise<number> {
       if(!authorized(call)){callback({code:grpc.status.UNAUTHENTICATED,message:'paired Core required'} as grpc.ServiceError);return}
       console.log(`[Agent] RunDirect tool=${tool} session=${sessionId || '-'}`)
       try {
-        const res = await agent.runDirect(tool || '', args || '')
+        const res = await agent.runDirect(tool || '', args || '', sessionId || '')
         callback(null, {
           success: res.success,
           result: res.result,
