@@ -1,5 +1,5 @@
 import { MocrProvider, Message, MessagePart, GenerateRequest, GenerateResponse, ToolCall } from '../provider/mocr.js';
-import { ToolRegistry, createDefaultRegistry, PluginTool } from '../tools/tools.js';
+import { ToolRegistry, createDefaultRegistry, PluginTool, type ToolSchema } from '../tools/tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
@@ -8,6 +8,7 @@ import { SubAgentRegistry } from './subagents.js';
 import * as path from 'path';
 import { stat, readdir, mkdir, readFile, writeFile, mkdtemp, rm } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
+import { SessionDirectives } from '../task/directives.js';
 import { ContextLedger } from '../context/ledger.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
@@ -22,7 +23,8 @@ import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
 import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
 import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/groups.js';
-import { ReconGraph } from '../analysis/artex/graph.js';
+import { ReconGraph, FileGraphStore } from '../analysis/artex/graph.js';
+import { AssessmentManager } from '../analysis/artex/tasks.js';
 import { shellChoice } from '../tools/shell_choice.js';
 import { DeliverySupervisor, supervisionDirective } from './supervision.js';
 import { resolvePosture, postureDirective } from './posture.js';
@@ -52,7 +54,15 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
 // call just makes the whole agent look broken.
 // Tools that cannot touch the world, so an approval prompt would only be noise.
 // `tools` lists and loads tool groups: it mutates an in-memory set and nothing else.
-const ALWAYS_SAFE_TOOLS = new Set(['report_artifacts', 'tools', 'recon_graph', 'vuln_kb']);
+const ALWAYS_SAFE_TOOLS = new Set([
+  'report_artifacts', 'tools', 'recon_graph', 'vuln_kb', 'assessments', 'session',
+  // ARTEX graph surface: bookkeeping on the session's exploration graph and
+  // trace store — no world-touching calls, so approval prompts would be noise.
+  'graph_overview', 'list_goals', 'list_facts', 'list_findings', 'node_detail', 'expand_digest',
+  'list_assets', 'list_untested_assets', 'add_task_scope', 'add_intent', 'prove_goal', 'goal_met',
+  'kill_work', 'steer_work', 'record_fact', 'report_finding', 'insert_assets', 'add_hint',
+  'set_goals', 'set_constraints', 'search_all_worker_traces', 'get_worker_trace',
+]);
 
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -211,6 +221,8 @@ export class Agent {
   private settings: Required<AgentSettings>;
   private recorder = taskRecorder;
   private approvals = new ApprovalManager();
+  /** Session UI directives (titles, toasts) — collected by core's inbox poll. */
+  private directives = new SessionDirectives();
   private questions = new QuestionManager();
   private handoffs = new Map<string,string>();
   private workspaces = new WorkspaceRegistry();
@@ -220,6 +232,37 @@ export class Agent {
   private taskGroups = new Map<string, Set<string>>();
   /** Asset + exploration graphs, one pair per task (the recon_graph tool). */
   private reconGraphs = new Map<string, ReconGraph>();
+  /** Graphs are written through to disk so a restart continues the session. */
+  private reconStoreField?: FileGraphStore;
+  private reconSaves = new Map<string, Promise<void>>();
+  /** Background assessment tasks (the assessments tool), persisted like the graphs. */
+  private assessmentsField?: AssessmentManager;
+  private get assessments(): AssessmentManager {
+    if (this.assessmentsField) return this.assessmentsField;
+    try {
+      const dataDir = process.env.AGENT_DATA_DIR || './data/agent';
+      this.assessmentsField = new AssessmentManager(
+        (sessionId) => this.reconFor(sessionId),
+        path.join(dataDir, 'assessments'),
+      );
+    } catch {
+      // A data dir that cannot be created still leaves the manager working in
+      // memory: tasks run, they just do not survive a restart.
+      this.assessmentsField = new AssessmentManager((sessionId) => this.reconFor(sessionId));
+    }
+    return this.assessmentsField;
+  }
+  /** Lazy because a read-only or unwritable data dir disables persistence, not the agent. */
+  private get reconStore(): FileGraphStore | undefined {
+    if (this.reconStoreField) return this.reconStoreField;
+    try {
+      const dataDir = process.env.AGENT_DATA_DIR || './data/agent';
+      this.reconStoreField = new FileGraphStore(path.join(dataDir, 'recon'));
+      return this.reconStoreField;
+    } catch {
+      return undefined;
+    }
+  }
   /** The configured sandbox mode; tasks inherit it unless they pass their own. */
   get sandboxMode(): string { return this.settings.sandbox_mode || 'workspace-write' }
   takeHandoff(taskId:string):string {const value=this.handoffs.get(taskId)||'';this.handoffs.delete(taskId);return value}
@@ -1061,12 +1104,33 @@ export class Agent {
     return `\n\nMore tools, not loaded (call one by name and it works; or tools(action:"load", group:"<name>") to add the whole group):\n${lines.join('\n')}`;
   }
 
-  private reconFor(taskId: string): ReconGraph {
-    let graph = this.reconGraphs.get(taskId);
-    if (!graph) {
-      graph = new ReconGraph();
-      this.reconGraphs.set(taskId, graph);
+  /**
+   * One graph per session key, loaded from disk on first touch. Writes go
+   * through the store behind the graph's onChange hook, chained per key so two
+   * rapid mutations cannot interleave half a document.
+   */
+  private async reconFor(key: string): Promise<ReconGraph> {
+    let graph = this.reconGraphs.get(key);
+    if (graph) return graph;
+    let restored: ReconGraph | null = null;
+    if (this.reconStore) {
+      const data = await this.reconStore.load(key).catch(() => null);
+      if (data) {
+        try { restored = ReconGraph.fromJSON(data); } catch { restored = null; }
+      }
     }
+    graph = restored || new ReconGraph();
+    if (this.reconStore) {
+      const store = this.reconStore;
+      graph.onChange(() => {
+        const run = (this.reconSaves.get(key) || Promise.resolve())
+          .catch(() => {})
+          .then(() => store.save(key, graph!.toJSON()))
+          .catch(() => {});
+        this.reconSaves.set(key, run);
+      });
+    }
+    this.reconGraphs.set(key, graph);
     return graph;
   }
 
@@ -1087,11 +1151,66 @@ export class Agent {
     };
   }
 
+  /**
+   * One line per tool, plus a terse signature line. The full schema travels
+   * natively in the API tools parameter; this copy exists for models without
+   * native function calling, and it needs names, types and required — not the
+   * prose. Property descriptions are the bulk of the old block and are the
+   * first thing a model asks the tool help for anyway (tools(action:"help")).
+   */
+  private compactToolBlock(tools: ToolSchema[]): string {
+    const firstSentences = (text: string, max = 220): string => {
+      const clean = String(text || '').replace(/\s+/g, ' ').trim();
+      const sentences = clean.split(/(?<=[.!?;])\s+/);
+      let out = '';
+      for (const sentence of sentences) {
+        if (!sentence) continue;
+        if (out && `${out} ${sentence}`.length > max) break;
+        out = out ? `${out} ${sentence}` : sentence;
+      }
+      return (out || clean.slice(0, max)).trim();
+    };
+    const typeOf = (param: any): string => {
+      if (Array.isArray(param?.type)) return param.type.join('|');
+      if (param?.type) return String(param.type);
+      if (Array.isArray(param?.enum)) return 'enum';
+      if (param?.properties) return 'object';
+      return 'any';
+    };
+    const renderProps = (props: Record<string, any>, required: string[]): string =>
+      Object.entries(props || {})
+        .map(([name, param]) => {
+          const optional = required.includes(name) ? '' : '?';
+          const type = typeOf(param);
+          const values = Array.isArray(param?.enum) && param.enum.length && param.enum.length <= 8
+            ? `=${param.enum.map((value: any) => String(value)).join('|')}`
+            : '';
+          return `${name}${optional}:${type}${values}`;
+        })
+        .join(', ');
+    const signature = (schema: any): string => {
+      const props = (schema?.properties || {}) as Record<string, any>;
+      const required: string[] = schema?.required || [];
+      const lines = [renderProps(props, required)];
+      for (const [name, param] of Object.entries(props)) {
+        const item = param?.items;
+        if (param?.type === 'array' && item?.properties) {
+          lines.push(`${name}[]{${renderProps(item.properties, item.required || [])}}`);
+        }
+        if (param?.type === 'object' && param?.properties) {
+          lines.push(`${name}{${renderProps(param.properties, param.required || [])}}`);
+        }
+      }
+      return lines.filter((line) => line && line !== ' ').join(' | ');
+    };
+    return tools
+      .map((tool) => `- ${tool.name}: ${firstSentences(tool.description)}\n  args: ${signature(tool.parameters)}`)
+      .join('\n');
+  }
+
   private getSystemPrompt(taskPrompt?: string, cwd = process.cwd(), forceSkill = '', minimal = false, taskId = ''): string {
     const tools = this.tools.listTools(this.toolVisible(taskId));
-    const toolDescriptions = tools
-      .map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`)
-      .join('\n');
+    const toolDescriptions = this.compactToolBlock(tools);
 
     const skillBlock = this.settings.enable_skills
       ? `\n\n${this.skills.contextBlock(taskPrompt || '', forceSkill)}`
@@ -1141,8 +1260,12 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
   }
 
   private contextBreakdown(cwd: string, conversationTokens: number, window: number) {
-    const toolList = this.tools.listTools()
-    const toolDescriptions = toolList.map(t => `- ${t.name}: ${t.description}\n  schema: ${JSON.stringify(t.parameters)}`).join('\n')
+    // Estimate with the SAME rendering the real prompt uses — the compact tool
+    // block and the fresh-session visibility set. The old copy here still
+    // rendered full JSON schemas, so the panel reported a tools block that no
+    // longer exists (and squeezed the system row down to 0).
+    const toolList = this.tools.listTools(this.toolVisible(''))
+    const toolDescriptions = this.compactToolBlock(toolList)
     const skillBlock = this.settings.enable_skills ? `\n\n${this.skills.contextBlock('', undefined)}` : ''
     let mcpText = ''
     try { mcpText = this.mcp ? JSON.stringify(this.mcp.listTools()) : '' } catch { mcpText = '' }
@@ -1204,6 +1327,9 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
+    // Resolved before the (synchronous) tool-context closure below: the graph
+    // may need a disk read the first time a session touches it.
+    const recon = await this.reconFor(context.sessionId || context.taskId);
     return serializeFileMutation(toolCall.name, () => this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
       cwd: context.cwd,
       taskId: context.taskId,
@@ -1215,6 +1341,12 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       ledger: context.ledger,
       signal: context.signal,
       llm: (request) => this.toolLlm(request, context),
+      // Background assessment tasks outlive this call, so their model calls
+      // must not inherit this context's abort signal.
+      backgroundLlm: (request) => this.toolLlm(request, { taskId: context.taskId, sessionId: context.sessionId }),
+      assessments: this.assessments,
+      artex: this.assessments.activeFor(context.sessionId || context.taskId),
+      sessionDirectives: this.directives,
       runSubAgent: depth >= 2 || context.options.no_subagents === '1'
         ? undefined
         : async (subPrompt, subType) => {
@@ -1231,7 +1363,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // working on, which outlives one task and is shared by its subagents.
       // It also has to match the direct path below (stateKey), or a UI reading
       // the graph would see a different one than the model wrote to.
-      recon: this.reconFor(context.sessionId || context.taskId),
+      recon,
       // Same depth rule as runSubAgent: a child two levels down gets no
       // sub-agent tool, so the tree cannot grow past depth 2.
       subagents: depth >= 2 || context.options.no_subagents === '1'
@@ -1440,6 +1572,8 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     }
 
     if(tool==='question_list')return {success:true,result:JSON.stringify(this.questions.list()),error:''};
+    if(tool==='session_directives')return {success:true,result:JSON.stringify(this.directives.list(String(parsed.session_id||''))),error:''};
+    if(tool==='session_directives_ack')return {success:true,result:JSON.stringify({removed:this.directives.ack(Array.isArray(parsed.ids)?parsed.ids.map(String):[])}),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
     if (tool === 'workspace_admin' || tool === 'projects_admin') {
       try {
@@ -1691,8 +1825,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         const cwd = path.resolve(parsed.cwd ? String(parsed.cwd) : process.cwd());
         const timeoutMs = Math.max(1000, Math.min(Number(parsed.timeout) || 120000, 300000));
         const label = await getOemLabel();
-        const directId = sessionIdOrEmpty();
-        try { await this.approvals.request(directId, 'direct', tool, parsed, cwd); }
+        try { await this.approvals.request(stateKey, 'direct', tool, parsed, cwd); }
         catch (error: any) { return { success: false, result: '', error: error.message }; }
         const { stdout, stderr, exitCode } = await runTerminalCommand(command, cwd, timeoutMs, label);
         return { success: true, error: '', result: JSON.stringify({ cwd, stdout, stderr, exitCode }) };
@@ -1705,7 +1838,11 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       return { success: true, result: String(parsed.output ?? parsed.result ?? args ?? ''), error: '' }
     }
 
-    const directId=sessionIdOrEmpty();
+    // One identity for the whole call: `stateKey` is the session the panel is
+    // looking at. A fresh `direct:<ts>` per call made assessments(action:"list")
+    // return nothing — create() filed the task under an id nobody could ask for
+    // again — and filed approvals somewhere the session's inbox never looks.
+    const directId = stateKey;
     const mailMcp = tool === 'mcp' && String(parsed?.action || '') === 'call' && String(parsed?.server || '') === 'mail';
     if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser' && !mailMcp && !ALWAYS_SAFE_TOOLS.has(tool)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
@@ -1713,7 +1850,8 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     }
     const res = await this.tools.call(tool, parsed, {
       cwd: process.cwd(),
-      taskId: sessionIdOrEmpty(),
+      taskId: stateKey,
+      sessionId: stateKey,
       agentType: this.settings.default_agent_type,
       todo: [],
       mcp: this.mcp,
@@ -1721,7 +1859,19 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // way around the policy the loop enforces.
       sandbox: new SandboxPolicy(parseSandboxMode(this.settings.sandbox_mode), allowedWorkspaceRoots()),
       toolGroups: this.toolGroupsApi(stateKey),
-      recon: this.reconFor(stateKey),
+      recon: await this.reconFor(stateKey),
+      assessments: this.assessments,
+      artex: this.assessments.activeFor(stateKey),
+      sessionDirectives: this.directives,
+      // No signal here to inherit: the direct path has no tool-call lifecycle,
+      // so plain toolLlm is already detached. runSubAgent lets assessment
+      // workers started from the panel run as real tool-carrying sub-agents.
+      backgroundLlm: (request) => this.toolLlm(request, { taskId: stateKey, sessionId: stateKey }),
+      runSubAgent: (subPrompt, subType) => this.recorder.run(
+        'subagent', subPrompt, directId, 'direct',
+        () => this.executeTaskInternal(`${directId}:sub:${randomUUID()}`, subPrompt, subType || this.settings.default_agent_type, 1, directId, {}),
+        `${directId}:sub`,
+      ),
     })
     if (res.success) {
       let result = ''

@@ -23,9 +23,11 @@ test('extractJson survives fences and prose', () => {
   assert.equal(extractJson('no json at all'), null)
 })
 
-test('deep_scan runs rounds until the planner goes quiet', async () => {
+test('deep_scan runs rounds until the goals are proven', async () => {
   const tool = new DeepScanTool()
   const ctx = contextWithPlanner([
+    // goals phase
+    JSON.stringify({ constraints: ['stay on a.example.com'], goals: [{ text: 'prove the login is bypassable', assets: ['https://a.example.com/login'] }] }),
     // planner round 1
     JSON.stringify({ plan: [{ text: 'probe the login' }], intents: [{ text: 'probe login', assets: ['https://a.example.com/login'], stepId: 's1' }] }),
     // worker round 1
@@ -38,7 +40,8 @@ test('deep_scan runs rounds until the planner goes quiet', async () => {
   assert.equal(result.data.stopped, 'goal-proven')
   assert.equal(result.data.proven, true)
   assert.equal(result.data.findings.length, 1)
-  assert.equal(result.data.goal.status, 'done')
+  assert.equal(result.data.goals[0].status, 'met')
+  assert.equal(result.data.scope[0], 'domain:a.example.com', 'a URL target reduces to its host')
   assert.equal(result.data.traces, 1)
 })
 
@@ -53,9 +56,10 @@ test('a planner that never returns intents ends immediately', async () => {
   assert.equal(result.data.intents, 0)
 })
 
-test('a worker reply that is not JSON is a failed intent, not a crash', async () => {
+test('a worker reply that is not JSON is a blocked intent, not a crash', async () => {
   const tool = new DeepScanTool()
   const ctx = contextWithPlanner([
+    JSON.stringify({ goals: [] }), // goals phase falls back to the single objective
     JSON.stringify({ intents: [{ text: 'probe', assets: ['example.com'] }] }),
     'I could not do that.',
     JSON.stringify({ intents: [] }),
@@ -63,6 +67,7 @@ test('a worker reply that is not JSON is a failed intent, not a crash', async ()
   const result = await tool.execute({ goal: 'find something', targets: ['example.com'], rounds: 2 }, ctx)
   assert.equal(result.success, true, result.error)
   assert.equal(result.data.findings.length, 0)
+  assert.equal(result.data.goals.length, 1, 'the objective itself becomes the goal when decomposition fails')
 })
 
 test('deep_scan needs a model and a scope', async () => {

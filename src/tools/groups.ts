@@ -26,8 +26,8 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   },
   agent: {
     label: 'agent',
-    hint: 'delegation, background work, artefacts, MCP',
-    tools: ['task', 'subagent', 'background_task', 'report_artifacts', 'acp_status', 'mcp'],
+    hint: 'delegation, background work, session cosmetics (titles, toasts), artefacts, MCP',
+    tools: ['task', 'subagent', 'background_task', 'report_artifacts', 'session', 'acp_status', 'mcp'],
   },
   web: {
     label: 'web',
@@ -41,8 +41,13 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   },
   analysis: {
     label: 'analysis',
-    hint: 'static binary analysis (incl. Ghidra), web assessment, PoC validation, recon graphs, diagrams',
-    tools: ['reverse_engineer', 'pentest', 'diagram', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'exploit_runtime'],
+    hint: 'static binary analysis (incl. Ghidra), web assessment, PoC validation, recon graphs, background assessment tasks, diagrams',
+    tools: ['reverse_engineer', 'pentest', 'diagram', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'assessments', 'exploit_runtime'],
+  },
+  artex: {
+    label: 'artex',
+    hint: 'ARTEX graph tools: record facts/findings, add intents & assets, prove goals, read the situation — live while an assessment runs',
+    tools: ['graph_overview', 'list_goals', 'list_facts', 'list_findings', 'node_detail', 'expand_digest', 'list_assets', 'list_untested_assets', 'add_task_scope', 'add_intent', 'prove_goal', 'goal_met', 'kill_work', 'steer_work', 'record_fact', 'report_finding', 'insert_assets', 'add_hint', 'set_goals', 'set_constraints', 'search_all_worker_traces', 'get_worker_trace'],
   },
   research: {
     label: 'research',

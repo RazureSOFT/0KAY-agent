@@ -116,4 +116,27 @@ export class Plan {
   isComplete(): boolean {
     return [...this.steps.values()].every((step) => step.status === 'done' || step.status === 'skipped')
   }
+
+  toJSON(): PlanStep[] {
+    return [...this.steps.values()]
+  }
+
+  /** Rebuild a plan (for a resumed run); ids are kept so step references survive. */
+  static fromJSON(steps: PlanStep[]): Plan {
+    const plan = new Plan()
+    for (const step of steps || []) {
+      if (!step?.id || !step.text) continue
+      plan.steps.set(step.id, {
+        id: step.id,
+        text: step.text,
+        needs: Array.isArray(step.needs) ? step.needs : [],
+        status: step.status || 'pending',
+        ...(step.note ? { note: step.note } : {}),
+      })
+      const seq = Number.parseInt(step.id.replace(/^s/, '') || '0', 10)
+      if (Number.isFinite(seq) && seq > plan.seq) plan.seq = seq
+    }
+    plan.refresh()
+    return plan
+  }
 }

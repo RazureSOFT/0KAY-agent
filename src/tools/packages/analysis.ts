@@ -18,9 +18,11 @@ export class ReconGraphTool extends Tool {
     return [
       'Track what a target IS separately from what you have TESTED, so coverage is a question you can answer.',
       'action=add assets:["https://a.example/x","10.0.0.5:443","a.example"] — the kind and parent are inferred, you just submit what you saw.',
-      'action=intent opens a direction against assets; action=fact/finding records a result (facts and findings are what mark an asset tested).',
-      'action=coverage lists untested assets; action=history shows everything tried against one asset.',
-      'action=overview is the one-call situation report (coverage, open intents, recent facts); action=prove closes a goal and refuses without a finding anchored to it.',
+      'action=goal opens a deliverable a finding could prove; action=intent opens a direction against assets (priority 0-10); action=fact/finding records a result — facts and findings are what mark an asset tested, so record negative observations too.',
+      'action=close moves an intent through its life (done | blocked | exhausted | stopped | paused); action=hint records steering for the planner.',
+      'action=scope assets:["example.com","10.0.0.0/24"] declares the coverage denominator; action=coverage lists what is untested within it.',
+      'action=history shows everything tried against one asset; action=overview is the one-call situation report.',
+      'action=prove closes a goal — it refuses without a finding anchored to it, and refuses while scope coverage is below minCoverage percent when given.',
     ].join(' ')
   }
   get parameters(): Record<string, any> {
@@ -28,12 +30,15 @@ export class ReconGraphTool extends Tool {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['add', 'intent', 'fact', 'finding', 'coverage', 'history', 'overview', 'prove', 'export'] },
-        assets: { type: 'array', items: { type: 'string' }, description: 'Raw observations: URL, host:port, IP, or hostname.' },
-        text: { type: 'string', description: 'intent/fact/finding: what it is, in one sentence.' },
+        action: { type: 'string', enum: ['add', 'goal', 'intent', 'fact', 'finding', 'hint', 'scope', 'close', 'coverage', 'history', 'overview', 'prove', 'export'] },
+        assets: { type: 'array', items: { type: 'string' }, description: 'Raw observations: URL, host:port, IP, or hostname. scope: domains or CIDR ranges.' },
+        text: { type: 'string', description: 'goal/intent/fact/finding/hint: what it is, in one sentence.' },
         asset: { type: 'string', description: 'history: the asset to look up.' },
-        id: { type: 'string', description: 'intent: the node id to close.' },
-        status: { type: 'string', enum: ['done', 'failed'], description: 'intent: how it ended.' },
+        id: { type: 'string', description: 'close/prove: the node id. prove: optional evidence finding id.' },
+        evidence: { type: 'string', description: 'prove: the finding node that proves the goal.' },
+        status: { type: 'string', description: 'close: done | blocked | exhausted | stopped | paused.' },
+        priority: { type: 'integer', minimum: 0, maximum: 10, description: 'intent: queue position, higher first.' },
+        minCoverage: { type: 'integer', minimum: 0, maximum: 100, description: 'prove: refuse unless this percent of the scope is tested.' },
         derivedFrom: { type: 'array', items: { type: 'string' }, description: 'Node ids this came from (provenance).' },
       },
     }
@@ -47,9 +52,19 @@ export class ReconGraphTool extends Tool {
           const added = (Array.isArray(args.assets) ? args.assets : []).map((raw: string) => graph.addAsset(String(raw)))
           return success({ added: added.length, assets: added.map((asset) => ({ id: asset.id, kind: asset.kind, key: asset.key })) })
         }
+        case 'goal': {
+          const node = graph.addNode({ kind: 'goal', text: String(args.text || ''), assets: args.assets })
+          return success({ id: node.id, kind: node.kind, status: node.status })
+        }
         case 'intent': {
-          const node = graph.addNode({ kind: 'intent', text: String(args.text || ''), assets: args.assets, derivedFrom: args.derivedFrom })
-          return success({ id: node.id, kind: node.kind, assets: node.assetIds })
+          const node = graph.addNode({
+            kind: 'intent',
+            text: String(args.text || ''),
+            assets: args.assets,
+            derivedFrom: args.derivedFrom,
+            priority: args.priority != null ? Number(args.priority) : undefined,
+          })
+          return success({ id: node.id, kind: node.kind, assets: node.assetIds, priority: node.priority })
         }
         case 'fact':
         case 'finding': {
@@ -57,11 +72,31 @@ export class ReconGraphTool extends Tool {
           if (args.id) graph.complete(String(args.id), 'done')
           return success({ id: node.id, kind: node.kind, assets: node.assetIds, coverage: graph.coverage() })
         }
+        case 'hint': {
+          const node = graph.addHint(String(args.text || ''), args.assets)
+          return success({ id: node.id, kind: node.kind })
+        }
+        case 'scope': {
+          const rows = graph.setScope((Array.isArray(args.assets) ? args.assets : []).map(String))
+          const coverage = graph.coverage()
+          return success({
+            scope: rows.map((row) => `${row.kind}:${row.value}`),
+            denominator: coverage.scope.denominator,
+            tested: coverage.tested,
+            pct: coverage.scope.pct,
+          })
+        }
+        case 'close': {
+          const status = String(args.status || 'done')
+          const node = graph.complete(String(args.id || ''), status)
+          return success({ id: node.id, kind: node.kind, status: node.status })
+        }
         case 'coverage': {
           const coverage = graph.coverage()
           return success({
             total: coverage.total,
             tested: coverage.tested,
+            scope: coverage.scope,
             untested: coverage.untested.slice(0, 50).map((asset) => `${asset.kind}:${asset.key}`),
             ...(coverage.untested.length > 50 ? { more: coverage.untested.length - 50 } : {}),
           })
@@ -76,13 +111,13 @@ export class ReconGraphTool extends Tool {
         case 'overview':
           return success(graph.overview())
         case 'prove': {
-          const goal = graph.prove(String(args.id || ''))
+          const goal = graph.prove(String(args.id || ''), args.evidence ? String(args.evidence) : undefined, args.minCoverage != null ? Number(args.minCoverage) : undefined)
           return success({ id: goal.id, status: goal.status, text: goal.text })
         }
         case 'export':
           return success(graph.toJSON())
         default:
-          throw new Error('action must be add, intent, fact, finding, coverage, history, overview, prove or export')
+          throw new Error('action must be add, goal, intent, fact, finding, hint, scope, close, coverage, history, overview, prove or export')
       }
     } catch (error) {
       return failure(error)

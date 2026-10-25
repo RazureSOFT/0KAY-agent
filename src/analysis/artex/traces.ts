@@ -92,4 +92,18 @@ export class TraceStore {
   get size(): number {
     return this.steps.length
   }
+
+  toJSON(): TraceStep[] {
+    return [...this.steps]
+  }
+
+  static fromJSON(steps: TraceStep[]): TraceStore {
+    const store = new TraceStore()
+    for (const step of steps || []) {
+      if (!step?.intentId) continue
+      store.steps.push({ ...step, at: step.at || new Date().toISOString() })
+    }
+    if (store.steps.length > MAX_STEPS) store.steps.splice(0, store.steps.length - MAX_STEPS)
+    return store
+  }
 }

@@ -53,6 +53,23 @@ export interface ToolContext {
   sandbox?: SandboxPolicy;
   /** Asset + exploration graphs for this task (the recon_graph tool). */
   recon?: ReconGraph;
+  /** Background assessment tasks (the assessments tool). */
+  assessments?: import('../analysis/artex/tasks.js').AssessmentManager;
+  /**
+   * The ARTEX run context: the session's shared graph plus the active run's
+   * trace store and live constraints. Present only while an assessment (or
+   * deep_scan) is running in this session — the ARTEX tool surface operates
+   * through it.
+   */
+  artex?: import('../analysis/artex/tasks.js').ArtexRunContext;
+  /** Session UI directives (the session tool): titles and toasts, applied by core on its next inbox poll. */
+  sessionDirectives?: import('../task/directives.js').SessionDirectives;
+  /**
+   * An LLM caller that survives the current tool call — no abort signal from
+   * this context rides along. Background assessment tasks must use this, or
+   * every model call dies the moment the task-creating call returns.
+   */
+  backgroundLlm?: LlmCaller;
   /** Which tool groups this task has loaded into its prompt. */
   toolGroups?: {
     list(): Array<{ group: string; hint: string; loaded: boolean; tools: string[] }>;
