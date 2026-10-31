@@ -1,5 +1,6 @@
 import { MocrProvider, Message, MessagePart, GenerateRequest, GenerateResponse, ToolCall } from '../provider/mocr.js';
 import { ToolRegistry, createDefaultRegistry, PluginTool, type ToolSchema } from '../tools/tools.js';
+import { planPluginTools } from '../tools/plugin-tools.js';
 import { SkillRegistry, getSkillRegistry } from '../skills/skills.js';
 import { TaskManager, Task } from '../task/task.js';
 import { McpManager, McpServerConfig } from '@0kay/mcp';
@@ -10,6 +11,8 @@ import { stat, readdir, mkdir, readFile, writeFile, mkdtemp, rm } from 'fs/promi
 import { ApprovalManager } from '../task/approvals.js';
 import { SessionDirectives } from '../task/directives.js';
 import { ContextLedger } from '../context/ledger.js';
+import { inferContextWindow, compactPolicy, cacheProfileFor, decideCompactTier, type CompactPolicy } from '../context/window.js';
+import { prefixHash } from '../context/prefix.js';
 import { QuestionManager } from '../task/questions.js';
 import * as os from 'os';
 import { execFile } from 'child_process';
@@ -23,10 +26,12 @@ import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
 import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
 import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/groups.js';
-import { ReconGraph, FileGraphStore } from '../analysis/artex/graph.js';
-import { AssessmentManager } from '../analysis/artex/tasks.js';
+import { ReconGraph, FileGraphStore } from '../analysis/recon/graph.js';
+import { AssessmentManager } from '../analysis/recon/tasks.js';
 import { shellChoice } from '../tools/shell_choice.js';
 import { DeliverySupervisor, supervisionDirective } from './supervision.js';
+import { completeProgress } from '../tools/progress.js';
+import { setEvolveGitHubToken, setEvolveBranchPrefix } from '../tools/self_evolve.js';
 import { resolvePosture, postureDirective } from './posture.js';
 import { resolveMode, type MultiAgentMode } from './modes.js';
 import { buildHandoffDoc } from './handoff.js';
@@ -56,7 +61,7 @@ const EXPLORE_READ_ONLY_TOOLS = new Set([
 // `tools` lists and loads tool groups: it mutates an in-memory set and nothing else.
 const ALWAYS_SAFE_TOOLS = new Set([
   'report_artifacts', 'tools', 'recon_graph', 'vuln_kb', 'assessments', 'session',
-  // ARTEX graph surface: bookkeeping on the session's exploration graph and
+  // RECON graph surface: bookkeeping on the session's exploration graph and
   // trace store — no world-touching calls, so approval prompts would be noise.
   'graph_overview', 'list_goals', 'list_facts', 'list_findings', 'node_detail', 'expand_digest',
   'list_assets', 'list_untested_assets', 'add_task_scope', 'add_intent', 'prove_goal', 'goal_met',
@@ -159,8 +164,11 @@ export interface AgentSettings {
   enable_terminal?: boolean;
   self_evolve_enabled?: boolean;
   self_evolve_repo?: string;
+  github_token?: string;
+  evolve_branch_prefix?: string;
   vision_model?: string;
   context_window?: number;
+  compaction_model?: string;
   enable_mcp_tool?: boolean;
   enable_plugin_tools?: boolean;
   enable_task_tool?: boolean;
@@ -201,6 +209,21 @@ function trackSessionPromptTokens(sessionId: string, tokens: number): void {
   }
 }
 
+// Last cacheable prefix seen per session. `prefix_changed` in context_usage
+// answers "did this turn throw the provider's prefix cache away?", which is the
+// difference between a cheap turn and a full-price one.
+const sessionPrefix = new Map<string, string>();
+function trackSessionPrefix(sessionId: string, hash: string): { hash: string; changed: boolean } {
+  if (!sessionId) return { hash, changed: false };
+  const previous = sessionPrefix.get(sessionId);
+  sessionPrefix.set(sessionId, hash);
+  if (sessionPrefix.size > MAX_SESSION_PROMPT_TOKENS) {
+    const oldest = sessionPrefix.keys().next().value;
+    if (oldest) sessionPrefix.delete(oldest);
+  }
+  return { hash, changed: previous !== undefined && previous !== hash };
+}
+
 const FILE_MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'document', 'slides']);
 let fileMutationChain: Promise<unknown> = Promise.resolve();
 function serializeFileMutation<T>(tool: string, task: () => Promise<T>): Promise<T> {
@@ -227,7 +250,13 @@ export class Agent {
   private handoffs = new Map<string,string>();
   private workspaces = new WorkspaceRegistry();
   private pluginToolNames = new Set<string>();
+  private lastPluginToolRefresh = 0;
+  /** What the last plugin-tool refresh did, for the status surface and logs. */
+  private pluginToolReport: { registered: string[]; renamed: string[]; skipped: any[]; error?: string } =
+    { registered: [], renamed: [], skipped: [] };
   private subagents = new SubAgentRegistry();
+  /** Last context measurement, so the UI can show a meter instead of guessing. */
+  lastContext: { used: number; window: number; tier: string; source: string } = { used: 0, window: 0, tier: 'none', source: 'default' };
   /** Groups a task has pulled into its prompt. */
   private taskGroups = new Map<string, Set<string>>();
   /** Asset + exploration graphs, one pair per task (the recon_graph tool). */
@@ -291,8 +320,11 @@ export class Agent {
       enable_terminal: false,
       self_evolve_enabled: false,
       self_evolve_repo: '',
+      github_token: '',
+      evolve_branch_prefix: 'self/',
       vision_model: '',
       context_window: 0,
+      compaction_model: '',
       enable_mcp_tool: true,
       enable_plugin_tools: true,
       enable_task_tool: true,
@@ -353,6 +385,10 @@ export class Agent {
       this.applyToolToggles();
     }
     if (typeof partial.self_evolve_repo === 'string') this.settings.self_evolve_repo = partial.self_evolve_repo;
+    if (typeof partial.github_token === 'string') this.settings.github_token = partial.github_token.trim();
+    if (typeof partial.evolve_branch_prefix === 'string') this.settings.evolve_branch_prefix = partial.evolve_branch_prefix.trim();
+    setEvolveGitHubToken(this.settings.github_token || '');
+    setEvolveBranchPrefix(this.settings.evolve_branch_prefix || 'self/');
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;
     if (typeof partial.enable_browser_tool === 'boolean') this.settings.enable_browser_tool = partial.enable_browser_tool;
@@ -361,6 +397,7 @@ export class Agent {
     if (typeof partial.enable_terminal === 'boolean') this.settings.enable_terminal = partial.enable_terminal;
     if (typeof partial.vision_model === 'string') this.settings.vision_model = partial.vision_model.trim();
     if (typeof partial.context_window === 'number' && partial.context_window >= 0) this.settings.context_window = Math.floor(partial.context_window);
+    if (typeof partial.compaction_model === 'string') this.settings.compaction_model = partial.compaction_model.trim();
     if (typeof partial.enable_mcp_tool === 'boolean') this.settings.enable_mcp_tool = partial.enable_mcp_tool;
     if (typeof partial.enable_plugin_tools === 'boolean') this.settings.enable_plugin_tools = partial.enable_plugin_tools;
     if (typeof partial.enable_task_tool === 'boolean') this.settings.enable_task_tool = partial.enable_task_tool;
@@ -437,12 +474,45 @@ export class Agent {
   private async refreshPluginTools(): Promise<void> {
     for (const name of this.pluginToolNames) this.tools.unregister(name);
     this.pluginToolNames.clear();
+    this.pluginToolReport = { registered: [], renamed: [], skipped: [] };
     if (!this.settings.enable_plugin_tools) return;
-    const defs = await listPluginTools('agent');
-    for (const def of defs) {
-      if (!def?.name || this.tools.get(def.name)) continue;
-      this.tools.register(new PluginTool(def));
-      this.pluginToolNames.add(def.name);
+    let defs: Array<any> = [];
+    try {
+      defs = await listPluginTools('agent');
+    } catch (error: any) {
+      this.pluginToolReport.error = error?.message || String(error);
+      return;
+    }
+    const plan = planPluginTools(defs, this.tools.names());
+    for (const entry of plan.register) {
+      this.tools.register(new PluginTool({ ...entry.def, plugin: entry.def.plugin || 'plugin', name: entry.name, call: entry.declared }));
+      this.pluginToolNames.add(entry.name);
+      this.pluginToolReport.registered.push(entry.name);
+      if (entry.renamed) this.pluginToolReport.renamed.push(`${entry.declared} -> ${entry.name}`);
+    }
+    this.pluginToolReport.skipped = plan.skipped;
+    // A tool that could not be registered is a visible hole in the model's
+    // toolbox, so say why rather than leaving it to be discovered.
+    for (const skip of plan.skipped) {
+      console.warn(`[plugin-tools] skipped ${skip.plugin}:${skip.declared}: ${skip.reason}`);
+    }
+  }
+
+  /**
+   * Refresh plugin tools at most once a minute.
+   *
+   * A plugin that starts after the agent did used to contribute nothing until
+   * the agent restarted. Refreshing on the way into a task fixes that without a
+   * timer that would keep the process awake.
+   */
+  private async maybeRefreshPluginTools(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastPluginToolRefresh < 60_000) return;
+    this.lastPluginToolRefresh = now;
+    try {
+      await this.refreshPluginTools();
+    } catch (error: any) {
+      this.pluginToolReport.error = error?.message || String(error);
     }
   }
 
@@ -669,15 +739,52 @@ export class Agent {
     return /context length|context_length|maximum context|max context|too long|token limit|too many tokens|reduce the length|exceeds? the maximum|上下文|超出/i.test(String(error?.message || error));
   }
 
-  private async compactHistory(context: AgentContext, modelId: string, sessionId: string): Promise<void> {
+  private static readonly SUMMARY_MARKER = '[context summary]';
+
+  /** The summary produced by an earlier compaction, if any. */
+  private existingSummary(context: AgentContext): string {
+    for (const message of context.history) {
+      if (message.role !== 'assistant' || typeof message.content !== 'string') continue;
+      if (message.content.startsWith(Agent.SUMMARY_MARKER)) {
+        return message.content.slice(Agent.SUMMARY_MARKER.length).trim();
+      }
+    }
+    return '';
+  }
+
+  private async compactHistory(context: AgentContext, modelId: string, sessionId: string, _policy?: CompactPolicy): Promise<void> {
+    if (context.history.length <= 3) return;
+    // Keep the tail verbatim: after a fold the model still needs to see the tool
+    // calls it was in the middle of, otherwise it restarts the work it just did.
+    const keepTail = Math.max(2, Math.min(6, Math.round(context.history.length * 0.2)));
+    const cut = Math.max(1, context.history.length - keepTail);
+    const folded = context.history.slice(1, cut);
+    if (folded.length === 0) return;
+    const tail = context.history.slice(cut);
+
+    const transcript = JSON.stringify(folded.map(({ parts, ...rest }) =>
+      parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
+
+    // Re-summarising from scratch loses the early decisions that a previous
+    // summary already captured. Merge into it instead.
+    const previous = this.existingSummary(context);
+    const prompt = previous
+      ? `${COMPACTION_SCHEMA_PROMPT}\n\nAn earlier summary of this session already exists. Preserve every fact it states (decisions, file paths, commands, errors, open todos) and merge the new messages into it. Do not drop detail to make room.\n\nEARLIER SUMMARY:\n${previous}\n\nNEW MESSAGES:\n${transcript}`
+      : `${COMPACTION_SCHEMA_PROMPT}\n\nMESSAGES:\n${transcript}`;
+
+    // Compaction is one-shot, tool-free summarisation. Running it on the main
+    // model is the most expensive per-token path in the session and it evicts
+    // the conversation's prefix cache; a configured cheap model avoids both.
+    const compactModel = this.settings.compaction_model || modelId;
     let summary = '';
-    const transcript = JSON.stringify(context.history.map(({ parts, ...rest }) => parts?.length ? { ...rest, content: `${rest.content}\n[${parts.filter(p => p.type === 'image').length} image attachment(s) omitted]` } : rest));
-    for await (const chunk of this.mocr.generate({ modelId, messages: [{ role: 'user', content: transcript }], systemPrompt: COMPACTION_SCHEMA_PROMPT, tools: [], toolChoice: 'none', signal: context.signal, taskId: context.taskId, sessionId, maxTokens: 5000 })) summary += chunk.chunk || '';
+    for await (const chunk of this.mocr.generate({ modelId: compactModel, messages: [{ role: 'user', content: prompt }], systemPrompt: COMPACTION_SCHEMA_PROMPT, tools: [], toolChoice: 'none', signal: context.signal, taskId: context.taskId, sessionId, maxTokens: 5000 })) summary += chunk.chunk || '';
     if (!summary.trim()) throw new Error('Context compaction returned no summary');
+
     const todoBlock = formatTodoList(context.todo);
     context.history = [
-      { role: 'user', content: context.prompt },
-      { role: 'assistant', content: `Structured context summary:\n${summary}${todoBlock ? `\n\n${todoBlock}` : ''}` },
+      context.history[0],
+      { role: 'assistant', content: `${Agent.SUMMARY_MARKER} ${summary.trim()}${todoBlock ? `\n\n${todoBlock}` : ''}` },
+      ...tail,
     ];
   }
 
@@ -694,6 +801,9 @@ export class Agent {
       if (!forceSkill && type && type !== 'general' && this.skills.get(type)) forceSkill = type;
     }
     this.taskManager.createTask(taskId, prompt, type);
+    // Not awaited: refreshing must never delay the task reaching RUNNING. The
+    // tool list this task sees is the one from the previous refresh.
+    void this.maybeRefreshPluginTools();
     return this.taskManager.executeTask(taskId, async () => {
       let workdir = options.workdir;
       const workspaceSelector = options.workspace || options.project;
@@ -769,7 +879,7 @@ export class Agent {
           let planText = '';
           for await (const chunk of this.mocr.generate({
             modelId: pair.thinkModel,
-            messages: [{ role: 'user', content: DUET_PLAN_USER_PROMPT + '\n\n任务：\n' + context.prompt }],
+            messages: [{ role: 'user', content: DUET_PLAN_USER_PROMPT + '\n\nTask:\n' + context.prompt }],
             systemPrompt: DUET_PLAN_SYSTEM_PROMPT,
             tools: [], toolChoice: 'none', signal: context.signal,
             taskId: context.taskId, sessionId: context.sessionId,
@@ -807,12 +917,23 @@ export class Agent {
         lastModel = modelId;
         this.activeModel = modelId;
 
-        let contextLimit = this.settings.context_window || 0;
-        if (!contextLimit && typeof (this.mocr as any).modelContextLength === 'function') {
-          contextLimit = await this.mocr.modelContextLength(modelId, context.signal).catch(() => 0);
+        // Resolve the window from the cheapest source that knows it: the
+        // operator's setting, then the provider, then the model name. The old
+        // code only asked the provider when the setting was 0 and otherwise
+        // never compacted at all, so a fresh install ran until the upstream
+        // returned a 400.
+        let providerWindow = 0;
+        if (!this.settings.context_window && typeof (this.mocr as any).modelContextLength === 'function') {
+          providerWindow = await this.mocr.modelContextLength(modelId, context.signal).catch(() => 0);
         }
-        if (contextLimit > 0 && (lastPromptTokens || this.estimateTokens(context.history)) > contextLimit * 0.85) {
-          await this.compactHistory(context, modelId, context.sessionId);
+        const windowInfo = inferContextWindow(modelId, this.settings.context_window || 0, providerWindow);
+        const contextLimit = windowInfo.tokens;
+        const compactThresholds = compactPolicy(modelId);
+        const usedTokens = lastPromptTokens || this.estimateTokens(context.history);
+        const tier = decideCompactTier(usedTokens, contextLimit, compactThresholds);
+        this.lastContext = { used: usedTokens, window: contextLimit, tier, source: windowInfo.source };
+        if (tier === 'compact' || tier === 'reactive' || tier === 'ceiling') {
+          await this.compactHistory(context, modelId, context.sessionId, compactThresholds);
           lastPromptTokens = 0;
         }
 
@@ -822,11 +943,19 @@ export class Agent {
         let finalText = '';
         let fullReasoning = '';
         let receivedNativeCalls = false;
+        // The cacheable prefix is the base system prompt plus the tool schemas.
+        // The iteration counter and todo list below are deliberately outside it:
+        // they change every step, and putting them in the prefix would throw the
+        // provider's cache away on every single request.
+        const requestTools = [...this.tools.listTools(this.toolVisible(context.taskId)),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}];
+        const baseSystem = this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '', minimal, context.taskId);
+        const prefix = trackSessionPrefix(context.sessionId, prefixHash({ system: baseSystem, tools: requestTools }));
+        if (context.ledger) context.ledger.prefixChanged = prefix.changed;
         try {
         for await (const chunk of this.generateWithVisionFallback({
           modelId,
           messages: context.history,
-          systemPrompt: this.getSystemPrompt(context.prompt, context.cwd, context.options.force_skill || '', minimal, context.taskId)
+          systemPrompt: baseSystem
             + (minimal
               ? `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Iteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}\n\n${this.minimalDirective(options.language)}`
               : `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`)
@@ -837,7 +966,7 @@ export class Agent {
           difficultyHint,
           requireThinking,
           maxTokens,
-          tools: [...this.tools.listTools(this.toolVisible(context.taskId)),{name:'question',description:'Ask the user a question with suggested options and a free-text answer.',parameters:{type:'object',required:['question'],properties:{question:{type:'string'},options:{type:'array',items:{type:'string'}}}}}],
+          tools: requestTools,
           toolChoice: 'auto',
           signal: context.signal,
           taskId: context.taskId,
@@ -882,6 +1011,7 @@ export class Agent {
                     break;
                   }
                   result = gate.result;
+                  await completeProgress(context.taskId, context.sessionId);
                   break;
                 }
                 context.history.push({
@@ -946,7 +1076,7 @@ export class Agent {
             const oldest = this.handoffs.keys().next().value;
             if (oldest) this.handoffs.delete(oldest);
           }
-        }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'任务已结束，产物信息提取失败，请查看 Agent 会话。'}))}
+        }catch{this.handoffs.set(taskId,JSON.stringify({artifacts:[],outcome:'The task ended but the handoff could not be extracted; see the agent session for details.'}))}
       }
       if (depth === 0 && process.env.OKAY_HANDOFF_DOC === '1') {
         try {
@@ -1225,6 +1355,7 @@ export class Agent {
 Host OS: ${process.platform}. Working directory: ${cwd}.
 The bash tool actually runs ${shellChoice().describe()}.
 Use write/edit for code files. Tool/program errors may be the correct diagnostic result; report them honestly instead of forcing success.
+Report progress with the progress tool (percent + one-line note) when you start, after each step, and at 100 when done.
 Verify every factual claim against evidence you retrieved and cite its source (file path, URL, DOI); never invent facts, citations or paths.
 
 Available tools:
@@ -1244,6 +1375,7 @@ Host OS: ${process.platform}. Working directory: ${cwd}.
 Bash runs ${shellChoice().describe()}.
 Use write/edit for code files, not shell echo. Report progress in assistant text before tool actions. Choose the smallest change that satisfies the request; avoid speculative features and repeated probes.
 For multi-step work, first call todowrite with a short checklist and keep exactly one item in_progress; update it as items finish. Skip it for trivial requests.
+Progress: call the progress tool when you start, after each meaningful step, and once at the end — percent (0-100, honest), a one-line note about the current action, and a phase. Set 100 only when everything asked for is done and verified; the user sees this as a progress bar.
 A tool/program error can be the correct diagnostic result — report it honestly instead of forcing success.
 Verification: back every factual claim with evidence you retrieved (tool result, file path, URL, DOI); label anything unverified. Never invent citations, URLs, DOIs, versions, figures, quotes or API signatures; prefer primary sources.
 
@@ -1345,7 +1477,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       // must not inherit this context's abort signal.
       backgroundLlm: (request) => this.toolLlm(request, { taskId: context.taskId, sessionId: context.sessionId }),
       assessments: this.assessments,
-      artex: this.assessments.activeFor(context.sessionId || context.taskId),
+      reconRun: this.assessments.activeFor(context.sessionId || context.taskId),
       sessionDirectives: this.directives,
       runSubAgent: depth >= 2 || context.options.no_subagents === '1'
         ? undefined
@@ -1744,10 +1876,29 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if (tool === 'context_usage') {
       try {
         const cwd = typeof parsed.cwd === 'string' && parsed.cwd ? parsed.cwd : process.cwd()
-        const breakdown = this.contextBreakdown(cwd, Number(parsed.conversation_tokens) || 0, Number(parsed.window) || 0)
         const sessionId = String(parsed.session_id || '')
+        const modelId = this.activeModel || this.settings.model_id || ''
+        // A caller that does not know the window used to send 0, which made the
+        // meter divide by zero and show nothing. Resolve it the same way the
+        // loop does, so the panel and the compaction threshold agree.
+        const windowInfo = inferContextWindow(modelId, this.settings.context_window || 0)
+        const window = Number(parsed.window) || windowInfo.tokens
+        const breakdown = this.contextBreakdown(cwd, Number(parsed.conversation_tokens) || 0, window)
         const lastPrompt = sessionId ? (sessionPromptTokens.get(sessionId) || 0) : 0
-        return { success: true, result: JSON.stringify({ ...breakdown, last_prompt_tokens: lastPrompt }), error: '' }
+        return {
+          success: true,
+          result: JSON.stringify({
+            ...breakdown,
+            last_prompt_tokens: lastPrompt,
+            window_source: windowInfo.source,
+            compact_tier: decideCompactTier(lastPrompt || breakdown.used, window, compactPolicy(modelId)),
+            cache: {
+              prefix_hash: sessionId ? (sessionPrefix.get(sessionId) || '') : '',
+              cache_profile: cacheProfileFor(modelId),
+            },
+          }),
+          error: '',
+        }
       } catch (error: any) { return { success: false, result: '', error: error?.message || 'context_usage failed' } }
     }
     if (tool === 'host_status') {
@@ -1861,7 +2012,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       toolGroups: this.toolGroupsApi(stateKey),
       recon: await this.reconFor(stateKey),
       assessments: this.assessments,
-      artex: this.assessments.activeFor(stateKey),
+      reconRun: this.assessments.activeFor(stateKey),
       sessionDirectives: this.directives,
       // No signal here to inherit: the direct path has no tool-call lifecycle,
       // so plain toolLlm is already detached. runSubAgent lets assessment

@@ -1,6 +1,6 @@
 import type { SubAgentRunner } from '../agent/subagents.js'
 import type { SandboxPolicy } from '../sandbox/policy.js'
-import type { ReconGraph } from '../analysis/artex/graph.js'
+import type { ReconGraph } from '../analysis/recon/graph.js'
 export interface ToolResult {
   success: boolean;
   data: any;
@@ -54,14 +54,14 @@ export interface ToolContext {
   /** Asset + exploration graphs for this task (the recon_graph tool). */
   recon?: ReconGraph;
   /** Background assessment tasks (the assessments tool). */
-  assessments?: import('../analysis/artex/tasks.js').AssessmentManager;
+  assessments?: import('../analysis/recon/tasks.js').AssessmentManager;
   /**
-   * The ARTEX run context: the session's shared graph plus the active run's
+   * The RECON run context: the session's shared graph plus the active run's
    * trace store and live constraints. Present only while an assessment (or
-   * deep_scan) is running in this session — the ARTEX tool surface operates
+   * deep_scan) is running in this session — the RECON tool surface operates
    * through it.
    */
-  artex?: import('../analysis/artex/tasks.js').ArtexRunContext;
+  reconRun?: import('../analysis/recon/tasks.js').ReconRunContext;
   /** Session UI directives (the session tool): titles and toasts, applied by core on its next inbox poll. */
   sessionDirectives?: import('../task/directives.js').SessionDirectives;
   /**

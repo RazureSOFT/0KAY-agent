@@ -8,9 +8,11 @@ import { OsintTool } from './packages/recon.js';
 import { DeepScanTool, ExploitRuntimeTool } from './packages/scan.js';
 import { AssessmentsTool } from './packages/assess.js';
 import { SessionTool } from './packages/session.js';
-import { ARTEX_TOOLS } from './packages/artex.js';
+import { RECON_OPS_TOOLS } from './packages/recon_ops.js';
 import { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
+import { ProgressTool } from './progress.js';
+import { PlanTool } from './plan.js';
 export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { withWindowsShellHint } from './shell_hint.js';
@@ -40,6 +42,8 @@ import { DiagramTool } from './diagram.js';
 import { SetupDepsTool } from './setup_deps.js';
 import { GitHubSearchTool } from './github_search.js';
 import { BackgroundTaskTool } from './background_task.js';
+import { TaskListTool, TaskOutputTool, TaskStopTool, SleepTool, MonitorTool } from './task_tools.js';
+import { ShellSessionTool } from './shell_tool.js';
 import { ReportArtifactsTool } from './report_artifacts.js';
 import { EvolveBeginTool, EvolveCommitTool, EvolveUpstreamTool, EvolveFinishTool } from './self_evolve.js';
 import { Tool, type ToolResult, type ToolContext, type TodoItem, type McpClientLike } from './types.js';
@@ -458,10 +462,14 @@ export class ShellTool extends Tool {
 
 export class WebFetchTool extends Tool {
   get name(): string { return 'webfetch'; }
-  get description(): string { return 'Fetch a URL and return text, markdown-like HTML stripping, or raw HTML.'; }
+  get description(): string { return 'Fetch a URL and return text, markdown-like HTML stripping, or raw HTML. You may set the User-Agent when a site serves different content to different clients (mobile layout, bot wall, API-only).'; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['url'], properties: {
-      url: { type: 'string', format: 'uri' }, format: { type: 'string', enum: ['text', 'markdown', 'html'] }, timeout: { type: 'integer', minimum: 1, maximum: 120 },
+      url: { type: 'string', format: 'uri' },
+      format: { type: 'string', enum: ['text', 'markdown', 'html'] },
+      timeout: { type: 'integer', minimum: 1, maximum: 120 },
+      user_agent: { type: 'string', description: 'Override the User-Agent. Useful when a site returns a login wall or a degraded page to the default browser UA, or when the mobile page is the readable one.' },
+      accept_language: { type: 'string', description: 'Override Accept-Language, e.g. "en-US,en;q=0.9".' },
     }};
   }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
@@ -469,10 +477,18 @@ export class WebFetchTool extends Tool {
       if (typeof args.url !== 'string' || !/^https?:\/\//i.test(args.url)) throw new Error('url must be an http(s) URL');
       const timeout = AbortSignal.timeout(clamp(args.timeout, 30, 1, 120) * 1000);
       const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
+      // The model chooses the client identity; the default is a plain desktop
+      // browser because most sites are happier with that than with a bot string.
+      const userAgent = typeof args.user_agent === 'string' && args.user_agent.trim()
+        ? args.user_agent.trim().slice(0, 400)
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+      const acceptLanguage = typeof args.accept_language === 'string' && args.accept_language.trim()
+        ? args.accept_language.trim().slice(0, 120)
+        : 'zh-CN,zh;q=0.9,en;q=0.8';
       const response = await egressFetch(args.url, { signal, headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'User-Agent': userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Language': acceptLanguage,
       } }, clamp(args.timeout, 30, 1, 120) * 1000);
       const html = await response.text();
       const format = args.format || 'markdown';
@@ -1229,6 +1245,9 @@ export class ToolRegistry {
 export interface PluginToolDef {
   plugin: string;
   name: string;
+  /** Name the plugin answers to, when the visible name had to be changed to
+   *  avoid a collision. Defaults to `name`. */
+  call?: string;
   description?: string;
   parameters?: Record<string, any>;
   dangerous?: boolean;
@@ -1246,7 +1265,8 @@ export class PluginTool extends Tool {
   }
   get dangerous(): boolean { return !!this.def.dangerous; }
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
-    const result = await callPluginTool(this.def.name, args || {}, context?.sessionId || context?.taskId || '', `agent:${context?.agentType || 'general'}`);
+    // Renamed tools still call the name the plugin declared.
+    const result = await callPluginTool(this.def.call || this.def.name, args || {}, context?.sessionId || context?.taskId || '', `agent:${context?.agentType || 'general'}`);
     if (result.success) return success(result.result);
     return failure(result.error || 'plugin tool failed');
   }
@@ -1256,11 +1276,13 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
-    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new SessionTool(), ...ARTEX_TOOLS,
-    new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
+    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new SessionTool(), ...RECON_OPS_TOOLS,
+    new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
     new GitHubSearchTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),
+    new TaskListTool(), new TaskOutputTool(), new TaskStopTool(), new SleepTool(), new MonitorTool(),
+    new ShellSessionTool(),
     new EvolveBeginTool(), new EvolveCommitTool(), new EvolveUpstreamTool(), new EvolveFinishTool(),
     new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new AcpStatusTool(),
   ]) registry.register(tool);

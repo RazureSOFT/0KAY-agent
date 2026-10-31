@@ -1,26 +1,26 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
-import type { ReconGraph } from '../../analysis/artex/graph.js'
-import type { TraceStore } from '../../analysis/artex/traces.js'
+import type { ReconGraph } from '../../analysis/recon/graph.js'
+import type { TraceStore } from '../../analysis/recon/traces.js'
 
-// The ARTEX tool surface, 1:1: the same tool names, the same argument shapes
+// The RECON tool surface, 1:1: the same tool names, the same argument shapes
 // and the same model-facing descriptions (ported from agent/tools.go, AGPL-3.0,
 // see analysis/README.md for the licence record). They operate on the run
-// context (context.artex) — the session's shared graph and the active run's
-// trace store — instead of ARTEX's per-task DB stores.
+// context (context.reconRun) — the session's shared graph and the active run's
+// trace store — instead of RECON's per-task DB stores.
 //
 // Known divergences, kept honest:
-//   - report_finding returns only the exploration node id (ARTEX also keeps a
+//   - report_finding returns only the exploration node id (RECON also keeps a
 //     separate findings table bound to recorded traffic);
-//   - steer_work queues a steering trace for the intent (ARTEX injects it into
+//   - steer_work queues a steering trace for the intent (RECON injects it into
 //     the worker's live conversation);
-//   - company scopes do not exist here (no company model).
-// Tool names not ported: traffic_* (no MITM layer yet), list_companies /
-// add_company_scope (no company model), mcp/skill wrappers (already exist as
-// their own tools).
+//   - a company carries no coverage rule of its own: assets are tagged with an
+//     owner and reported per owner, but scope stays keyed on domains/IPs.
+// Tool names not ported: traffic_* (no MITM layer yet), add_company_scope,
+// mcp/skill wrappers (already exist as their own tools).
 
-export interface ArtexRun {
+export interface ReconRun {
   graph: ReconGraph
   traces: TraceStore
   /** The task's live constraints array — mutating it steers the planner. */
@@ -28,12 +28,12 @@ export interface ArtexRun {
   objective?: string
 }
 
-function run(context: ToolContext): ArtexRun | null {
-  return context.artex || null
+function run(context: ToolContext): ReconRun | null {
+  return context.reconRun || null
 }
 
 /**
- * asset_ids in ARTEX are ids; here they may also be raw observations. Returns
+ * asset_ids in RECON are ids; here they may also be raw observations. Returns
  * RAW strings for addNode({assets}) — ids resolve to their asset's key, unknown
  * entries pass through as new observations.
  */
@@ -77,9 +77,9 @@ export class RecordFactTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable (recon_graph tool covers ad-hoc use)')
-    const { graph } = artex
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable (recon_graph tool covers ad-hoc use)')
+    const { graph } = reconRun
     const items: Array<Record<string, any>> = Array.isArray(args.facts) && args.facts.length ? args.facts : [args]
     const defaultIntent = String(args.intent_id || '')
     const ids: string[] = []
@@ -127,9 +127,9 @@ export class ReportFindingTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const { graph } = artex
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const { graph } = reconRun
     const summary = String(args.summary || '').trim()
     if (!summary) return failure('summary is required')
     const name = String(args.name || '').trim()
@@ -164,16 +164,18 @@ export class InsertAssetsTool extends Tool {
       properties: {
         assets: { type: 'array', items: { type: 'string' }, description: '资产原始标识数组：URL、主机名、host:port、IP。' },
         intent_id: { type: 'string', description: '发现这些资产的意图 id（锚点）。' },
+        company: { type: 'string', description: '这些资产所属的组织/公司；报告按组织归集，后续再补也可以。' },
       },
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const { graph } = artex
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const { graph } = reconRun
     const raws = Array.isArray(args.assets) ? args.assets.map(String).filter(Boolean) : []
     if (!raws.length) return failure('assets must be a non-empty array')
-    const created = raws.map((raw) => graph.addAsset(raw))
+    const company = String(args.company || '').trim() || undefined
+    const created = raws.map((raw) => graph.addAsset(raw, company))
     const intentId = String(args.intent_id || '')
     if (intentId) {
       const intent = graph.node(intentId)
@@ -206,9 +208,9 @@ export class AddIntentTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const { graph } = artex
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const { graph } = reconRun
     const items: Array<Record<string, any>> = Array.isArray(args.intents) && args.intents.length ? args.intents : [args]
     const ids: string[] = []
     const errors: Record<string, string> = {}
@@ -250,13 +252,13 @@ export class ProveGoalTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const goalId = String(args.goal_id || '')
     const evidenceId = String(args.evidence_id || '')
     if (!goalId || !evidenceId) return failure('goal_id 和 evidence_id 必填')
-    const goal = artex.graph.prove(goalId, evidenceId)
-    const goals = artex.graph.toJSON().nodes.filter((node) => node.kind === 'goal')
+    const goal = reconRun.graph.prove(goalId, evidenceId)
+    const goals = reconRun.graph.toJSON().nodes.filter((node) => node.kind === 'goal')
     const allMet = goals.length > 0 && goals.every((node) => node.status === 'met' || node.status === 'abandoned')
     return success({
       goal: goalId, status: goal.status,
@@ -280,12 +282,12 @@ export class GoalMetTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const reason = String(args.reason || '').trim()
     if (!reason) return failure('reason is required')
-    const goals = artex.graph.toJSON().nodes.filter((node: any) => node.kind === 'goal' && node.status === 'open')
-    for (const goal of goals) artex.graph.setStatus(goal.id, 'met')
+    const goals = reconRun.graph.toJSON().nodes.filter((node: any) => node.kind === 'goal' && node.status === 'open')
+    for (const goal of goals) reconRun.graph.setStatus(goal.id, 'met')
     return success({ closed: goals.length, reason, note: '全部目标已标记 met，任务按目标完成收官' })
   }
 }
@@ -298,9 +300,9 @@ export class KillWorkTool extends Tool {
     return { type: 'object', required: ['intent_id'], properties: { intent_id: { type: 'string', description: '要终止的意图节点 id。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    artex.graph.setStatus(String(args.intent_id || ''), 'stopped')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    reconRun.graph.setStatus(String(args.intent_id || ''), 'stopped')
     return success({ killed: String(args.intent_id || '') })
   }
 }
@@ -319,13 +321,13 @@ export class SteerWorkTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const intentId = String(args.intent_id || '')
     const message = String(args.message || '').trim()
     if (!intentId || !message) return failure('intent_id and message are required')
-    artex.traces.record({ intentId, worker: 'steer', action: 'steer', detail: message, ok: true })
-    const node = artex.graph.node(intentId)
+    reconRun.traces.record({ intentId, worker: 'steer', action: 'steer', detail: message, ok: true })
+    const node = reconRun.graph.node(intentId)
     if (node) {
       node.text += `\n[steer] ${message}`
     }
@@ -341,11 +343,11 @@ export class AddHintTool extends Tool {
     return { type: 'object', required: ['text'], properties: { text: { type: 'string', description: '战略提示一句话。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const text = String(args.text || '').trim()
     if (!text) return failure('text is required')
-    const node = artex.graph.addHint(text)
+    const node = reconRun.graph.addHint(text)
     return success({ id: node.id })
   }
 }
@@ -364,15 +366,15 @@ export class SetGoalsTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const list = Array.isArray(args.goals) ? args.goals.map(String).map((entry) => entry.trim()).filter(Boolean) : []
     if (!list.length) return failure('goals must be a non-empty array')
     const created: string[] = []
-    for (const node of artex.graph.toJSON().nodes) {
-      if (node.kind === 'goal' && node.status === 'open') artex.graph.setStatus(node.id, 'abandoned')
+    for (const node of reconRun.graph.toJSON().nodes) {
+      if (node.kind === 'goal' && node.status === 'open') reconRun.graph.setStatus(node.id, 'abandoned')
     }
-    for (const text of list.slice(0, 8)) created.push(artex.graph.addNode({ kind: 'goal', text }).id)
+    for (const text of list.slice(0, 8)) created.push(reconRun.graph.addNode({ kind: 'goal', text }).id)
     return success({ goals: created })
   }
 }
@@ -391,17 +393,17 @@ export class SetConstraintsTool extends Tool {
     }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    if (!artex.constraints) return failure('this run has no constraints channel')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    if (!reconRun.constraints) return failure('this run has no constraints channel')
     const list = Array.isArray(args.constraints) ? args.constraints.map(String).map((entry) => entry.trim()).filter(Boolean) : []
     if (!list.length) return failure('constraints must be a non-empty array')
-    for (const entry of list) if (!artex.constraints.includes(entry)) artex.constraints.push(entry)
-    return success({ constraints: [...artex.constraints] })
+    for (const entry of list) if (!reconRun.constraints.includes(entry)) reconRun.constraints.push(entry)
+    return success({ constraints: [...reconRun.constraints] })
   }
 }
 
-/** add_task_scope — merges scope rows (ARTEX add_task_scope; minimal-scope principle). */
+/** add_task_scope — merges scope rows (RECON add_task_scope; minimal-scope principle). */
 export class AddTaskScopeTool extends Tool {
   get name(): string { return 'add_task_scope'; }
   get description(): string {
@@ -411,10 +413,10 @@ export class AddTaskScopeTool extends Tool {
     return { type: 'object', required: ['patterns'], properties: { patterns: { type: 'array', items: { type: 'string' }, description: '域名/IP/CIDR（URL 会取主机名）。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const rows = artex.graph.addScope(Array.isArray(args.patterns) ? args.patterns.map(String) : [])
-    return success({ scope: rows.map((row: any) => `${row.kind}:${row.value}`), pct: artex.graph.coverage().scope.pct })
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const rows = reconRun.graph.addScope(Array.isArray(args.patterns) ? args.patterns.map(String) : [])
+    return success({ scope: rows.map((row: any) => `${row.kind}:${row.value}`), pct: reconRun.graph.coverage().scope.pct })
   }
 }
 
@@ -426,9 +428,9 @@ export class GraphOverviewTool extends Tool {
   get description(): string { return '一次性读取完整探索态势（goals、open/running 意图、facts、coverage、traces）——规划者的态势输入就是它，无需再调别的读工具。' }
   get parameters(): Record<string, any> { return { type: 'object', properties: {} } }
   async execute(_args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    return success(artex.graph.overview())
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    return success(reconRun.graph.overview())
   }
 }
 
@@ -440,11 +442,11 @@ export class ListFactsTool extends Tool {
     return { type: 'object', properties: { q: { type: 'string', description: '子串过滤。' }, limit: { type: 'integer', minimum: 1, maximum: 100, description: '默认 20。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const q = String(args.q || '').toLowerCase()
     const limit = Math.min(Number(args.limit) || 20, 100)
-    const rows = artex.graph.toJSON().nodes
+    const rows = reconRun.graph.toJSON().nodes
       .filter((node) => node.kind === 'fact' && node.status !== 'origin')
       .filter((node) => !q || node.text.toLowerCase().includes(q))
       .slice(-limit)
@@ -460,10 +462,10 @@ export class ListFindingsTool extends Tool {
   get description(): string { return '列出全部确认的漏洞发现。' }
   get parameters(): Record<string, any> { return { type: 'object', properties: {} } }
   async execute(_args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     return success({
-      findings: artex.graph.toJSON().nodes.filter((node) => node.kind === 'finding').map((node: any) => ({ id: node.id, text: node.text, status: node.status })),
+      findings: reconRun.graph.toJSON().nodes.filter((node) => node.kind === 'finding').map((node: any) => ({ id: node.id, text: node.text, status: node.status })),
     })
   }
 }
@@ -474,9 +476,9 @@ export class ListGoalsTool extends Tool {
   get description(): string { return '列出本任务的目标与状态。' }
   get parameters(): Record<string, any> { return { type: 'object', properties: {} } }
   async execute(_args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    return success({ goals: artex.graph.toJSON().nodes.filter((node) => node.kind === 'goal').map((node: any) => ({ id: node.id, text: node.text, status: node.status })) })
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    return success({ goals: reconRun.graph.toJSON().nodes.filter((node) => node.kind === 'goal').map((node: any) => ({ id: node.id, text: node.text, status: node.status })) })
   }
 }
 
@@ -488,15 +490,15 @@ export class NodeDetailTool extends Tool {
     return { type: 'object', required: ['id'], properties: { id: { type: 'string', description: '节点 id。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const node = artex.graph.node(String(args.id || ''))
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const node = reconRun.graph.node(String(args.id || ''))
     if (!node) return failure(`unknown node: ${args.id}`)
-    const edges = artex.graph.edgesOut()
+    const edges = reconRun.graph.edgesOut()
     return success({
       id: node.id, kind: node.kind, status: node.status, text: node.text, assetIds: node.assetIds,
-      upstream: node.derivedFrom.map((id) => artex.graph.node(id)).filter(Boolean).map((parent) => ({ id: parent!.id, kind: parent!.kind, text: parent!.text })),
-      downstream: edges.filter((edge) => edge.src === node.id).map((edge) => artex.graph.node(edge.dst)).filter(Boolean).map((child) => ({ id: child!.id, kind: child!.kind, text: child!.text })),
+      upstream: node.derivedFrom.map((id) => reconRun.graph.node(id)).filter(Boolean).map((parent) => ({ id: parent!.id, kind: parent!.kind, text: parent!.text })),
+      downstream: edges.filter((edge) => edge.src === node.id).map((edge) => reconRun.graph.node(edge.dst)).filter(Boolean).map((child) => ({ id: child!.id, kind: child!.kind, text: child!.text })),
     })
   }
 }
@@ -509,13 +511,13 @@ export class ExpandDigestTool extends Tool {
     return { type: 'object', required: ['id'], properties: { id: { type: 'string', description: 'digest 节点 id。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    const digest = artex.graph.digests().find((entry) => entry.id === String(args.id || ''))
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const digest = reconRun.graph.digests().find((entry) => entry.id === String(args.id || ''))
     if (!digest) return failure(`unknown or inactive digest: ${args.id}`)
     return success({
       id: digest.id, text: digest.text,
-      members: digest.memberIds.map((id) => artex.graph.node(id)).filter(Boolean).map((node) => ({ id: node!.id, kind: node!.kind, status: node!.status, text: node!.text })),
+      members: digest.memberIds.map((id) => reconRun.graph.node(id)).filter(Boolean).map((node) => ({ id: node!.id, kind: node!.kind, status: node!.status, text: node!.text })),
     })
   }
 }
@@ -528,13 +530,13 @@ export class ListAssetsTool extends Tool {
     return { type: 'object', properties: { type: { type: 'string', description: '按类型过滤（root_domain/subdomain/ip/service/app/endpoint）。' }, q: { type: 'string', description: '子串过滤。' }, limit: { type: 'integer', minimum: 1, maximum: 500, description: '默认 100。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const type = String(args.type || '')
     const q = String(args.q || '').toLowerCase()
     const limit = Math.min(Number(args.limit) || 100, 500)
     return success({
-      assets: artex.graph.toJSON().assets
+      assets: reconRun.graph.toJSON().assets
         .filter((asset) => (!type || asset.kind === type) && (!q || asset.key.toLowerCase().includes(q)))
         .slice(0, limit)
         .map((asset) => ({ id: asset.id, kind: asset.kind, key: asset.key })),
@@ -550,10 +552,10 @@ export class ListUntestedAssetsTool extends Tool {
     return { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 200, description: '默认 20。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     const limit = Math.min(Number(args.limit) || 20, 200)
-    const coverage = artex.graph.coverage()
+    const coverage = reconRun.graph.coverage()
     return success({
       untested: coverage.untested.slice(0, limit).map((asset) => ({ id: asset.id, kind: asset.kind, key: asset.key })),
       total: coverage.untested.length,
@@ -570,10 +572,10 @@ export class SearchAllWorkerTracesTool extends Tool {
     return { type: 'object', required: ['q'], properties: { q: { type: 'string', description: '关键字（如 sqlmap、/admin、500）。' }, exclude_intent: { type: 'string', description: '排除自己的意图 id。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
     return success({
-      hits: artex.traces.search(String(args.q || ''), { excludeIntent: args.exclude_intent ? String(args.exclude_intent) : undefined }),
+      hits: reconRun.traces.search(String(args.q || ''), { excludeIntent: args.exclude_intent ? String(args.exclude_intent) : undefined }),
     })
   }
 }
@@ -586,15 +588,55 @@ export class GetWorkerTraceTool extends Tool {
     return { type: 'object', required: ['intent_id'], properties: { intent_id: { type: 'string', description: '意图节点 id。' } } }
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const artex = run(context)
-    if (!artex) return failure('artex run context unavailable')
-    return success({ steps: artex.traces.get(String(args.intent_id || '')) })
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    return success({ steps: reconRun.traces.get(String(args.intent_id || '')) })
   }
 }
 
-export const ARTEX_TOOLS = [
+/**
+ * Assets grouped by owning organisation.
+ *
+ * The report has to attribute each finding to a company, and a target list often
+ * spans several owners. Unowned assets are returned under an empty name rather
+ * than dropped, so a missing tag is visible instead of silently absent.
+ */
+export class ListCompaniesTool extends Tool {
+  get name(): string { return 'list_companies'; }
+  get description(): string {
+    return '按所属组织归集资产：返回每个组织名下的资产、资产总数与已测数量。没有标注组织的资产会归到空名称下，便于补标。'
+  }
+  get parameters(): Record<string, any> {
+    return {
+      type: 'object',
+      properties: {
+        detail: { type: 'boolean', description: 'true 时列出每个组织下的资产明细（id/kind/key），默认只给数量。' },
+      },
+    }
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const detail = args.detail === true
+    const groups = reconRun.graph.companies({ hostsPerCompany: detail ? 40 : 8 }).map((group) => ({
+      company: group.company || '(未标注组织)',
+      total: group.total,
+      tested: group.tested,
+      untested: group.untested,
+      pct: group.pct,
+      byKind: group.byKind,
+      hosts: group.hosts,
+      ...(detail
+        ? { assets: group.assets.map((asset) => ({ id: asset.id, kind: asset.kind, key: asset.key })) }
+        : {}),
+    }))
+    return success({ companies: groups, total: groups.reduce((sum, group) => sum + group.total, 0) })
+  }
+}
+
+export const RECON_OPS_TOOLS = [
   new GraphOverviewTool(), new ListGoalsTool(), new ListFactsTool(), new ListFindingsTool(), new NodeDetailTool(), new ExpandDigestTool(),
-  new ListAssetsTool(), new ListUntestedAssetsTool(), new AddTaskScopeTool(),
+  new ListAssetsTool(), new ListUntestedAssetsTool(), new ListCompaniesTool(), new AddTaskScopeTool(),
   new AddIntentTool(), new ProveGoalTool(), new GoalMetTool(), new KillWorkTool(), new SteerWorkTool(),
   new RecordFactTool(), new ReportFindingTool(), new InsertAssetsTool(), new AddHintTool(), new SetGoalsTool(), new SetConstraintsTool(),
   new SearchAllWorkerTracesTool(), new GetWorkerTraceTool(),

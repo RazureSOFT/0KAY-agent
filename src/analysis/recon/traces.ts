@@ -1,7 +1,7 @@
-// ARTEX's cross-worker knowledge sharing, without the database.
+// RECON's cross-worker knowledge sharing, without the database.
 //
 // Workers run in parallel and cannot see each other's conversations, so the same
-// endpoint gets probed five times. ARTEX solves it by letting a worker search the
+// endpoint gets probed five times. RECON solves it by letting a worker search the
 // others' *execution traces* — not their conclusions, their steps. That is a
 // different granularity: "someone already tried `sqlmap -u .../id=1` and got a 500"
 // is more useful than a formalised fact, and it costs nothing to record.

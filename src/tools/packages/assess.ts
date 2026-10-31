@@ -2,8 +2,8 @@ import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
 
-// ARTEX's task system as one tool: background assessment tasks that run the
-// ARTEX loop on the session graph, outliving the call that started them. The
+// RECON's task system as one tool: background assessment tasks that run the
+// RECON loop on the session graph, outliving the call that started them. The
 // panel drives this same tool over /api/run, which is why it is in the
 // always-safe set — the user pressing "start" in the panel is the approval.
 
@@ -11,7 +11,7 @@ export class AssessmentsTool extends Tool {
   get name(): string { return 'assessments'; }
   get description(): string {
     return [
-      'Long-running assessment tasks: create starts the ARTEX loop (goals phase, planner, workers) in the background on the session recon graph — it keeps running after this call returns.',
+      'Long-running assessment tasks: create starts the RECON loop (goals phase, planner, workers) in the background on the session recon graph — it keeps running after this call returns.',
       'action=list shows every task with status and coverage; action=get returns one task plus the live graph read (goals, open intents, findings, recent activity).',
       'action=control with operation=pause|resume|cancel|delete manages a task; a paused task resumes where the frontier left off. action=hint sends steering text the planner reads next round.',
       'action=report renders the task graph into a Markdown deliverable (goals, coverage, findings with evidence chains, open directions) written to the working directory — call report_artifacts with the returned path.',
@@ -23,7 +23,7 @@ export class AssessmentsTool extends Tool {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'trace', 'report'] },
+        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report'] },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
         objective: { type: 'string', description: 'create: the objective, in one sentence.' },
         targets: { type: 'array', items: { type: 'string' }, description: 'create: in-scope assets — also the coverage denominator.' },
@@ -85,6 +85,17 @@ export class AssessmentsTool extends Tool {
           await manager.hint(String(args.id || ''), String(args.text || ''))
           return success({ delivered: true })
         }
+        case 'say': {
+          // A direct message to the running agent, not a graph hint: it lands in
+          // the constraints the next planning round already re-reads.
+          const outcome = await manager.say(String(args.id || ''), String(args.text || ''))
+          return success({
+            ...outcome,
+            note: outcome.delivered
+              ? 'delivered to the live run — it takes effect on the next round'
+              : 'no live run; the message is kept and folded in when the task resumes',
+          })
+        }
         case 'trace': {
           const steps = manager.trace(String(args.id || ''), String(args.intent_id || ''))
           return success({ steps })
@@ -95,7 +106,7 @@ export class AssessmentsTool extends Tool {
           return success({ ...result, note: 'call report_artifacts with this path so the user gets a clickable link' })
         }
         default:
-          throw new Error('action must be create, list, get, control, hint or report')
+          throw new Error('action must be create, list, get, control, hint, say or report')
       }
     } catch (error) {
       return failure(error)

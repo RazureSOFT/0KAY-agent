@@ -45,6 +45,8 @@ export interface Asset {
   /** What the caller submitted, kept for display. */
   raw: string
   parentId?: string
+  /** Owning organisation, when the caller knows it. Assets without one stay unowned. */
+  company?: string
   createdAt: string
 }
 
@@ -80,7 +82,7 @@ export interface ExplorationNode {
   createdAt: string
 }
 
-export type ScopeKind = 'domain' | 'ip' | 'cidr'
+export type ScopeKind = 'domain' | 'ip' | 'cidr' | 'company'
 
 export interface ScopeEntry {
   kind: ScopeKind
@@ -236,16 +238,33 @@ export class ReconGraph {
   }
 
   /** Add an asset, deduplicated by kind+key, with its parents inferred. */
-  addAsset(raw: string): Asset {
+  addAsset(raw: string, company?: string): Asset {
     const classified = classify(raw)
     const existing = this.byKey.get(`${classified.kind}:${classified.key}`)
-    if (existing) return this.assets.get(existing)!
+    if (existing) {
+      const asset = this.assets.get(existing)!
+      // Seen again with an owner we did not know before: keep it, and carry the
+      // tag up the parent chain — an asset's ancestors belong to the same owner,
+      // and the tag often arrives after the tree was first built.
+      if (company && company.trim() && !asset.company) {
+        const owner = company.trim()
+        asset.company = owner
+        let parent = asset.parentId ? this.assets.get(asset.parentId) : undefined
+        while (parent && !parent.company) {
+          parent.company = owner
+          parent = parent.parentId ? this.assets.get(parent.parentId) : undefined
+        }
+        this.changed()
+      }
+      return asset
+    }
 
     let parentId: string | undefined
     if (classified.parentKey) {
       parentId = this.byKey.get(`${classified.parentKind}:${classified.parentKey}`)
       // The parent may not have been seen yet; add it so the tree is never broken.
-      if (!parentId) parentId = this.addAsset(classified.parentKey).id
+      // The parent belongs to the same owner as the child that revealed it.
+      if (!parentId) parentId = this.addAsset(classified.parentKey, company).id
     }
 
     const asset: Asset = {
@@ -254,6 +273,7 @@ export class ReconGraph {
       key: classified.key,
       raw: raw.trim(),
       parentId,
+      ...(company && company.trim() ? { company: company.trim() } : {}),
       createdAt: now(),
     }
     this.assets.set(asset.id, asset)
@@ -296,6 +316,12 @@ export class ReconGraph {
       const slash = value.includes('/') ? value.split('/') : null
       if (slash && IPV4.test(slash[0]) && /^\d{1,2}$/.test(slash[1] || '')) {
         entries.push({ kind: 'cidr', value })
+        continue
+      }
+      // `company:ACME` puts every asset tagged with that owner in scope.
+      if (/^company:/i.test(value)) {
+        const name = value.replace(/^company:/i, '').trim()
+        if (name) entries.push({ kind: 'company', value: name })
         continue
       }
       let host = value
@@ -510,6 +536,7 @@ export class ReconGraph {
     return this.scopeRows.some((row) => {
       if (row.kind === 'ip') return host === row.value
       if (row.kind === 'cidr') return host ? ipv4InCidr(host, row.value) : false
+      if (row.kind === 'company') return (asset.company || '').toLowerCase() === row.value.toLowerCase()
       if (!host) return false
       return host === row.value || host.endsWith(`.${row.value}`)
     })
@@ -676,6 +703,66 @@ export class ReconGraph {
     if (Array.isArray(data.scope)) graph.scopeRows = data.scope.filter((row) => row?.kind && row?.value)
     return graph
   }
+  /**
+   * The organisation view of the asset graph.
+   *
+   * A flat asset list answers "what did we find"; the report needs "whose is it,
+   * how much is done, what is still untested" per owner. Each entry therefore
+   * carries a kind breakdown and its own coverage. Assets without an owner stay
+   * visible under an empty name, so an untagged asset cannot hide.
+   */
+  companies(options: { hostsPerCompany?: number } = {}): Array<{
+    company: string
+    total: number
+    tested: number
+    untested: number
+    pct: number | null
+    byKind: Partial<Record<AssetKind, number>>
+    hosts: string[]
+    assets: Asset[]
+  }> {
+    const tested = this.testedAssets()
+    const hostLimit = Math.max(0, options.hostsPerCompany ?? 12)
+    const buckets = new Map<string, Asset[]>()
+    for (const asset of this.assets.values()) {
+      const owner = asset.company || ''
+      const list = buckets.get(owner)
+      if (list) list.push(asset)
+      else buckets.set(owner, [asset])
+    }
+    const rows = [...buckets.entries()].map(([company, assets]) => {
+      const byKind: Partial<Record<AssetKind, number>> = {}
+      const hosts: string[] = []
+      let testedCount = 0
+      let scoped = 0
+      let scopedTested = 0
+      for (const asset of assets) {
+        byKind[asset.kind] = (byKind[asset.kind] || 0) + 1
+        const isTested = tested.has(asset.id)
+        if (isTested) testedCount += 1
+        if (this.inScope(asset)) {
+          scoped += 1
+          if (isTested) scopedTested += 1
+        }
+        // Hosts are what a person recognises; services and endpoints repeat them.
+        if ((asset.kind === 'root_domain' || asset.kind === 'subdomain' || asset.kind === 'ip') && hosts.length < hostLimit) {
+          hosts.push(asset.key)
+        }
+      }
+      return {
+        company,
+        total: assets.length,
+        tested: testedCount,
+        untested: scoped - scopedTested,
+        pct: scoped === 0 ? null : Math.round((scopedTested / scoped) * 100),
+        byKind,
+        hosts: [...new Set(hosts)].sort(),
+        assets: [...assets].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      }
+    })
+    // Unattributed assets sort last: owned work is what the report is about.
+    return rows.sort((a, b) => (a.company === '' ? 1 : 0) - (b.company === '' ? 1 : 0) || b.total - a.total)
+  }
 }
 
 export type StoredGraph = SerializedGraph
@@ -715,4 +802,6 @@ export class FileGraphStore {
   async save(key: string, data: StoredGraph): Promise<void> {
     await writeFileAtomic(this.fileFor(key), JSON.stringify(data))
   }
+
+
 }

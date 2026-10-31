@@ -31,6 +31,8 @@ export class ContextLedger {
   private blocks: LedgerBlock[] = []
   private counter = 0
   lastPromptTokens = 0
+  /** Did the cacheable prefix change since this session's previous request? */
+  prefixChanged = false
 
   constructor(private readonly getHistory: () => any[]) {}
 
@@ -111,6 +113,7 @@ export class ContextLedger {
       visible_messages: Array.isArray(history) ? history.length : 0,
       estimated_tokens: visibleTokens,
       last_prompt_tokens: this.lastPromptTokens,
+      prefix_changed: this.prefixChanged,
       compressed_blocks: this.blocks.map((block) => ({ id: block.id, index: block.index, folded_messages: block.messages.length, tokens: block.tokens })),
       note: 'compress(from,to,summary) folds history[from..to] into a summary; decompress(block) restores it; search_context(query) looks inside folded ranges.',
     }

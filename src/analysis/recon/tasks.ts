@@ -13,15 +13,15 @@ import type { LoopRuntime, LoopContext } from './loop.js'
 import { renderAssessmentReport } from './report.js'
 import { writeFileAtomic } from '../../tools/atomic_write.js'
 
-// The task system: ARTEX's long-lived assessment tasks, adapted to this agent.
+// The task system: RECON's long-lived assessment tasks, adapted to this agent.
 //
-// A task is an objective plus targets that runs the ARTEX loop in the
+// A task is an objective plus targets that runs the RECON loop in the
 // background — the same engine, planner and workers as deep_scan — on the
 // session's recon graph. It outlives the tool call that created it, which is
 // the whole point: the panel lists tasks, watches them move the graph, and
 // steers them (pause / resume / cancel / a hint to the planner) while they run.
 //
-// Tasks keep ARTEX's shape: goals are proven by evidence or not at all, the
+// Tasks keep RECON's shape: goals are proven by evidence or not at all, the
 // coverage gate can hold a proof back, a budget ends the run with one
 // settlement round, and a paused task resumes on the same graph, plan and
 // traces — the frontier is the state, not the process.
@@ -94,6 +94,12 @@ export interface AssessmentState {
   goalIds: string[]
   goalTexts: Array<{ id: string; text: string }>
   constraints: string[]
+  /**
+   * Operator messages that arrived while no run was live. They are folded into
+   * the constraints when the task is resumed, so a paused task does not lose what
+   * the operator told it.
+   */
+  pendingMessages?: string[]
   scope: string[]
   stopped?: string
   error?: string
@@ -130,12 +136,12 @@ export interface AssessmentLive {
 }
 
 /**
- * What the ARTEX tool surface (record_fact / add_intent / graph_overview / …)
+ * What the RECON tool surface (record_fact / add_intent / graph_overview / …)
  * operates on while a run is live in this session. The graph is the session's
  * shared instance; the trace store and the constraints array belong to the
  * active run.
  */
-export interface ArtexRunContext {
+export interface ReconRunContext {
   graph: ReconGraph
   traces: TraceStore
   constraints?: string[]
@@ -157,8 +163,8 @@ const MAX_SESSIONS = 400
 export class AssessmentManager {
   private states = new Map<string, AssessmentState>()
   private runs = new Map<string, RunHandles>()
-  /** The live run per session — what context.artex hands to the ARTEX tools. */
-  private activeBySession = new Map<string, ArtexRunContext>()
+  /** The live run per session — what context.reconRun hands to the RECON tools. */
+  private activeBySession = new Map<string, ReconRunContext>()
   private pauseRequested = new Set<string>()
   private cancelRequested = new Set<string>()
   private loaded = false
@@ -312,7 +318,7 @@ export class AssessmentManager {
     const traces = TraceStore.fromJSON(state.traceSteps)
     const controller = new AbortController()
     this.runs.set(state.id, { controller, graph, plan, traces })
-    // The ARTEX tool surface works through this holder for as long as the run
+    // The RECON tool surface works through this holder for as long as the run
     // is live; one running assessment per session makes the key unambiguous.
     this.activeBySession.set(state.sessionId, {
       graph,
@@ -424,6 +430,14 @@ export class AssessmentManager {
     } else if (action === 'resume') {
       if (state.status !== 'paused') throw new Error(`cannot resume a ${state.status} assessment`)
       const graph = await this.graphFor(state.sessionId)
+      // Operator messages that arrived while paused were held back; they belong
+      // in the constraints before the first round of the resumed run.
+      if (state.pendingMessages?.length) {
+        for (const message of state.pendingMessages) {
+          if (!state.constraints.includes(message)) state.constraints.push(message)
+        }
+        state.pendingMessages = []
+      }
       const loop: LoopContext = {
         objective: state.objective,
         scopeLine: `Scope (never leave it): ${state.scope.join(', ')}`,
@@ -457,12 +471,12 @@ export class AssessmentManager {
   }
 
   /** The live run context for a session, if an assessment (or a registered deep_scan) is running. */
-  activeFor(sessionId: string): ArtexRunContext | undefined {
+  activeFor(sessionId: string): ReconRunContext | undefined {
     return this.activeBySession.get(sessionId)
   }
 
   /** deep_scan registers its own run so its workers get the same tool surface. */
-  registerRun(sessionId: string, holder: ArtexRunContext): void {
+  registerRun(sessionId: string, holder: ReconRunContext): void {
     this.activeBySession.set(sessionId, holder)
   }
 
@@ -492,6 +506,34 @@ export class AssessmentManager {
     state.activity.push({ at: new Date().toISOString(), round: -1, kind: 'hint', text: trimmed })
     if (state.activity.length > MAX_ACTIVITY) state.activity.splice(0, state.activity.length - MAX_ACTIVITY)
     await this.persist(state)
+  }
+
+  /**
+   * Talk to a running agent.
+   *
+   * The message goes into the live run's constraints array, which every planning
+   * and worker prompt re-reads, so it takes effect on the very next round instead
+   * of waiting for a restart. A run that is not live still records the message in
+   * its activity and keeps it for the next resume.
+   */
+  async say(id: string, text: string): Promise<{ delivered: boolean; queued: boolean }> {
+    await this.ensureLoaded()
+    const state = this.states.get(id)
+    if (!state) throw new Error(`unknown assessment: ${id}`)
+    const trimmed = String(text || '').trim()
+    if (!trimmed) throw new Error('message text is required')
+
+    const entry = `操作员指示：${trimmed}`
+    const live = this.activeBySession.get(state.sessionId)
+    const delivered = !!(live && Array.isArray(live.constraints))
+    if (delivered) live!.constraints!.push(entry)
+    else if (state.pendingMessages) state.pendingMessages.push(entry)
+    else state.pendingMessages = [entry]
+
+    state.activity.push({ at: new Date().toISOString(), round: -1, kind: 'operator', text: trimmed })
+    if (state.activity.length > MAX_ACTIVITY) state.activity.splice(0, state.activity.length - MAX_ACTIVITY)
+    await this.persist(state)
+    return { delivered, queued: !delivered }
   }
 
   /**
@@ -531,7 +573,7 @@ export class AssessmentManager {
     }))
   }
 
-  /** A worker session's execution trace (ARTEX 执行过程 rows). */
+  /** A worker session's execution trace (RECON 执行过程 rows). */
   trace(id: string, intentId: string): TraceStep[] {
     const state = this.states.get(id)
     if (!state) throw new Error(`unknown assessment: ${id}`)

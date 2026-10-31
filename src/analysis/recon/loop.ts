@@ -2,7 +2,7 @@ import type { Planner, Worker, Summarizer, IntentSpec, WorkerResult } from './en
 import type { Plan } from './plan.js'
 import type { ReconGraph } from './graph.js'
 
-// The model side of the ARTEX loop, shared by the synchronous deep_scan tool and
+// The model side of the RECON loop, shared by the synchronous deep_scan tool and
 // the background assessment tasks: one goals phase, one planner factory, one
 // worker factory — so a task and a scan behave identically except for who
 // started them and where their output goes.
@@ -13,8 +13,8 @@ import type { ReconGraph } from './graph.js'
 // loop is not.
 
 // ── Prompt provenance ───────────────────────────────────────────────────────
-// The three prompt bodies below are PORTED from jaykwok/ARTEX (v0.3.15,
-// e6ec569; AGPL-3.0, © the ARTEX authors) — goalsDefaultTmpl, plannerDefaultTmpl
+// The three prompt bodies below are PORTED from jaykwok/RECON (v0.3.15,
+// e6ec569; AGPL-3.0, © the RECON authors) — goalsDefaultTmpl, plannerDefaultTmpl
 // and workerDefaultTmpl, with tool names adapted to this repo's surface
 // (recon_graph actions instead of insert_assets / record_fact /
 // report_finding, a JSON reply envelope instead of native tool calls) and the
@@ -47,7 +47,7 @@ export function extractJson(text: string): any | null {
   return null
 }
 
-// Ported from ARTEX goalsDefaultTmpl (+ its scope tail's minimal-scope rule,
+// Ported from RECON goalsDefaultTmpl (+ its scope tail's minimal-scope rule,
 // which this repo enforces in code via setScope(targets)).
 const GOALS_PROMPT = `你是渗透测试目标分解器。你的职责是从用户输入中识别出**最终要达成的结果**，而不是规划攻击步骤。
 
@@ -78,7 +78,7 @@ const GOALS_PROMPT = `你是渗透测试目标分解器。你的职责是从用�
 测试资产范围由系统按 targets 字段登记（最小范围原则：只登记用户明确点到的那一个目标，绝不擅自放大——看到 xxx.example.com 就登记整个 example.com 会把范围扩到用户目标之外）。
 回复 JSON：{"constraints":["..."],"goals":[{"text":"...","assets":["..."]}]}。`
 
-// Ported from ARTEX plannerDefaultTmpl. Adaptations: 判目标 is engine-side
+// Ported from RECON plannerDefaultTmpl. Adaptations: 判目标 is engine-side
 // (findings auto-prove behind the coverage gate, so the planner only dispatches
 // directions), the planner is a JSON call without tools (its optional light
 // probing section does not apply), and add_intent's batching maps to the
@@ -117,7 +117,7 @@ const PLANNER_PROMPT = `你是一个网络安全平台授权渗透测试系统�
 
 // Code-owned tail appended after the ported planner body — the mechanical
 // rules this repo's engine depends on (reply envelope, caps, steering),
-// kept out of the ported text so the two evolve independently (ARTEX's
+// kept out of the ported text so the two evolve independently (RECON's
 // 段 [A]/[B] split).
 const PLANNER_TAIL = `
 
@@ -128,7 +128,7 @@ const PLANNER_TAIL = `
 - 尊重 hints：它们是循环外的操舵。
 - 绝不越过给定 scope。`
 
-// Ported in spirit from ARTEX's settleWrapUpPrompt (worker-facing there; here
+// Ported in spirit from RECON's settleWrapUpPrompt (worker-facing there; here
 // the settlement round is planner-dispatched).
 const PLANNER_SETTLE_TAIL = `
 
@@ -149,7 +149,7 @@ const WORKER_PROMPT = `你是网络安全平台授权渗透测试系统的"执�
 - fact = 探索结论/观察（"login accepts POST /auth with JSON"），多个观察汇总成【一条】，带上证据（命令+关键输出行）。
 - finding = **只有真实触发过、拿到可复现证据（请求/响应或命令输出）的缺陷**才写。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库推断"当已确认；触发不了但有嫌疑 → 写成 fact（嫌疑点+为何未触发）。`
 
-// Ported from ARTEX workerDefaultTmpl: the single mandate, the three red lines
+// Ported from RECON workerDefaultTmpl: the single mandate, the three red lines
 // and the write-back discipline (consolidate, increments only, real evidence,
 // negative results recorded, findings only with reproducible triggers) — with
 // the write-back tools mapped to recon_graph actions and the final summary
@@ -170,7 +170,7 @@ const WORKER_SUBAGENT_PROMPT = `你是一个网络安全平台授权渗透测试
 {"steps":[{"action":"...","detail":"...","ok":true}],"note":"一句话：做了什么、得到哪些关键结论","facts":[],"findings":[]}
 "steps" 列你实际执行过的工具调用与结果。facts/findings 留空——已写回图；只有确实无法用 record_fact/report_finding 写回的观察才作兜底写在这里。`
 
-// Ported from ARTEX renderWorkerGraphOverview: the read-only situation frame —
+// Ported from RECON renderWorkerGraphOverview: the read-only situation frame —
 // awareness without mandate creep, coverage deliberately removed.
 function workerOverviewFrame(overviewJson: string): string {
   return `\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：

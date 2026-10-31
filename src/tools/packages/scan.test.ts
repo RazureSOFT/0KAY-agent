@@ -4,7 +4,7 @@ import { DeepScanTool, ExploitRuntimeTool, extractJson } from './scan.js'
 import { SandboxPolicy } from '../../sandbox/policy.js'
 import type { ToolContext } from '../types.js'
 
-// deep_scan is the ARTEX loop with a model bolted on. The model is faked here on
+// deep_scan is the RECON loop with a model bolted on. The model is faked here on
 // purpose: what needs testing is the stopping logic, not the prompt.
 
 function contextWithPlanner(replies: string[]): ToolContext {

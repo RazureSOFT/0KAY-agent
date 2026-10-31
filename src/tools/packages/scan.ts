@@ -4,17 +4,17 @@ import * as path from 'node:path'
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
-import { ReconGraph } from '../../analysis/artex/graph.js'
-import { Plan } from '../../analysis/artex/plan.js'
-import { TraceStore } from '../../analysis/artex/traces.js'
-import { ReconEngine } from '../../analysis/artex/engine.js'
-import { extractJson, plantGoals, makePlanner, makeWorker, makeSummarizer } from '../../analysis/artex/loop.js'
+import { ReconGraph } from '../../analysis/recon/graph.js'
+import { Plan } from '../../analysis/recon/plan.js'
+import { TraceStore } from '../../analysis/recon/traces.js'
+import { ReconEngine } from '../../analysis/recon/engine.js'
+import { extractJson, plantGoals, makePlanner, makeWorker, makeSummarizer } from '../../analysis/recon/loop.js'
 
-// The ARTEX loop as one tool: give it an objective and the targets, it decomposes
+// The RECON loop as one tool: give it an objective and the targets, it decomposes
 // the objective into provable goals, then runs planner → workers → graph until
 // the goals are proven or a budget (with one final settlement round) ends it.
 //
-// The model side lives in analysis/artex/loop.ts, shared with the background
+// The model side lives in analysis/recon/loop.ts, shared with the background
 // assessment tasks — a scan and a task are the same loop, different plumbing.
 //
 // By default the loop runs on the SESSION's recon graph (the same one the
@@ -71,10 +71,10 @@ export class DeepScanTool extends Tool {
     const { goalIds, constraints } = await plantGoals(runtime, graph, { objective, targets })
     loop.constraints = constraints
 
-    // deep_scan's workers get the same ARTEX tool surface as assessment tasks:
+    // deep_scan's workers get the same RECON tool surface as assessment tasks:
     // register this run under the session for its duration.
-    const artexSession = context.sessionId || context.taskId
-    context.assessments?.registerRun(artexSession, { graph, traces, constraints, objective })
+    const reconSession = context.sessionId || context.taskId
+    context.assessments?.registerRun(reconSession, { graph, traces, constraints, objective })
 
     const engine = new ReconEngine(graph, plan, traces, {
       goalId: goalIds.length === 1 ? goalIds[0] : undefined,
@@ -92,7 +92,7 @@ export class DeepScanTool extends Tool {
       const goalStates = snapshot.nodes
         .filter((node) => node.kind === 'goal' && goalIds.includes(node.id))
         .map((node) => ({ id: node.id, text: node.text, status: node.status }))
-      context.assessments?.releaseRun(artexSession)
+      context.assessments?.releaseRun(reconSession)
       return success({
         ...report,
         goals: goalStates,
@@ -104,7 +104,7 @@ export class DeepScanTool extends Tool {
         traces: traces.size,
       })
     } catch (error) {
-      context.assessments?.releaseRun(artexSession)
+      context.assessments?.releaseRun(reconSession)
       return failure(error)
     }
   }

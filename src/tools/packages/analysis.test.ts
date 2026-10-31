@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ReconGraphTool, ValidateFindingTool, GhidraAnalyzeTool } from './analysis.js'
-import { ReconGraph } from '../../analysis/artex/graph.js'
+import { ReconGraph } from '../../analysis/recon/graph.js'
 import type { ToolContext } from '../types.js'
 
 const context = (): ToolContext => ({

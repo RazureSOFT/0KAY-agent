@@ -1,4 +1,4 @@
-// ARTEX's "planner shared todolist": a chain that survives the planner's amnesia.
+// RECON's "planner shared todolist": a chain that survives the planner's amnesia.
 //
 // Every planner wake-up is a fresh conversation — it does not remember the last
 // one. Real exploitation is order-dependent (find the injection point → get

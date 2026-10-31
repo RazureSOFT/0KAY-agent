@@ -7,7 +7,7 @@ import { ReconGraph } from './graph.js'
 import { AssessmentManager } from './tasks.js'
 import type { LoopRuntime } from './loop.js'
 
-// The task system is the ARTEX loop with a lifecycle: it starts on a tool call
+// The task system is the RECON loop with a lifecycle: it starts on a tool call
 // and keeps running without one. These tests fake the model side and check the
 // lifecycle — start, steer, pause, resume, cancel, and what survives a restart.
 
@@ -243,4 +243,30 @@ test('an abort mid-run ends the engine as aborted', async () => {
   const report = await run
   assert.equal(report.stopped, 'aborted')
   openGate()
+})
+
+test('say queues a message when no run is live', async () => {
+  const manager: any = new AssessmentManager(async () => ({} as any))
+  manager.states.set('t1', {
+    id: 't1', sessionId: 's1', objective: 'o', targets: [], rounds: 0, intents: 0,
+    concurrency: 1, timeoutMs: 1000, status: 'paused', createdAt: new Date().toISOString(),
+    goalIds: [], goalTexts: [], constraints: [], scope: [], activity: [],
+  })
+  const outcome = await manager.say('t1', 'only test port 443')
+  assert.equal(outcome.delivered, false)
+  assert.equal(outcome.queued, true)
+  // Held for the next resume instead of being dropped on the floor.
+  assert.deepEqual(manager.states.get('t1').pendingMessages, ['操作员指示：only test port 443'])
+  assert.equal(manager.states.get('t1').activity.at(-1).kind, 'operator')
+})
+
+test('say refuses an unknown id and empty text', async () => {
+  const manager: any = new AssessmentManager(async () => ({} as any))
+  await assert.rejects(() => manager.say('nope', 'x'), /unknown assessment/)
+  manager.states.set('t2', {
+    id: 't2', sessionId: 's2', objective: 'o', targets: [], rounds: 0, intents: 0,
+    concurrency: 1, timeoutMs: 1, status: 'running', createdAt: '', goalIds: [], goalTexts: [],
+    constraints: [], scope: [], activity: [],
+  })
+  await assert.rejects(() => manager.say('t2', '   '), /message text is required/)
 })

@@ -2,7 +2,7 @@ import type { ReconGraph } from './graph.js'
 import type { ExplorationNode } from './graph.js'
 import type { AssessmentState } from './tasks.js'
 
-// The report module: ARTEX renders a deliverable document from the graph when
+// The report module: RECON renders a deliverable document from the graph when
 // the work is done, and strix writes its findings to disk as it runs. This is
 // the same idea — the graph is the single source of truth, the report is a
 // deterministic walk over it: goals, scope and coverage, findings with their

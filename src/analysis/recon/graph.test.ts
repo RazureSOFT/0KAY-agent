@@ -272,3 +272,74 @@ test('a v1 export (no edges, old status words) is translated, not rejected', () 
 test('garbage is refused at the restore boundary', () => {
   assert.throws(() => ReconGraph.fromJSON({ assets: 'nope' } as any), /not a serialized recon graph/)
 })
+
+test('assets are grouped by owning company', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com/x', 'ACME')
+  graph.addAsset('https://b.example.com/y', 'ACME')
+  graph.addAsset('10.1.1.1', 'Other Ltd')
+
+  const groups = graph.companies()
+  assert.equal(groups.length, 2)
+  const acme = groups.find((group) => group.company === 'ACME')!
+  // Revealing an endpoint also reveals its service and host, and those belong to
+  // the same owner — so the count is the subtree, not the single URL.
+  assert.ok(acme.assets.some((asset) => asset.key.includes('a.example.com')))
+  assert.ok(acme.assets.some((asset) => asset.key.includes('b.example.com')))
+  assert.ok(!acme.assets.some((asset) => asset.key.includes('10.1.1.1')))
+})
+
+test('unowned assets are reported, not hidden', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com')
+  const groups = graph.companies()
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].company, '')
+})
+
+test('a later tag fills in the owner and its ancestors once', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com')
+  graph.addAsset('https://a.example.com', 'ACME')
+  graph.addAsset('https://a.example.com', 'Someone Else')
+
+  const groups = graph.companies()
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].company, 'ACME')
+})
+
+test('a company can be put in scope as a whole', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com/x', 'ACME')
+  graph.addAsset('https://b.other.com/y', 'Other Ltd')
+  graph.setScope(['company:ACME'])
+
+  const coverage = graph.coverage()
+  // Only ACME's subtree counts: the other owner is out of scope, not merely untested.
+  assert.equal(coverage.untested.length, coverage.scope.denominator)
+  assert.ok(graph.inScope(graph.asset(graph.companies()[0].assets[0].id)!))
+  const outside = graph.companies().find((group) => group.company === 'Other Ltd')!
+  assert.ok(outside.assets.every((asset) => !graph.inScope(asset)))
+})
+
+test('the company view reports per-owner coverage and kind breakdown', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com/x', 'ACME')
+  const host = graph.companies()[0].assets.find((asset) => asset.kind === 'root_domain')!
+  // Marking the host tested must move ACME's own percentage.
+  graph.addNode({ kind: 'fact', text: 'reachable', assets: [host.key] })
+
+  const acme = graph.companies().find((group) => group.company === 'ACME')!
+  assert.ok(acme.tested >= 1)
+  assert.ok((acme.byKind.endpoint || 0) >= 1)
+  assert.ok(acme.hosts.some((entry) => entry.includes('example.com')))
+  assert.ok(typeof acme.pct === 'number')
+})
+
+test('unattributed companies sort last', () => {
+  const graph = new ReconGraph()
+  graph.addAsset('https://a.example.com', 'ACME')
+  graph.addAsset('https://loose.example.net')
+  const rows = graph.companies()
+  assert.equal(rows[rows.length - 1].company, '')
+})

@@ -1,16 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { ReconGraph } from '../../analysis/artex/graph.js'
-import { TraceStore } from '../../analysis/artex/traces.js'
-import { RecordFactTool, InsertAssetsTool, AddIntentTool, ProveGoalTool, GoalMetTool, SetConstraintsTool, GraphOverviewTool, SearchAllWorkerTracesTool, KillWorkTool } from './artex.js'
+import { ReconGraph } from '../../analysis/recon/graph.js'
+import { TraceStore } from '../../analysis/recon/traces.js'
+import { RecordFactTool, InsertAssetsTool, AddIntentTool, ProveGoalTool, GoalMetTool, SetConstraintsTool, GraphOverviewTool, SearchAllWorkerTracesTool, KillWorkTool } from './recon_ops.js'
 import type { ToolContext } from '../types.js'
 
-// The ARTEX tool surface runs on a run context (graph + traces + live
+// The RECON tool surface runs on a run context (graph + traces + live
 // constraints). These tests pin the 1:1 semantics: batch writes with intent
 // linkage, asset anchoring, evidence-gated proofs, and the global finish.
 
 function contextWith(graph: ReconGraph, traces: TraceStore = new TraceStore(), constraints?: string[]): ToolContext {
-  return { artex: { graph, traces, ...(constraints ? { constraints } : {}) }, cwd: process.cwd(), taskId: 't', agentType: 'general' } as unknown as ToolContext
+  return { reconRun: { graph, traces, ...(constraints ? { constraints } : {}) }, cwd: process.cwd(), taskId: 't', agentType: 'general' } as unknown as ToolContext
 }
 
 test('record_fact writes a fact linked to the intent, batch mode included', async () => {
