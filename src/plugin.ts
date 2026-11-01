@@ -173,6 +173,14 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '自我迭代用的分支前缀，默认 self/；改前缀不会影响已有分支',
           },
           {
+            // An `action` field is a button, not a value: the settings page owns the
+            // confirmation, the plugin owns what happens next.
+            key: 'self_evolve_proposal',
+            type: 'action',
+            label: '让它自己提案',
+            help: '点开后 agent 先读仓库、自己决定改哪里，给你一份提案再动手。只在上面开关打开时可用；分支留在 self/*，不提 PR 就不碰主分支。',
+          },
+          {
             key: 'note_evolve_pr',
             type: 'note',
             label: '提 PR 的规则',
