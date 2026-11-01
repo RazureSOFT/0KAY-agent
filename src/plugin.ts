@@ -145,48 +145,6 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: 'ExecuteTask 未指定类型时使用',
           },
           {
-            key: 'self_evolve_enabled',
-            type: 'bool',
-            label: '允许自我迭代',
-            defaultValue: 'false',
-            help: '打开后 agent 可以在独立的 git worktree（分支 self/*）里改自己的代码；不提 PR 就只留在分支上，不动你的工作区',
-          },
-          {
-            key: 'self_evolve_repo',
-            type: 'text',
-            label: '自我迭代仓库',
-            defaultValue: '',
-            help: '留空 = agent 自己的仓库；填绝对路径可让它在别的仓库里迭代',
-          },
-          {
-            key: 'github_token',
-            type: 'text',
-            label: 'GitHub Token',
-            defaultValue: '',
-            help: '开 PR 用（需要 repo 权限）。填了就通过 GH_TOKEN 传给 gh，留空则用你本机已登录的 gh 账号',
-          },
-          {
-            key: 'evolve_branch_prefix',
-            type: 'text',
-            label: '迭代分支前缀',
-            defaultValue: 'self/',
-            help: '自我迭代用的分支前缀，默认 self/；改前缀不会影响已有分支',
-          },
-          {
-            // An `action` field is a button, not a value: the settings page owns the
-            // confirmation, the plugin owns what happens next.
-            key: 'self_evolve_proposal',
-            type: 'action',
-            label: '让它自己提案',
-            help: '点开后 agent 先读仓库、自己决定改哪里，给你一份提案再动手。只在上面开关打开时可用；分支留在 self/*，不提 PR 就不碰主分支。',
-          },
-          {
-            key: 'note_evolve_pr',
-            type: 'note',
-            label: '提 PR 的规则',
-            help: '打开上面的开关后，agent 会用 `evolve_begin` 在独立 worktree 里改自己。\n\n改完它**必须先问你**要不要提 PR：\n- 你说提 → `evolve_finish(open_pr=true)`，推分支并建 PR\n- 你说不提 → 分支留在本地，主分支和工作区一个字节都不动\n\n失败、测试没过的迭代不会自动提 PR。',
-          },
-          {
             key: 'enable_shell_tool',
             type: 'bool',
             label: 'Shell 工具',
@@ -341,6 +299,57 @@ async function registerWithCore(proto: any): Promise<string | null> {
             label: '大小模型协作（duet）',
             defaultValue: 'false',
             help: '开启后自动选型：大模型（think）定方案并写出实现提示词，小模型（output）按提示词完成实现；手动指定模型时不生效',
+          },
+        ],
+      },
+      {
+        id: 'experiments',
+        label: '实验功能',
+        icon: 'flask',
+        order: 75,
+        description: '仍在验证的能力，默认关闭；打开前请先读说明',
+        fields: [
+          {
+            key: 'self_evolve_enabled',
+            type: 'bool',
+            label: '允许自我迭代',
+            defaultValue: 'false',
+            help: '打开后 agent 可以在独立的 git worktree（分支 self/*）里改自己的代码；不提 PR 就只留在分支上，不动你的工作区',
+          },
+          {
+            key: 'self_evolve_repo',
+            type: 'text',
+            label: '自我迭代仓库',
+            defaultValue: '',
+            help: '留空 = agent 自己的仓库；填绝对路径可让它在别的仓库里迭代',
+          },
+          {
+            key: 'github_token',
+            type: 'text',
+            label: 'GitHub Token',
+            defaultValue: '',
+            help: '开 PR 用（需要 repo 权限）。填了就通过 GH_TOKEN 传给 gh，留空则用你本机已登录的 gh 账号',
+          },
+          {
+            key: 'evolve_branch_prefix',
+            type: 'text',
+            label: '迭代分支前缀',
+            defaultValue: 'self/',
+            help: '自我迭代用的分支前缀，默认 self/；改前缀不会影响已有分支',
+          },
+          {
+            // An `action` field is a button, not a value: the settings page owns the
+            // confirmation, the plugin owns what happens next.
+            key: 'self_evolve_proposal',
+            type: 'action',
+            label: '让它自己提案',
+            help: '点开后 agent 先读仓库、自己决定改哪里，给你一份提案再动手。只在上面开关打开时可用；分支留在 self/*，不提 PR 就不碰主分支。',
+          },
+          {
+            key: 'note_evolve_pr',
+            type: 'note',
+            label: '提 PR 的规则',
+            help: '打开上面的开关后，agent 会用 `evolve_begin` 在独立 worktree 里改自己。\n\n改完它**必须先问你**要不要提 PR：\n- 你说提 → `evolve_finish(open_pr=true)`，推分支并建 PR\n- 你说不提 → 分支留在本地，主分支和工作区一个字节都不动\n\n失败、测试没过的迭代不会自动提 PR。',
           },
         ],
       },
