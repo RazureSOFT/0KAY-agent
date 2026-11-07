@@ -64,6 +64,14 @@ export interface ToolContext {
   reconRun?: import('../analysis/recon/tasks.js').ReconRunContext;
   /** Session UI directives (the session tool): titles and toasts, applied by core on its next inbox poll. */
   sessionDirectives?: import('../task/directives.js').SessionDirectives;
+  /** The intent ledger and 100% gate for this task (the intent tool). */
+  gate?: import('../agent/gate.js').QualityGate;
+  /** fact_1..fact_10, the task's durable memory (the fact tool). */
+  facts?: import('../agent/facts.js').FactMemory;
+  /** Checks that a memory or experience write is allowed before it lands. */
+  permissions?: import('../agent/permission.js').PermissionLedger;
+  /** The message -> library -> model stage, for tools that want the learned rules. */
+  library?: import('../agent/library.js').RuleLibrary;
   /**
    * An LLM caller that survives the current tool call — no abort signal from
    * this context rides along. Background assessment tasks must use this, or

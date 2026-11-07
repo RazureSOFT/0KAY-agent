@@ -22,7 +22,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   core: {
     label: 'core',
     hint: 'always loaded',
-    tools: ['read', 'write', 'edit', 'apply_patch', 'glob', 'grep', 'bash', 'todowrite', 'progress', 'plan', 'skill', 'question', 'tools'],
+    tools: ['read', 'write', 'edit', 'apply_patch', 'glob', 'grep', 'bash', 'todowrite', 'progress', 'intent', 'fact', 'plan', 'skill', 'question', 'tools'],
   },
   agent: {
     label: 'agent',

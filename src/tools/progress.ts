@@ -95,7 +95,7 @@ export class ProgressTool extends Tool {
   }
 
   get description(): string {
-    return 'Report how complete the task is (0-100) and what you are doing right now. Call it once when you start, after each meaningful step, and once when you finish. The user sees this as a progress bar, so keep the note short and concrete ("running the test suite").';
+    return 'Report how complete the task is (0-100) and what you are doing right now. Call it once when you start, after each meaningful step, and once when you finish. Reporting 100 here submits the task for review: the gate checks it against the intent ledger and, if the rules pass, a second model reads your files before accepting it. The user sees this as a progress bar, so keep the note short and concrete ("running the test suite").';
   }
 
   get parameters(): Record<string, any> {
@@ -121,6 +121,22 @@ export class ProgressTool extends Tool {
             required: ['title'],
           },
         },
+        intents: {
+          type: 'array',
+          description: 'Optional: the intent ledger, same shape as the intent tool. Supplying it together with percent=100 submits a complete claim.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              description: { type: 'string' },
+              method: { type: 'string' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'done', 'blocked'] },
+              evidence: { type: 'string' },
+            },
+            required: ['id', 'description', 'status'],
+          },
+        },
+        approach: { type: 'string', description: 'Optional: the plan of attack shown to the user next to the intent list.' },
       },
       required: ['percent'],
     };
@@ -144,6 +160,39 @@ export class ProgressTool extends Tool {
 
     const state: ProgressState = { percent: accepted, phase, note, items, updatedAt: Date.now() };
     states.set(key, state);
+
+    // A 100% self-report is a claim of completion, so it goes through the same
+    // gate as finish. Below 100 it is just a status line, and the gate is not
+    // paid for: ordinary work is not audited.
+    if (accepted >= 100 && context.gate?.enabled) {
+      const ledger = context.gate.ledger;
+      const claimed = Array.isArray(args.intents) ? args.intents : [];
+      if (claimed.length) context.gate.updateIntents(claimed, String(args.approach || ''), 'agent', { taskId: context.taskId, sessionId: context.sessionId || '' });
+      const verdict = ledger.check(100);
+      void taskRecorder
+        .record({
+          task_id: context.taskId,
+          caller_id: 'agent',
+          session_id: context.sessionId || '',
+          kind: 'agent',
+          state: 'running',
+          progress: accepted,
+          phase,
+          note,
+          intent: JSON.stringify(ledger.serialize()),
+        })
+        .catch(() => undefined);
+      if (!verdict.ok) {
+        // Hand the reasons back instead of the claim: the model keeps working.
+        states.set(key, { ...state, percent: Math.min(99, verdict.derived), phase: 'acting' });
+        return success({
+          percent: Math.min(99, verdict.derived),
+          phase: 'acting',
+          note,
+          gate: { status: 'reject', source: 'intent_rules', actual_completion: `${verdict.derived}%`, fix_feedback: verdict.problems.join(' ') },
+        });
+      }
+    }
 
     // The UI reads this off the task row, so it has to reach Core. A failure to
     // report is not a task failure — the work still happened.

@@ -37,6 +37,12 @@ import { resolveMode, type MultiAgentMode } from './modes.js';
 import { buildHandoffDoc } from './handoff.js';
 import { ensureAgentWorkspace, appendAgentNote } from './agent_workspace.js';
 import { extractDocumentText, isDocumentAttachment } from './attachment_text.js';
+import { agentEvents } from './events.js';
+import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
+import { FactMemory } from './facts.js';
+import { PermissionLedger } from './permission.js';
+import { prepareTurn, libraryFor } from './library.js';
+import { steering } from './steering.js';
 
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080';
 
@@ -178,6 +184,20 @@ export interface AgentSettings {
   always_allow_tools?: string;
   minimal_mode?: boolean;
   duet_mode?: boolean;
+  /** off = no gate; rules = intent ledger only; full = ledger + reviewer model. */
+  gate_mode?: string;
+  /** Model for the reviewer. Empty = the task's own model. */
+  reviewer_model?: string;
+  /** Reviews rejected in a row before the task stops for a human. */
+  gate_max_rejects?: number;
+  /** Tool calls the reviewer may make per review. */
+  gate_max_tool_steps?: number;
+  /** Wall-clock budget for one review, in seconds. */
+  gate_budget_seconds?: number;
+  /** Rules injected before the first message (the LIBRARY stage). */
+  library_enabled?: boolean;
+  /** Let the agent rewrite its own experience without a user/reviewer instruction. */
+  agent_self_write?: boolean;
 }
 
 export interface AgentContext {
@@ -190,6 +210,14 @@ export interface AgentContext {
   cwd: string;
   options: Record<string, string>;
   ledger?: ContextLedger;
+  /** Intent ledger + 100% gate for this task. */
+  gate?: QualityGate;
+  /** fact_1..fact_10 for this task. */
+  facts?: FactMemory;
+  /** Checks memory and experience writes before they land. */
+  permissions?: PermissionLedger;
+  /** The learned rule library of the workspace this task runs in. */
+  library?: ReturnType<typeof libraryFor>;
 }
 
 export function estimateTextTokens(text: string): number {
@@ -334,6 +362,13 @@ export class Agent {
       always_allow_tools: DEFAULT_AUTO_APPROVE_TOOLS,
       minimal_mode: false,
       duet_mode: false,
+      gate_mode: 'full',
+      reviewer_model: '',
+      gate_max_rejects: 3,
+      gate_max_tool_steps: 6,
+      gate_budget_seconds: 120,
+      library_enabled: true,
+      agent_self_write: false,
     };
 
     this.mocr = new MocrProvider({ grpcAddress: this.config.mocrAddress });
@@ -345,6 +380,7 @@ export class Agent {
 
     this.taskManager.setOnComplete((task) => {
       console.log(`Task ${task.id} completed: ${task.state}`);
+      agentEvents.forget(task.id);
       const completed = this.taskManager.getAllTasks().filter(t => !['PENDING', 'RUNNING'].includes(t.state));
       for (const old of completed.slice(0, -200)) this.taskManager.removeTask(old.id);
     });
@@ -427,6 +463,19 @@ export class Agent {
     }
     if (typeof partial.minimal_mode === 'boolean') this.settings.minimal_mode = partial.minimal_mode;
     if (typeof partial.duet_mode === 'boolean') this.settings.duet_mode = partial.duet_mode;
+    if (partial.gate_mode !== undefined) this.settings.gate_mode = resolveGateMode(partial.gate_mode);
+    if (typeof partial.reviewer_model === 'string') this.settings.reviewer_model = partial.reviewer_model.trim();
+    if (typeof partial.gate_max_rejects === 'number' && partial.gate_max_rejects >= 1) {
+      this.settings.gate_max_rejects = Math.max(1, Math.min(10, Math.floor(partial.gate_max_rejects)));
+    }
+    if (typeof partial.gate_max_tool_steps === 'number' && partial.gate_max_tool_steps >= 0) {
+      this.settings.gate_max_tool_steps = Math.max(0, Math.min(30, Math.floor(partial.gate_max_tool_steps)));
+    }
+    if (typeof partial.gate_budget_seconds === 'number' && partial.gate_budget_seconds >= 5) {
+      this.settings.gate_budget_seconds = Math.max(5, Math.min(900, Math.floor(partial.gate_budget_seconds)));
+    }
+    if (typeof partial.library_enabled === 'boolean') this.settings.library_enabled = partial.library_enabled;
+    if (typeof partial.agent_self_write === 'boolean') this.settings.agent_self_write = partial.agent_self_write;
     this.applyToolToggles();
     void this.refreshPluginTools();
     void this.refreshMcpServers();
@@ -469,6 +518,7 @@ export class Agent {
     if (!this.settings.enable_mcp_tool) this.tools.unregister('mcp');
     if (!this.settings.enable_task_tool) this.tools.unregister('task');
     if (!this.settings.enable_skills) this.tools.unregister('skill');
+    if (resolveGateMode(this.settings.gate_mode) === 'off') { this.tools.unregister('intent'); this.tools.unregister('fact'); }
   }
 
   private async refreshPluginTools(): Promise<void> {
@@ -844,10 +894,71 @@ export class Agent {
         postureDirective(resolvePosture(options.posture || process.env.OKAY_POSTURE)),
       ].filter(Boolean).join('\n\n');
 
+      // --- USER MESSAGE -> LIBRARY -> MODEL ---------------------------------
+      // The library runs before the first model call: it classifies the turn,
+      // learns from a correction, and produces the rule block the loop injects.
+      // Sub-agents inherit the parent's block instead of re-classifying.
+      let libraryBlock = '';
+      let turnKind: 'chat' | 'task' = 'task';
+      if (depth === 0) {
+        try {
+          const verdict = await prepareTurn(cwd, context.prompt, [
+            `Workspace: ${cwd}`,
+            ...(options.session_title ? [`Session: ${options.session_title}`] : []),
+          ]);
+          libraryBlock = verdict.injection;
+          turnKind = verdict.kind;
+          context.library = libraryFor(cwd);
+          agentEvents.emit({
+            type: 'task.started',
+            taskId, sessionId, at: Date.now(),
+            data: {
+              kind: verdict.kind,
+              reason: verdict.reason,
+              rules: verdict.rules.map((rule) => rule.text),
+              learned: verdict.learned?.text || '',
+              workspace: cwd,
+            },
+          });
+        } catch (error: any) {
+          console.warn('[Agent] library stage failed; continuing without injected rules:', error?.message);
+        }
+      } else if (options.library_block) {
+        libraryBlock = options.library_block;
+      }
+
+      // --- the gate and the two task-scoped stores --------------------------
+      // Reviewers are expensive, so a chat turn gets no gate at all: there is no
+      // work to check, and a "hello" that returns a reject is worse than no gate.
+      const selfWrites = options.agent_self_write === '1' || this.settings.agent_self_write;
+      const gateModeSetting: GateMode = turnKind === 'chat' ? 'off' : resolveGateMode(
+        options.gate_mode || this.settings.gate_mode,
+        'full',
+      );
+      const gate = new QualityGate({
+        settings: {
+          mode: gateModeSetting,
+          reviewerModel: options.reviewer_model || this.settings.reviewer_model,
+          maxRejects: Number(options.gate_max_rejects) || this.settings.gate_max_rejects,
+          maxToolSteps: Number.isFinite(Number(options.gate_max_tool_steps)) ? Number(options.gate_max_tool_steps) : this.settings.gate_max_tool_steps,
+          budgetMs: (Number(options.gate_budget_seconds) || this.settings.gate_budget_seconds) * 1000,
+        },
+        events: agentEvents,
+      });
+      context.gate = gate;
+      context.facts = new FactMemory();
+      context.permissions = new PermissionLedger(cwd, { allowAgentSelfWrite: selfWrites });
+      steering.open(taskId);
+      const gateDirective = gate.directive();
+      if (depth === 0 && gateModeSetting !== 'off') {
+        void this.recordIntentState(context, gate);
+      }
+
       let result = '';
       let lastModel = this.settings.model_id;
       let lastPromptTokens = 0;
       let gateBlocks = 0;
+      let humanTakeover = false;
 
       try {
         const note = await this.workspaceContext(cwd);
@@ -938,6 +1049,15 @@ export class Agent {
         }
 
         const todoBlock = formatTodoList(context.todo);
+        // The intent ledger and the recall block change on the model's own
+        // action, so they sit outside the cached prefix for the same reason the
+        // todo list does: they change without the prompt changing.
+        const intentBlock = gate.ledger.promptBlock();
+        const factBlock = context.facts?.promptBlock() || '';
+
+        // The quiet moment: the previous tool results are in, the next turn is
+        // not chosen. Anything the user said meanwhile lands here, as one turn.
+        this.applySteering(context);
 
         let fullResponse = '';
         let finalText = '';
@@ -960,7 +1080,10 @@ export class Agent {
               ? `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Iteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}\n\n${this.minimalDirective(options.language)}`
               : `\nPreferred UI language: ${options.language === 'en' ? 'English' : 'Chinese'}. Match the user language in progress, questions and replies.\nIteration ${i + 1}. Continue until complete or cancelled. Ask the user with question when blocked; do not repeat failing actions without new evidence. ${this.thinkingDirective(intensity, difficultyHint)}`)
             + (runtimeDirectives ? '\n\n' + runtimeDirectives : '')
-            + (todoBlock ? `\n\n${todoBlock}` : '') + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : ''),
+            + (todoBlock ? `\n\n${todoBlock}` : '') + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : '')
+            + (gateDirective ? `\n\n${gateDirective}` : '')
+            + (intentBlock ? `\n\n${intentBlock}` : '')
+            + (factBlock ? `\n\n${factBlock}` : ''),
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,
@@ -1003,14 +1126,24 @@ export class Agent {
                 if (item.status === 'rejected') throw item.reason;
                 const toolResult = item.value;
                 supervisor.recordToolCall(toolCall.name, toolCall.arguments, toolResult.success);
+                this.emitToolEvent(context, toolCall.name, toolCall.arguments, toolResult, Date.now());
                 if (toolCall.name === 'finish' && toolResult.success) {
-                  const gate = this.gateFinish(toolResult.data?.output || 'Task completed', supervisor);
-                  if (gate.blocked && gateBlocks < 3) {
+                  const output = toolResult.data?.output || 'Task completed';
+                  const ruleGate = this.gateFinish(output, supervisor);
+                  if (ruleGate.blocked && gateBlocks < 3) {
                     gateBlocks++;
-                    context.history.push({ role: 'tool', toolCallId: toolCall.id, content: JSON.stringify({ success: true, data: { output: gate.message } }) });
+                    context.history.push({ role: 'tool', toolCallId: toolCall.id, content: JSON.stringify({ success: true, data: { output: ruleGate.message } }) });
                     break;
                   }
-                  result = gate.result;
+                  const gateOutcome = await this.runGate(context, gate, supervisor, output, toolCall.id);
+                  if (!gateOutcome.pass) {
+                    // The reviewer's verdict goes back as the tool's response,
+                    // never as a user-facing message: the loop keeps the thread.
+                    context.history.push({ role: 'tool', toolCallId: toolCall.id, content: JSON.stringify({ success: true, data: gateOutcome.payload }) });
+                    if (gateOutcome.exhausted) { humanTakeover = true; result = this.takeoverMessage(gateOutcome.payload, output); }
+                    break;
+                  }
+                  result = this.reviewedResult(output, gateOutcome.payload);
                   await completeProgress(context.taskId, context.sessionId);
                   break;
                 }
@@ -1041,19 +1174,27 @@ export class Agent {
         if (toolCall) {
           const toolResult = await this.executeToolCall({ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }, context, type, depth);
           supervisor.recordToolCall(toolCall.name, JSON.stringify(toolCall.args), toolResult.success);
+          this.emitToolEvent(context, toolCall.name, JSON.stringify(toolCall.args), toolResult, Date.now());
           context.history.push({ role: 'assistant', content: finalText || fullResponse, toolCalls: [{ id: `fallback_${i}`, name: toolCall.name, arguments: JSON.stringify(toolCall.args) }], reasoningContent: fullReasoning || undefined });
           const desktopImages: MessagePart[] = [];
           context.history.push({ role: 'tool', toolCallId: `fallback_${i}`, content: JSON.stringify(this.desktopResult(toolCall.name, toolResult, desktopImages)) });
           if (desktopImages.length) context.history.push({ role: 'user', content: '', parts: desktopImages });
 
           if (toolResult.success && toolCall.name === 'finish') {
-            const gate = this.gateFinish(toolResult.data?.output || 'Task completed', supervisor);
-            if (gate.blocked && gateBlocks < 3) {
+            const output = toolResult.data?.output || 'Task completed';
+            const ruleGate = this.gateFinish(output, supervisor);
+            if (ruleGate.blocked && gateBlocks < 3) {
               gateBlocks++;
-              context.history.push({ role: 'user', content: gate.message });
+              context.history.push({ role: 'user', content: ruleGate.message });
               continue;
             }
-            result = gate.result;
+            const gateOutcome = await this.runGate(context, gate, supervisor, output, `fallback_${i}`);
+            if (!gateOutcome.pass) {
+              context.history.push({ role: 'user', content: `Review verdict on your finish: ${JSON.stringify(gateOutcome.payload)}` });
+              if (gateOutcome.exhausted) { humanTakeover = true; result = this.takeoverMessage(gateOutcome.payload, output); }
+              continue;
+            }
+            result = this.reviewedResult(output, gateOutcome.payload);
             break;
           }
         } else {
@@ -1418,6 +1559,173 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     return { ...result, data: { ...data, image: 'attached as visual input' } };
   }
 
+  /**
+   * Drain what the user said while the agent was working, as one turn.
+   *
+   * The framing matters: an instruction that arrives mid-task is not a new
+   * request, and the model must not treat it as permission to restart. It is an
+   * amendment to the task in hand, applied on top of the work already done.
+   */
+  private applySteering(context: AgentContext): void {
+    const drained = steering.drain(context.taskId);
+    if (!drained.length) return;
+    const text = drained.length === 1
+      ? drained[0].text
+      : drained.map((entry, index) => `${index + 1}. ${entry.text}`).join('\n');
+    context.history.push({
+      role: 'user',
+      content: `The user added this while you were working. Treat it as an amendment to the current task, not a new one: keep what you have already done, adjust the plan, and continue.\n\n${text}`,
+    });
+    agentEvents.emit({
+      type: 'intent.updated',
+      taskId: context.taskId,
+      sessionId: context.sessionId,
+      at: Date.now(),
+      data: { steering: text, ...context.gate?.ledger.serialize() },
+    });
+  }
+
+  /** Tool results on the event bus, so the UI can show COT and steps live. */
+  private emitToolEvent(context: AgentContext, name: string, rawArgs: string, result: import('../tools/types.js').ToolResult, at: number): void {
+    agentEvents.emit({
+      type: 'tool.result',
+      taskId: context.taskId,
+      sessionId: context.sessionId,
+      at,
+      data: {
+        tool: name,
+        ok: result.success !== false,
+        error: result.error || '',
+        args: String(rawArgs || '').slice(0, 1200),
+        summary: String(result.error || JSON.stringify(result.data ?? '')).slice(0, 600),
+      },
+    });
+  }
+
+  /**
+   * Run the 100% gate and persist the review outcome where the UI reads tasks.
+   * The reviewer sits on top of the rule-based supervisor: rules catch provable
+   * problems (no verification command, a loop), the reviewer catches the ones
+   * only reading the files can find.
+   */
+  private async runGate(
+    context: AgentContext,
+    gate: QualityGate,
+    supervisor: DeliverySupervisor,
+    output: string,
+    toolCallId: string,
+  ): Promise<{ pass: boolean; exhausted: boolean; payload: Record<string, any> }> {
+    if (!gate.enabled) return { pass: true, exhausted: false, payload: { status: 'success' } };
+    const report = supervisor.report();
+    const touched = this.touchedFiles(context, supervisor);
+    const outcome = await gate.evaluate({
+      taskId: context.taskId,
+      sessionId: context.sessionId,
+      cwd: context.cwd,
+      userIntent: context.prompt,
+      claim: output,
+      approach: gate.ledger.current.approach,
+      completionRate: 100,
+      trace: (supervisor as any).trace ?? [],
+      delivery: report,
+      transcript: this.recentTranscript(context),
+      touched,
+    }, (request) => this.reviewerLlm(request, context));
+
+    void this.recordIntentState(context, gate, outcome.payload);
+    if (outcome.pass) {
+      agentEvents.emit({
+        type: 'task.finished',
+        taskId: context.taskId,
+        sessionId: context.sessionId,
+        at: Date.now(),
+        data: { passed: true, intent: outcome.intent, toolCallId },
+      });
+    }
+    return { pass: outcome.pass, exhausted: outcome.exhausted, payload: outcome.payload };
+  }
+
+  /** The reviewer's model call: separate model when configured, no tools here. */
+  private async reviewerLlm(request: import('../tools/types.js').LlmRequest, context: AgentContext): Promise<string | null> {
+    const modelId = this.settings.reviewer_model || this.activeModel || this.settings.model_id || '';
+    const messages = request.messages.map((message) => ({ role: message.role, content: message.content }));
+    let text = '';
+    try {
+      for await (const chunk of this.mocr.generate({
+        modelId,
+        messages,
+        systemPrompt: request.systemPrompt,
+        maxTokens: request.maxTokens || 2600,
+        temperature: request.temperature ?? 0.1,
+        tools: [],
+        toolChoice: 'none',
+        signal: AbortSignal.timeout(90_000),
+        taskId: context.taskId,
+        sessionId: context.sessionId,
+      })) text += chunk.chunk || '';
+      return text || null;
+    } catch (error: any) {
+      console.warn(`[Agent] reviewer model call failed: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /** Files the task wrote or edited, pulled from the tool trace. */
+  private touchedFiles(context: AgentContext, supervisor: DeliverySupervisor): string[] {
+    const trace: any[] = (supervisor as any).trace ?? [];
+    const out: string[] = [];
+    for (const entry of trace) {
+      if (!['write', 'edit', 'apply_patch', 'patch'].includes(entry.name)) continue;
+      const match = /"path":"((?:[^"\\]|\\.)*)"/.exec(entry.fingerprint || '');
+      if (!match) continue;
+      const file = match[1].replace(/\\\\/g, '\\');
+      if (!out.includes(file)) out.push(file);
+    }
+    // A review with no touched files is legitimate (an answer-only turn), but
+    // the reviewer should still see what the workspace looks like.
+    return out.slice(0, 40);
+  }
+
+  /** Only the tail: the reviewer needs the claim's context, not the whole log. */
+  private recentTranscript(context: AgentContext): string {
+    const tail = context.history.slice(-14);
+    return tail.map((message) => {
+      const role = message.role;
+      const content = typeof message.content === 'string' ? message.content : '';
+      const calls = (message as any).toolCalls?.map((call: any) => `${call.name}(${String(call.arguments || '').slice(0, 200)})`).join('; ') || '';
+      return `[${role}] ${content.slice(0, 1200)}${calls ? `\n  calls: ${calls}` : ''}`;
+    }).join('\n');
+  }
+
+  /** The final text when the reviewer passed: the claim, plus any caveat it found. */
+  private reviewedResult(output: string, payload: Record<string, any>): string {
+    if (payload?.degraded) return `${output}\n\n[review skipped] ${payload.degraded}`;
+    return output;
+  }
+
+  /** What the user sees when the gate gives up: the gap, not a hang. */
+  private takeoverMessage(payload: Record<string, any>, output: string): string {
+    const missing = Array.isArray(payload?.missing_intents) && payload.missing_intents.length
+      ? `\n\nStill missing:\n${payload.missing_intents.map((item: string) => `- ${item}`).join('\n')}`
+      : '';
+    const feedback = payload?.fix_feedback ? `\n\nReviewer's last note: ${payload.fix_feedback}` : '';
+    return `I stopped rather than claim this was finished: the review rejected it ${payload?.max_attempts ?? 3} times in a row, so this needs you to take over.${missing}${feedback}\n\nWhat I did complete:\n${output}`;
+  }
+
+  /** Push the intent state onto the same task row the UI already polls. */
+  private async recordIntentState(context: AgentContext, gate: QualityGate, verdict?: Record<string, any>): Promise<void> {
+    const state = gate.ledger.serialize();
+    await this.recorder.record({
+      task_id: context.taskId,
+      caller_id: 'agent',
+      session_id: context.sessionId || '',
+      kind: 'agent',
+      state: 'running',
+      intent: JSON.stringify(state),
+      ...(verdict ? { review: JSON.stringify(verdict) } : {}),
+    }).catch(() => undefined);
+  }
+
   private gateFinish(output: string, supervisor: DeliverySupervisor): { blocked: boolean; result: string; message: string } {
     const mode = (process.env.OKAY_EVIDENCE_GATE || '').trim().toLowerCase();
     if (mode !== '1' && mode !== 'warn' && mode !== '2' && mode !== 'strict') {
@@ -1707,6 +2015,18 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if(tool==='session_directives')return {success:true,result:JSON.stringify(this.directives.list(String(parsed.session_id||''))),error:''};
     if(tool==='session_directives_ack')return {success:true,result:JSON.stringify({removed:this.directives.ack(Array.isArray(parsed.ids)?parsed.ids.map(String):[])}),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
+    if (tool === 'task_steer') {
+      // The UI's "say something while it works" path. The text is queued and
+      // applied at the next tool boundary, so it cannot cut a write in half.
+      const taskId = String(parsed.task_id || '');
+      const text = String(parsed.text || '');
+      if (!taskId) return { success: false, result: '', error: 'task_id required' };
+      const queued = steering.push(taskId, String(parsed.session_id || ''), text);
+      return { success: queued.ok, result: JSON.stringify({ queued: queued.queued, reason: queued.reason || '' }), error: queued.ok ? '' : (queued.reason || 'not queued') };
+    }
+    if (tool === 'task_steer_status') {
+      return { success: true, result: JSON.stringify({ active: steering.activeTasks, pending: steering.pending(String(parsed.task_id || '')) }), error: '' };
+    }
     if (tool === 'workspace_admin' || tool === 'projects_admin') {
       try {
         return { success: true, result: JSON.stringify(await this.handleWorkspaceAdmin(parsed)), error: '' };

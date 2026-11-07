@@ -13,6 +13,8 @@ import { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 import { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { ProgressTool } from './progress.js';
 import { PlanTool } from './plan.js';
+import { IntentTool, FactTool } from './gate_tools.js';
+export { IntentTool, FactTool } from './gate_tools.js';
 export { PaperSearchTool, ApiDocSearchTool } from './packages/web-search.js';
 export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatusTool } from './packages/context.js';
 import { withWindowsShellHint } from './shell_hint.js';
@@ -1277,7 +1279,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
     new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new SessionTool(), ...RECON_OPS_TOOLS,
-    new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
+    new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new IntentTool(), new FactTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
     new GitHubSearchTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),

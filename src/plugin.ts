@@ -303,6 +303,64 @@ async function registerWithCore(proto: any): Promise<string | null> {
         ],
       },
       {
+        id: 'gate',
+        label: '质检门禁',
+        icon: 'shield',
+        order: 72,
+        description: '主 Agent 声称 100% 完成时，由审查模型读取文件复核；不通过则打回重做',
+        fields: [
+          {
+            key: 'gate_mode',
+            type: 'select',
+            label: '门禁模式',
+            options: ['off', 'rules', 'full'],
+            defaultValue: 'full',
+            help: 'off = 关闭；rules = 只校验意图清单（不调用审查模型，零额外成本）；full = 清单校验 + 审查模型读文件复核',
+          },
+          {
+            key: 'reviewer_model',
+            type: 'text',
+            label: '审查模型',
+            defaultValue: '',
+            help: '留空 = 用任务自己的模型。建议填一个不同厂商的模型，同源模型更容易认可自己的错误',
+          },
+          {
+            key: 'gate_max_rejects',
+            type: 'number',
+            label: '最大打回次数',
+            defaultValue: '3',
+            help: '连续被打回这么多次后强制中断，把缺口列给用户接管',
+          },
+          {
+            key: 'gate_max_tool_steps',
+            type: 'number',
+            label: '审查工具次数上限',
+            defaultValue: '6',
+            help: '审查模型每次复核最多读多少个文件/搜多少次，防止复核本身失控',
+          },
+          {
+            key: 'gate_budget_seconds',
+            type: 'number',
+            label: '单次复核时限（秒）',
+            defaultValue: '120',
+            help: '超时视为审查不可用：放行并在结果里注明，不让复核卡死任务',
+          },
+          {
+            key: 'agent_self_write',
+            type: 'bool',
+            label: '允许 Agent 自行改写经验',
+            defaultValue: 'false',
+            help: '默认只有用户或审查模型能改 Agent 的长期经验；打开后 Agent 可自己写入规则库',
+          },
+          {
+            key: 'note_gate',
+            type: 'note',
+            label: '门禁怎么工作',
+            help: 'Agent 每轮维护一份**意图清单**（id / 用户要什么 / 打算怎么做 / 当前状态）。完成度由这份清单算出来，不是它自己填的数字。\n\n- **完成度 < 100%**：不触发审查，Agent 自己循环干活。\n- **提交 100%**：先算清单，有任何一项没完成就被机械打回（不花钱）。\n- 清单过了 → **审查模型**读被你改过的文件、必要时联网核对、查有没有偷工减料 → 判定结果包装成 **tool 响应** 还给 Agent（不是发给你的聊天消息）。\n- 连续打回 3 次 → 停下，把还缺什么列给你。\n\n门禁结论会显示在会话里，附「审查模型实际看了哪些文件」。',
+          },
+        ],
+      },
+      {
         id: 'experiments',
         label: '实验功能',
         icon: 'flask',
@@ -465,6 +523,13 @@ async function pollAgentSettings(): Promise<void> {
       sandbox_mode: typeof values.sandbox_mode === 'string' ? values.sandbox_mode : 'workspace-write',
       minimal_mode: values.minimal_mode === true,
       duet_mode: values.duet_mode === true,
+      gate_mode: typeof values.gate_mode === 'string' ? values.gate_mode : 'full',
+      reviewer_model: typeof values.reviewer_model === 'string' ? values.reviewer_model : '',
+      gate_max_rejects: Number(values.gate_max_rejects ?? 3),
+      gate_max_tool_steps: Number(values.gate_max_tool_steps ?? 6),
+      gate_budget_seconds: Number(values.gate_budget_seconds ?? 120),
+      library_enabled: values.library_enabled !== false,
+      agent_self_write: values.agent_self_write === true,
     })
     taskManager.setMaxConcurrentTasks(Number(values.max_concurrent_tasks ?? 5))
   } catch {
