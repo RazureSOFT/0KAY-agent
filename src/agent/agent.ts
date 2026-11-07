@@ -24,6 +24,7 @@ import { coreFetch, coreHeaders, coreHttpBase, listPluginTools, executorIdentity
 import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
 import { allowTaskRoot, allowedWorkspaceRoots, isPathAllowed } from '../workspace/paths.js';
+import { assertReadable, filterListing } from '../workspace/secrets.js';
 import { SandboxPolicy, parseSandboxMode } from '../sandbox/policy.js';
 import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/groups.js';
 import { ReconGraph, FileGraphStore } from '../analysis/recon/graph.js';
@@ -2128,8 +2129,11 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
             if (await stat(root).then(s => s.isDirectory()).catch(() => false)) roots.push(root);
           }
         } else roots.push('/');
+        // A tree that names the credential files tells an injected prompt exactly
+        // what to ask for next, even though it does not return the contents.
+        const visible = new Set(await filterListing(directory, entries.map(entry => entry.name)));
         const items = entries
-          .filter(entry => entry.name !== '.git' && entry.name !== 'node_modules')
+          .filter(entry => entry.name !== '.git' && entry.name !== 'node_modules' && visible.has(entry.name))
           .map(entry => ({ name: entry.name, path: path.join(directory, entry.name), dir: entry.isDirectory() }))
           .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
         return { success: true, error: '', result: JSON.stringify({ path: directory, parent: path.dirname(directory), roots, entries: items }) };
@@ -2139,6 +2143,12 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       try {
         const file = path.resolve(String(parsed.path || ''));
         if (!isPathAllowed(file)) throw new Error('path not allowed: outside workspace roots');
+        // The workspace roots say which directories this task is about; they do
+        // not say which files are secrets. This endpoint is the panel's file
+        // viewer, and it served providers.json — plaintext API keys — to anyone
+        // who asked, because the roots included the repo that Core keeps its
+        // data in.
+        await assertReadable(file);
         const s = await stat(file);
         if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
         if (s.size > 1_500_000) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
@@ -2166,6 +2176,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         if (!parsed.path) throw new Error('path is required');
         const file = path.resolve(String(parsed.path));
         if (!isPathAllowed(file)) throw new Error('path not allowed: outside workspace roots');
+        await assertReadable(file);
         const s = await stat(file);
         if (s.isDirectory()) return { success: false, result: '', error: 'is a directory' };
         if (s.size > 30 * 1024 * 1024) return { success: false, result: '', error: `file too large (${s.size} bytes)` };
