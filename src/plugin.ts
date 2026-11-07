@@ -264,6 +264,27 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '留空 = 内置 + agent/skills/*.md；可指向自定义目录',
           },
           {
+            key: 'plugins_dir',
+            type: 'text',
+            label: '插件目录',
+            defaultValue: '',
+            help: 'agent 扩展插件的目录；留空 = agent/plugins。每个插件是一个带 manifest.json 的子目录，装载后可以改提示词、规则、工具集与模型参数',
+          },
+          {
+            key: 'plugins_enabled',
+            type: 'text',
+            label: '启用的插件',
+            defaultValue: '',
+            help: '逗号分隔的插件名；留空 = 目录里找到的全部启用。改这一项不需要重启，下一个任务就生效',
+          },
+          {
+            key: 'extensions_panel',
+            type: 'extensions',
+            label: '已安装的插件',
+            defaultValue: '',
+            help: '插件是一个带 manifest.json 的目录。声明式的插件只改提示词、规则、工具可见性和模型参数，不需要写代码；高级插件可以带一个模块，注册工具并在工具调用前后做检查',
+          },
+          {
             key: 'always_allow_tools',
             type: 'text',
             label: '免审批工具',
@@ -485,6 +506,33 @@ const taskManager = agent.getTaskManager()
 const CORE_HTTP = process.env.CORE_HTTP_ADDR || process.env.CORE_HTTP || 'http://127.0.0.1:8080'
 let settingsPollTimer: NodeJS.Timeout | null = null
 
+/**
+ * Where Core keeps the agent extensions it installs.
+ *
+ * Cached for a minute: this runs inside the settings poll, and asking Core on
+ * every poll would be a request per poll for a value that changes once in a
+ * while. An operator who points the setting somewhere else still wins, because
+ * this is only consulted when that setting is empty.
+ */
+let extensionDirCache: { dir: string; at: number } = { dir: '', at: 0 }
+async function discoverExtensionDir(): Promise<string> {
+  if (Date.now() - extensionDirCache.at < 60_000) return extensionDirCache.dir
+  let dir = ''
+  try {
+    const res = await coreFetch(`${CORE_HTTP}/api/agent/extensions`, {
+      signal: AbortSignal.timeout(4000),
+      headers: coreHeaders(),
+    })
+    if (res.ok) {
+      const body: any = await res.json()
+      if (typeof body?.dir === 'string') dir = body.dir
+    }
+  } catch {
+  }
+  extensionDirCache = { dir, at: Date.now() }
+  return dir
+}
+
 async function pollAgentSettings(): Promise<void> {
   try {
     const res = await coreFetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() })
@@ -517,6 +565,12 @@ async function pollAgentSettings(): Promise<void> {
       mcp_servers_json: typeof values.mcp_servers_json === 'string' ? values.mcp_servers_json : '[]',
       enable_skills: values.enable_skills !== false,
       skills_dir: typeof values.skills_dir === 'string' ? values.skills_dir : '',
+      // The extension directory belongs to Core when Core is the one installing
+      // plugins; the agent asks rather than requiring the operator to keep two
+      // settings in step. An explicit setting still wins.
+      plugins_dir: typeof values.plugins_dir === 'string' && values.plugins_dir.trim()
+        ? values.plugins_dir.trim()
+        : await discoverExtensionDir(),
       always_allow_tools:
         typeof values.always_allow_tools === 'string' ? values.always_allow_tools : DEFAULT_AUTO_APPROVE_TOOLS,
       tool_disclosure: typeof values.tool_disclosure === 'string' ? values.tool_disclosure : 'progressive',

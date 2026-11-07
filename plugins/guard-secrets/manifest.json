@@ -1,0 +1,13 @@
+{
+  "name": "guard-secrets",
+  "title": "密钥保护",
+  "version": "1.0.0",
+  "description": "演示带代码的插件：当 agent 要写一个看起来像密钥文件的目标时，先用一条提示拦住它。",
+  "author": "0KAY",
+  "api": "1",
+  "entry": "index.mjs",
+  "permissions": ["hooks:tool", "tools:register"],
+  "behaviour": {
+    "prompt": "Never write credentials into a file that is tracked by git. If you must create one, write it next to the project and tell the user to add it to .gitignore."
+  }
+}

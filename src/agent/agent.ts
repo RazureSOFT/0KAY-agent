@@ -7,6 +7,7 @@ import { McpManager, McpServerConfig } from '@0kay/mcp';
 import { randomUUID } from 'crypto';
 import { SubAgentRegistry } from './subagents.js';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import { stat, readdir, mkdir, readFile, writeFile, mkdtemp, rm } from 'fs/promises';
 import { ApprovalManager } from '../task/approvals.js';
 import { SessionDirectives } from '../task/directives.js';
@@ -38,6 +39,7 @@ import { resolveMode, type MultiAgentMode } from './modes.js';
 import { buildHandoffDoc } from './handoff.js';
 import { ensureAgentWorkspace, appendAgentNote } from './agent_workspace.js';
 import { extractDocumentText, isDocumentAttachment } from './attachment_text.js';
+import { PluginHost, toRegistryTool } from '../plugins/host.js';
 import { agentEvents } from './events.js';
 import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
 import { FactMemory } from './facts.js';
@@ -200,6 +202,10 @@ export interface AgentSettings {
   mcp_servers_json?: string;
   enable_skills?: boolean;
   skills_dir?: string;
+  /** Where agent extension plugins live. Empty means the bundled directory. */
+  plugins_dir?: string;
+  /** Comma-separated plugin names to load. Empty means "every plugin found". */
+  plugins_enabled?: string;
   always_allow_tools?: string;
   minimal_mode?: boolean;
   duet_mode?: boolean;
@@ -298,6 +304,14 @@ export class Agent {
   private workspaces = new WorkspaceRegistry();
   private pluginToolNames = new Set<string>();
   private lastPluginToolRefresh = 0;
+  /**
+   * Extensions that change how this agent behaves, as opposed to tools it can
+   * call. Loaded from disk, so installing one is a directory copy rather than a
+   * rebuild, and disabling one takes effect on the next task.
+   */
+  private extensions?: PluginHost;
+  /** Tool names the current plugin generation registered, so a reload can drop them. */
+  private pluginExtensionTools: string[] = [];
   /** What the last plugin-tool refresh did, for the status surface and logs. */
   private pluginToolReport: { registered: string[]; renamed: string[]; skipped: any[]; error?: string } =
     { registered: [], renamed: [], skipped: [] };
@@ -378,6 +392,8 @@ export class Agent {
       mcp_servers_json: '[]',
       enable_skills: true,
       skills_dir: '',
+      plugins_dir: '',
+      plugins_enabled: '',
       always_allow_tools: DEFAULT_AUTO_APPROVE_TOOLS,
       minimal_mode: false,
       duet_mode: false,
@@ -482,6 +498,20 @@ export class Agent {
     }
     if (typeof partial.minimal_mode === 'boolean') this.settings.minimal_mode = partial.minimal_mode;
     if (typeof partial.duet_mode === 'boolean') this.settings.duet_mode = partial.duet_mode;
+    if (partial.plugins_dir !== undefined || partial.plugins_enabled !== undefined) {
+      const nextDir = typeof partial.plugins_dir === 'string' ? partial.plugins_dir.trim() : this.settings.plugins_dir;
+      const nextEnabled = typeof partial.plugins_enabled === 'string' ? partial.plugins_enabled.trim() : this.settings.plugins_enabled;
+      // The settings poll runs on a timer; reloading on every poll would re-import
+      // every plugin module once a minute for no reason.
+      if (nextDir !== this.settings.plugins_dir || nextEnabled !== this.settings.plugins_enabled) {
+        this.settings.plugins_dir = nextDir;
+        this.settings.plugins_enabled = nextEnabled;
+        // The load is async and the caller is not; a task that starts in the
+        // meantime sees the previous set, which is the same set it saw a moment
+        // ago. Rejections are recorded on the host, not thrown into settings.
+        void this.reloadExtensions();
+      }
+    }
     if (partial.gate_mode !== undefined) this.settings.gate_mode = resolveGateMode(partial.gate_mode);
     if (typeof partial.reviewer_model === 'string') this.settings.reviewer_model = partial.reviewer_model.trim();
     if (typeof partial.gate_max_rejects === 'number' && partial.gate_max_rejects >= 1) {
@@ -497,6 +527,7 @@ export class Agent {
     if (typeof partial.agent_self_write === 'boolean') this.settings.agent_self_write = partial.agent_self_write;
     this.applyToolToggles();
     void this.refreshPluginTools();
+    void this.reloadExtensions();
     void this.refreshMcpServers();
     void this.refreshPluginSkills();
   }
@@ -517,6 +548,60 @@ export class Agent {
    * as "trust every tool for this executor". It is a deliberate, persistent
    * choice made by the person who owns the machine, not a per-request flag.
    */
+  /**
+   * The directory agent extension plugins are read from.
+   *
+   * `plugins_dir` when set, otherwise the directory next to this file. Both the
+   * bundled plugins and a user's own copy are read, so an operator can drop a
+   * plugin into their data directory without touching the install.
+   */
+  private extensionRoots(): string[] {
+    const bundled = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../plugins');
+    const configured = this.settings.plugins_dir;
+    if (!configured) return [bundled];
+    // An absolute path is used as given. A relative one is taken relative to the
+    // agent, not to Core — the two processes have different working directories,
+    // and silently resolving it against whichever is current is how a plugin
+    // ends up installed in one place and read from another.
+    return [path.resolve(configured), bundled];
+  }
+
+  /**
+   * Reload plugins from disk.
+   *
+   * Re-reading rather than restarting is the point: editing a plugin's prompt
+   * and sending another message should be enough to see the change. Tools are
+   * re-registered in the same pass, so a removed plugin's tools disappear too.
+   */
+  async reloadExtensions(): Promise<void> {
+    const enabled = this.settings.plugins_enabled
+      ? new Set(this.settings.plugins_enabled.split(',').map((name) => name.trim()).filter(Boolean))
+      : null;
+    const host = new PluginHost(this.extensionRoots(), enabled);
+    await host.load();
+    // Tools from the previous generation are removed before the new ones land,
+    // or a plugin that dropped a tool would keep answering for it.
+    for (const name of this.pluginExtensionTools) this.tools.unregister(name);
+    this.pluginExtensionTools = [];
+    for (const { plugin, spec } of host.toolImplementations()) {
+      this.tools.register(toRegistryTool(plugin, spec));
+      this.pluginExtensionTools.push(spec.name);
+    }
+    this.extensions = host;
+  }
+
+  /** What settings shows: the plugins that actually loaded, and why the rest did not. */
+  extensionReport(): { plugins: any[]; errors: any[]; hiddenTools: string[]; promptBytes: number } {
+    if (!this.extensions) return { plugins: [], errors: [], hiddenTools: [], promptBytes: 0 };
+    const report = this.extensions.describe();
+    return {
+      plugins: report.plugins,
+      errors: report.errors,
+      hiddenTools: [...this.extensions.hiddenTools()],
+      promptBytes: this.extensions.promptBlock().length,
+    };
+  }
+
   private fullAccessGranted(context: AgentContext): boolean {
     if (context.options.permission_mode !== 'full_access') return false;
     const blanket = (this.settings.always_allow_tools || '')
@@ -992,6 +1077,13 @@ export class Agent {
       context.facts = new FactMemory();
       context.permissions = new PermissionLedger(cwd, { allowAgentSelfWrite: selfWrites });
       steering.open(taskId);
+      // Plugins see the task before it starts. A plugin that wants to add a rule
+      // for the duration of one task does it here; the hook budget resets, so a
+      // long session cannot accumulate against a previous task's count.
+      if (depth === 0 && this.extensions) {
+        this.extensions.startTask();
+        await this.extensions.taskStart({ prompt: context.prompt, cwd, taskId, sessionId: context.sessionId });
+      }
       const gateDirective = gate.directive();
       if (depth === 0 && gateModeSetting !== 'off') {
         void this.recordIntentState(context, gate);
@@ -1097,6 +1189,12 @@ export class Agent {
         // todo list does: they change without the prompt changing.
         const intentBlock = gate.ledger.promptBlock();
         const factBlock = context.facts?.promptBlock() || '';
+        // Plugin text sits outside the cached prefix for the same reason the
+        // todo list does: a plugin's beforeModelCall hook changes it per turn.
+        const extensionBlock = this.extensions?.promptBlock() || '';
+        const turnExtension = this.extensions
+          ? await this.extensions.beforeModelCall({ iteration: i + 1, model: modelId })
+          : '';
 
         // The quiet moment: the previous tool results are in, the next turn is
         // not chosen. Anything the user said meanwhile lands here, as one turn.
@@ -1126,7 +1224,9 @@ export class Agent {
             + (todoBlock ? `\n\n${todoBlock}` : '') + (context.options.workspace_note ? `\n\nWorkspace context:\n${context.options.workspace_note}` : '')
             + (gateDirective ? `\n\n${gateDirective}` : '')
             + (intentBlock ? `\n\n${intentBlock}` : '')
-            + (factBlock ? `\n\n${factBlock}` : ''),
+            + (factBlock ? `\n\n${factBlock}` : '')
+            + (extensionBlock ? `\n\n${extensionBlock}` : '')
+            + (turnExtension ? `\n\n${turnExtension}` : ''),
           temperature: this.settings.temperature,
           thinking: requireThinking,
           difficultyHint,
@@ -1394,9 +1494,12 @@ export class Agent {
    * what it is allowed to do.
    */
   private toolVisible(taskId: string) {
-    if (this.settings.tool_disclosure === 'all') return () => true;
+    // A plugin can hide a tool it replaces, or one this deployment must not use.
+    const hidden = this.extensions?.hiddenTools();
+    const notHidden = hidden && hidden.size ? (name: string) => !hidden.has(name) : () => true;
+    if (this.settings.tool_disclosure === 'all') return notHidden;
     const groups = this.loadedGroups(taskId);
-    return (name: string) => isAlwaysLoaded(name) || groups.has(groupOf(name) || '');
+    return (name: string) => notHidden(name) && (isAlwaysLoaded(name) || groups.has(groupOf(name) || ''));
   }
 
   /**
@@ -1806,6 +1909,16 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     // makes progressive disclosure safe rather than a guessing game.
     const toolGroup = groupOf(toolCall.name);
     if (toolGroup) this.loadGroup(context.taskId, toolGroup);
+    // Plugins run before approval, not after: a plugin that refuses a call
+    // should spare the user the prompt, and one that rewrites the arguments
+    // should get the operator's approval for what will actually run.
+    if (this.extensions) {
+      const verdict = await this.extensions.beforeToolCall({ tool: toolCall.name, args, cwd: context.cwd });
+      if (verdict.block) {
+        return { success: false, data: null, error: verdict.block };
+      }
+      if (verdict.args) args = verdict.args;
+    }
     if (!this.fullAccessGranted(context) && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
@@ -1813,7 +1926,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     // Resolved before the (synchronous) tool-context closure below: the graph
     // may need a disk read the first time a session touches it.
     const recon = await this.reconFor(context.sessionId || context.taskId);
-    return serializeFileMutation(toolCall.name, () => this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
+    const call = () => serializeFileMutation(toolCall.name, () => this.recorder.run('tool', toolCall.name, context.taskId, context.sessionId, () => this.tools.call(toolCall.name, args, {
       cwd: context.cwd,
       taskId: context.taskId,
       sessionId: context.sessionId,
@@ -1862,6 +1975,30 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
             cancel: (id: string) => this.subagents.cancel(id),
           },
     }), undefined, serializeToolArgs(args)));
+    if (!this.extensions) return call();
+    // The after hook observes, it cannot rewrite: by this point the side effect
+    // has happened, and a plugin that could change the reported result would be
+    // a plugin that can lie to the model about what it just did.
+    const result = await call();
+    await this.extensions.afterToolCall({
+      tool: toolCall.name,
+      args,
+      success: !!result?.success,
+      output: this.extensionOutput(result),
+    });
+    return result;
+  }
+
+  /** A bounded, textual view of a tool result, for afterToolCall plugins. */
+  private extensionOutput(result: any): string {
+    if (!result) return '';
+    const payload = result.success ? result.data : result.error;
+    try {
+      const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+      return (text || '').slice(0, 2000);
+    } catch {
+      return '';
+    }
   }
 
   private parseToolCall(response: string): { name: string; args: Record<string, any> } | null {
@@ -2058,6 +2195,15 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if(tool==='session_directives')return {success:true,result:JSON.stringify(this.directives.list(String(parsed.session_id||''))),error:''};
     if(tool==='session_directives_ack')return {success:true,result:JSON.stringify({removed:this.directives.ack(Array.isArray(parsed.ids)?parsed.ids.map(String):[])}),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
+    if(tool==='extensions_list')return {success:true,result:JSON.stringify(this.extensionReport()),error:''};
+    if(tool==='extensions_reload'){
+      // The settings page's toggle path: rewrite the enabled list, reload from
+      // disk, and report what actually came up rather than what was requested.
+      if(typeof parsed.enabled==='string')this.settings.plugins_enabled=parsed.enabled.trim();
+      await this.reloadExtensions();
+      const report=this.extensionReport();
+      return {success:true,result:JSON.stringify({...report,loaded:report.plugins.map((p:any)=>p.manifest.name)}),error:''};
+    }
     if (tool === 'task_steer') {
       // The UI's "say something while it works" path. The text is queued and
       // applied at the next tool boundary, so it cannot cut a write in half.

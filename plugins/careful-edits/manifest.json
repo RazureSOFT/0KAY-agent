@@ -1,0 +1,20 @@
+{
+  "name": "careful-edits",
+  "title": "谨慎编辑",
+  "version": "1.0.0",
+  "description": "演示插件：不加任何代码，只靠声明来改 agent 的行为。",
+  "author": "0KAY",
+  "api": "1",
+  "behaviour": {
+    "prompt": "Before editing an existing file, read the whole function you are about to change, not just the line you found. If the change spans more than one file, state the list of files you are about to touch before the first write.",
+    "rules": [
+      {
+        "trigger": "refactor",
+        "text": "A refactor must keep the public API unchanged unless the user asked for a change. Run the tests before claiming it is done."
+      }
+    ],
+    "model": {
+      "temperature": 0.2
+    }
+  }
+}
