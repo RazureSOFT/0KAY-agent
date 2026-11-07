@@ -90,8 +90,26 @@ export function formatTodoList(todo?: Array<{ content?: string; status?: string 
   return `Current todo list — ${remaining} item(s) remaining. Keep it current with todowrite and exactly one item in_progress:\n${lines.join('\n')}`;
 }
 
+// Tools that run without asking the user. The list is deliberately short: it
+// holds only things that cannot act on the world.
+//
+// `read`, `glob` and `grep` are NOT here even though they only read. A read is
+// half of the exfiltration pair — the other half is `webfetch` — and an
+// injected instruction in a webpage or a repo is exactly what turns a harmless
+// read into "read the key file and put it in this URL". Reading also has no
+// visible side effect, so a user cannot tell from the transcript that it
+// happened. The path gate in workspace/secrets.ts is the hard stop; this list
+// is the second lock, and it costs one approval per unfamiliar directory.
+// Reading and fetching run without a prompt: they are what an agent does all
+// day, and a prompt per file or page makes it unusable.
+//
+// That pair is also the exfiltration chain — read a key, fetch a URL — so the
+// chain is closed where it actually leaks rather than at every call site: the
+// read gate in workspace/secrets.ts refuses credential files no matter what the
+// workspace roots say, and `http_request` (the tool that takes an arbitrary
+// method, body and host) stays out of this list.
 export const DEFAULT_AUTO_APPROVE_TOOLS =
-  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,document,slides,compress,decompress,search_context,acp_status,report_artifacts,tools';
+  'read,glob,grep,webfetch,websearch,papersearch,apidocsearch,todowrite,skill,compress,decompress,search_context,acp_status,report_artifacts,tools';
 
 export const DUET_PLAN_SYSTEM_PROMPT =
   'You are the planning model (large model). Your job is to produce an implementation plan the execution model (weaker, with no conversation context) can follow directly. ' +
@@ -486,13 +504,37 @@ export class Agent {
     return { ...this.settings };
   }
 
+  /**
+   * Is this task allowed to skip approvals entirely?
+   *
+   * The request body used to decide this on its own, which meant the party most
+   * likely to be compromised — whatever is submitting tasks — could grant itself
+   * blanket permission with one field. Now the request may only ask; the
+   * operator's saved setting has to agree.
+   *
+   * The setting is `always_allow_tools: "*"`, which the settings page documents
+   * as "trust every tool for this executor". It is a deliberate, persistent
+   * choice made by the person who owns the machine, not a per-request flag.
+   */
+  private fullAccessGranted(context: AgentContext): boolean {
+    if (context.options.permission_mode !== 'full_access') return false;
+    const blanket = (this.settings.always_allow_tools || '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .some((entry) => entry === '*');
+    if (!blanket) return false;
+    return true;
+  }
+
   private autoApproved(tool: string): boolean {
     if (!tool) return false;
-    return this.settings.always_allow_tools
+    const allowed = this.settings.always_allow_tools
       .split(',')
       .map((s) => s.trim())
-      .filter(Boolean)
-      .includes(tool);
+      .filter(Boolean);
+    // "*" is the documented "trust every tool" value; without this branch it
+    // matched no tool name and silently did nothing.
+    return allowed.includes('*') || allowed.includes(tool);
   }
 
   private readOnlyComputerUse(tool: string, args: Record<string, any>): boolean {
@@ -1763,7 +1805,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     // makes progressive disclosure safe rather than a guessing game.
     const toolGroup = groupOf(toolCall.name);
     if (toolGroup) this.loadGroup(context.taskId, toolGroup);
-    if (context.options.permission_mode !== 'full_access' && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
+    if (!this.fullAccessGranted(context) && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
@@ -2314,8 +2356,12 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     // return nothing — create() filed the task under an id nobody could ask for
     // again — and filed approvals somewhere the session's inbox never looks.
     const directId = stateKey;
-    const mailMcp = tool === 'mcp' && String(parsed?.action || '') === 'call' && String(parsed?.server || '') === 'mail';
-    if (!this.autoApproved(tool) && tool !== 'computeruse' && tool !== 'browser' && !mailMcp && !ALWAYS_SAFE_TOOLS.has(tool)) {
+    // A tool is exempt from approval for one reason only: it cannot act on the
+    // world. Three exemptions used to sit here for other reasons and each was a
+    // hole — `computeruse` and `browser` drive the screen and the network, and
+    // an MCP server named "mail" is still an arbitrary server chosen by whoever
+    // configured it. Name-based privilege is not privilege; ask the user.
+    if (!this.autoApproved(tool) && !ALWAYS_SAFE_TOOLS.has(tool)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }

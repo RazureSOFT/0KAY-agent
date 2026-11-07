@@ -1,6 +1,6 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
-import { success, failure } from '../helpers.js'
+import { success, failure, egressOrDirect } from '../helpers.js'
 import { compactOutput } from '../compact.js'
 
 // strix's "HTTP interception proxy", reduced to what an agent actually needs from
@@ -50,16 +50,27 @@ export class HttpRequestTool extends Tool {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return failure(`only http and https are allowed, got ${parsed.protocol}`)
     }
+    // This tool sends an arbitrary method, headers and body to an arbitrary URL.
+    // Pointed at Core's own gateway it can install a plugin (npm lifecycle
+    // scripts), rewrite a file, or flip a setting — privilege the model does not
+    // get to grant itself. Core's loopback address is refused by name, and the
+    // request then goes through egress so a redirect cannot reach it either.
+    if (isCoreAddress(parsed)) {
+      return failure(`refused: ${parsed.host} is this machine's Core API, which agents may not call directly`)
+    }
 
     const started = Date.now()
     try {
-      const response = await fetch(url, {
+      // egressOrDirect, not fetch: the same SSRF guard every other outbound call
+      // uses. A raw fetch here let a model reach 169.254.169.254 and the LAN
+      // without netguard ever seeing the request.
+      const response = await egressOrDirect(url, {
         method: args.method ? String(args.method).toUpperCase() : 'GET',
         headers: args.headers && typeof args.headers === 'object' ? args.headers : undefined,
         body: args.body != null ? String(args.body) : undefined,
         redirect: args.followRedirects === true ? 'follow' : 'manual',
         signal: AbortSignal.timeout(Number(args.timeoutMs) || 30_000),
-      })
+      }, Number(args.timeoutMs) || 30_000)
 
       const raw = await response.text().catch(() => '')
       const headers: Record<string, string> = {}
@@ -90,4 +101,17 @@ export class HttpRequestTool extends Tool {
 /** Trim a body down to something a report can quote. */
 export function bodyExcerpt(body: string, limit = 500): string {
   return compactOutput(body, { maxChars: limit, maxLines: 12, maxLineLength: 200 }).text
+}
+
+/**
+ * Is this URL this machine's own Core?
+ *
+ * 127.0.0.1 and ::1 are obvious. The port matters less than the host: Core is
+ * the only thing on loopback an agent must never treat as a target, and a
+ * request to the wrong port fails harmlessly.
+ */
+function isCoreAddress(url: URL): boolean {
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0'
+  return loopback
 }

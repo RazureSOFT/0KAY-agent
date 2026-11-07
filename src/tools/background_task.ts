@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { failure, success } from './helpers.js';
+import { isPathAllowed } from '../workspace/paths.js';
 
 interface BackgroundJob {
   id: string;
@@ -74,7 +75,18 @@ export class BackgroundTaskTool extends Tool {
   private start(args: Record<string, any>, context: ToolContext): ToolResult {
     const command = String(args.command || '').trim();
     if (!command) return failure('command is required for start');
+    // A background job is still the agent running a shell command. This path
+    // used to spawn directly, so "read-only" tasks could run anything here while
+    // the foreground shell tool refused it — the sandbox had a door with no lock
+    // next to the locked one.
+    if (context.sandbox) {
+      const decision = context.sandbox.checkShell(command);
+      if (!decision.allowed) {
+        return failure(`sandbox refused this background command: ${decision.reason}`);
+      }
+    }
     const cwd = String(args.cwd || context.cwd || process.cwd());
+    if (!isPathAllowed(cwd)) return failure(`cwd not allowed: outside workspace roots (${cwd})`);
     const id = `bg_${randomUUID().slice(0, 8)}`;
     const child = spawn(command, {
       cwd,

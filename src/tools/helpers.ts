@@ -109,16 +109,45 @@ export function simpleDiff(filePath: string, original: string, updated: string):
 
 export { MAX_OUTPUT, MAX_FILE_BYTES };
 
+// Outbound requests go through Core, and "Core said no" is final.
+//
+// This used to be a fail-open: if the guarded fetch threw and the message did
+// not match a short word list, it retried with plain `fetch`. Core rejects with
+// "egress to %q is not permitted", which matched none of those words — so
+// precisely when the guard refused a destination, the agent bypassed the guard
+// and connected anyway. Every tool that takes a URL from a model or a user
+// (scrape, crawl, pentest, github_search) inherited that hole.
+//
+// There is no fallback now. The guard is the only way out; a missing Core is a
+// misconfiguration that fails loudly rather than silently fetching unguarded.
+
+export class EgressBlocked extends Error {
+  readonly destination: string;
+  constructor(destination: string, message: string) {
+    super(message);
+    this.name = 'EgressBlocked';
+    this.destination = destination;
+  }
+}
+
+/** Core's own refusals: the destination was evaluated and denied. */
+const EGRESS_REFUSED = /is not permitted|not allowed|blocked|egress (denied|refused)|private address|loopback|link-local|metadata/i;
+/** Core is not there at all — different failure, same rule: do not go direct. */
+const EGRESS_UNREACHABLE = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|ECONNRESET|etimedout/i;
+
 export async function egressOrDirect(url: string, options: RequestInit = {}, timeoutMs = 60000): Promise<Response> {
   const { egressFetch } = await import('../connection.js');
+  let host = url;
+  try { host = new URL(url).host } catch { /* keep the raw string for the message */ }
   try {
     return await egressFetch(url, options, timeoutMs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (!/egress HTTP|not allowed|blocked/i.test(message)) {
-      const timeout = AbortSignal.timeout(timeoutMs);
-      const signal = options.signal ? AbortSignal.any([timeout, options.signal]) : timeout;
-      return fetch(url, { ...options, signal });
+    if (EGRESS_REFUSED.test(message)) {
+      throw new EgressBlocked(host, `egress refused by Core: ${message}`);
+    }
+    if (EGRESS_UNREACHABLE.test(message)) {
+      throw new EgressBlocked(host, `egress unavailable (Core unreachable): ${message}`);
     }
     throw error;
   }

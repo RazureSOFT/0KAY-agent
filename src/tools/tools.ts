@@ -35,6 +35,7 @@ import { browserController } from './browser.js';
 import { ensureNative, nativeAvailable } from './win_native.js';
 import { posixInput, type PosixInput } from './posix_native.js';
 import { isPathAllowed } from '../workspace/paths.js';
+import { assertReadable, filterListing, checkReadable } from '../workspace/secrets.js';
 import { ScrapeTool } from './scrape.js';
 import { CrawlTool } from './crawl.js';
 import { ScreenshotToCodeTool } from './screenshot_to_code.js';
@@ -98,10 +99,18 @@ export class ReadTool extends Tool {
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
       const filePath = resolvePath(args.filePath, context.cwd);
+      // Reading was the one privileged operation with no gate: writes checked
+      // the workspace roots, reads did not, and `read` is auto-approved. A page
+      // or repo that says "summarise ~/.0kay/data/providers.json" was therefore
+      // a complete exfiltration chain.
+      if (!isPathAllowed(filePath)) throw new Error(`path not allowed: outside workspace roots (${filePath})`);
+      await assertReadable(filePath);
       const stat = await fs.stat(filePath);
       if (stat.isDirectory()) {
         const entries = await fs.readdir(filePath, { withFileTypes: true });
-        return success({ path: filePath, entries: entries.map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`).sort() });
+        const visible = await filterListing(filePath, entries.map((entry) => entry.name));
+        const shown = new Set(visible);
+        return success({ path: filePath, entries: entries.filter((entry) => shown.has(entry.name)).map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`).sort() });
       }
       if (stat.size > MAX_FILE_BYTES) throw new Error(`refusing to read ${stat.size} byte file (limit ${MAX_FILE_BYTES})`);
       const lines = (await fs.readFile(filePath, 'utf8')).split(/\r?\n/);
@@ -244,10 +253,14 @@ export class GlobTool extends Tool {
     try {
       if (typeof args.pattern !== 'string' || !args.pattern) throw new Error('pattern is required');
       const root = args.path ? resolvePath(args.path, context.cwd) : context.cwd;
+      if (!isPathAllowed(root)) throw new Error(`path not allowed: outside workspace roots (${root})`);
+      await assertReadable(root);
       const regex = globToRegex(args.pattern.replace(/\\/g, '/'));
       const files: string[] = [];
       const scanned = await walk(root, async (fullPath, relative) => {
-        if (regex.test(relative)) files.push(fullPath);
+        // Paths of credential files are themselves information: a listing that
+        // names ~/.ssh/id_rsa tells an injected prompt exactly what to ask for.
+        if (regex.test(relative) && !(await checkReadable(fullPath)).blocked) files.push(fullPath);
         return files.length < 500;
       });
       return success({ root, pattern: args.pattern, files, truncated: files.length >= 500, scanned });
@@ -268,6 +281,8 @@ export class GrepTool extends Tool {
     try {
       if (typeof args.pattern !== 'string' || !args.pattern) throw new Error('pattern is required');
       const root = args.path ? resolvePath(args.path, context.cwd) : context.cwd;
+      if (!isPathAllowed(root)) throw new Error(`path not allowed: outside workspace roots (${root})`);
+      await assertReadable(root);
       const pattern = new RegExp(args.pattern, 'i');
       const include = typeof args.include === 'string' && args.include ? globToRegex(args.include) : null;
       // 500 matches of a long line is ~50k characters, most of it the same file
@@ -279,6 +294,9 @@ export class GrepTool extends Tool {
       const matches: Array<{ path: string; line: number; text: string }> = [];
       await walk(root, async (fullPath, relative) => {
         if (include && !include.test(relative)) return true;
+        // A grep that walks the tree would read the key files the read gate
+        // just refused, so the same deny-list applies per file.
+        if ((await checkReadable(fullPath)).blocked) return true;
         const stat = await fs.stat(fullPath);
         if (stat.size > MAX_FILE_BYTES) return true;
         const text = await fs.readFile(fullPath, 'utf8').catch(() => '');
