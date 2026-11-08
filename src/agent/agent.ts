@@ -1093,6 +1093,8 @@ export class Agent {
       let lastModel = this.settings.model_id;
       let lastPromptTokens = 0;
       let gateBlocks = 0;
+      /** How many turns were cut short by the token ceiling in this task. */
+      let truncatedTurns = 0;
       let humanTakeover = false;
 
       try {
@@ -1250,7 +1252,14 @@ export class Agent {
               if (context.ledger) context.ledger.lastPromptTokens = lastPromptTokens;
           }
           if (chunk.done) {
-            if (chunk.finishReason === 'FINISH_REASON_ERROR' || chunk.finishReason === 'FINISH_REASON_LENGTH' || chunk.finishReason === 'FINISH_REASON_CONTENT_FILTER') throw new Error(`Model generation stopped: ${chunk.finishReason}`);
+            // A length stop is a truncated answer, not a failed one. Throwing
+            // here ended the task with the reasoning block frozen mid-sentence,
+            // which is what "思维链卡住" looks like from the outside. The partial
+            // turn is kept and the loop asks for the rest.
+            if (chunk.finishReason === 'FINISH_REASON_LENGTH') truncatedTurns += 1;
+            if (chunk.finishReason === 'FINISH_REASON_ERROR' || chunk.finishReason === 'FINISH_REASON_CONTENT_FILTER') {
+              throw new Error(`Model generation stopped: ${chunk.finishReason}`);
+            }
             if (chunk.text) finalText = chunk.text;
             const nativeCalls = chunk.toolCalls || [];
             if (nativeCalls.length) {
@@ -1385,6 +1394,16 @@ export class Agent {
           const report = supervisor.report();
           await taskRecorder.record({ task_id: context.taskId, caller_id: 'agent', kind: 'delivery-gate', session_id: context.sessionId, state: report.status, result: JSON.stringify(report) });
         } catch { }
+      }
+      // A turn cut off by the token ceiling is invisible otherwise: the reply
+      // just stops. Say so once, at the end, so the reader knows the answer is
+      // short because of a limit and not because the agent decided it was done.
+      if (truncatedTurns > 0 && result) {
+        // English, like every other line the agent writes on its own behalf:
+        // this is a note about the tool chain, not localised UI copy.
+        result += `
+
+_(Answer truncated by the model's output limit in ${truncatedTurns} place(s). Raise max_tokens, or ask it to continue in parts, for the rest.)_`;
       }
       return result;
     }, depth > 0);

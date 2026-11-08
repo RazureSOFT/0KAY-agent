@@ -246,7 +246,14 @@ export class MocrProvider {
           publishing = this.recorder.record({ ...event, result: text, reasoning }).catch(error=>console.warn('Progress delivery failed:',error.message)).finally(()=>{publishing=null});
           lastPublished = Date.now();
         }
-        if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_LENGTH', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) throw new Error(`Model finish: ${chunk.finishReason}`);
+        // LENGTH is not a failure: the model hit max_tokens and stopped. The
+        // text it produced is real, and throwing here ended the task with the
+        // reasoning block frozen mid-sentence — which is what "the thinking is
+        // stuck" looks like from the outside. The chunk passes through with its
+        // reason intact, so the loop can continue instead of dying.
+        if (chunk.done && ['FINISH_REASON_ERROR', 'FINISH_REASON_CONTENT_FILTER'].includes(chunk.finishReason || '')) {
+          throw new Error(`Model finish: ${chunk.finishReason}`);
+        }
         if (chunk.done) {
           if (chunk.model || chunk.requestedModel || chunk.fallbackReason) {
             modelInfo = JSON.stringify({ model: chunk.model || '', requested: chunk.requestedModel || '', fallback: chunk.fallbackReason || '' });
