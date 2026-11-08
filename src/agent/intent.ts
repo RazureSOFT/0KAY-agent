@@ -135,11 +135,28 @@ export class IntentLedger {
   /**
    * Rule check. `claimed` is what the agent reported for this finish; when it is
    * absent the score is purely derived.
+   *
+   * `options.requiresPlan` turns on the plan-before-code rule: when the task is
+   * going to change something (a mutation is on record), an intent with no
+   * method and no approach is a plan that was never written down. The work may
+   * still be right — but the user cannot see the reasoning, and a correction
+   * has nothing to correct. So the ledger itself asks for the missing line.
+   *
+   * `options.approach` is the plan the caller is finishing under. The loop passes
+   * the same value the reviewer gets, so a plan stated once for the whole turn
+   * counts even when it never reached the ledger row.
    */
-  check(claimed?: number): IntentCheck {
+  check(claimed?: number, options: { requiresPlan?: boolean; approach?: string } = {}): IntentCheck {
     const problems: string[] = [];
     if (!this.state.intents.length) {
       problems.push('No intents are recorded. Call the intent tool first with one entry per thing the user asked for.');
+    }
+    const statedPlan = (options.approach ?? '').trim() || this.state.approach.trim();
+    if (options.requiresPlan && this.state.intents.length && !statedPlan) {
+      const methodless = this.state.intents.filter((intent) => !intent.method.trim());
+      if (methodless.length) {
+        problems.push(`Plan first: ${methodless.length} intent(s) have no method and the ledger has no approach. Say how each one will be delivered before claiming it is done (${methodless.map((intent) => intent.id).join(', ')}).`);
+      }
     }
     const open = this.state.intents.filter((intent) => intent.status !== 'done');
     if (open.length) {

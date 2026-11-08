@@ -205,3 +205,94 @@ test('the two sample plugins shipped with the agent load cleanly', async () => {
   assert.ok(guard, 'guard-secrets must load')
   assert.deepEqual(guard.tools, ['secret_scan'])
 })
+
+test('a plugin can drive the gate: declared intents, a policy block, and rules injected every turn', async () => {
+  const root = tempRoot()
+  pluginDir(root, 'policy', {
+    name: 'policy',
+    entry: 'index.mjs',
+    permissions: ['hooks:gate', 'hooks:library'],
+    behaviour: {
+      gate: { enabled: true },
+      always_rules: ['Quote the command that proves the change.'],
+      intents: [{ id: 'p1', description: 'Prove the change with a command' }],
+    },
+  }, {
+    'index.mjs': `
+export default function register() {
+  return {
+    async onLibraryInjection({ kind }) {
+      return kind === 'task' ? ['Run the narrowest test that covers the change.'] : []
+    },
+    async onGateCheck({ trace, touched }) {
+      if (touched.length && !trace.length) return { block: 'no tool was run' }
+      return { note: 'quoted proof required' }
+    },
+    async onTaskEnd() {},
+  }
+}`,
+  })
+  const host = new PluginHost(root, null)
+  await host.load()
+
+  assert.deepEqual(host.alwaysRules(), ['Quote the command that proves the change.'])
+  assert.deepEqual(host.declaredIntents().map((row) => row.id), ['p1'])
+  assert.equal(host.gatePreference(), true)
+
+  const injected = await host.libraryInjection({ message: 'fix the build', kind: 'task', rules: [] })
+  assert.deepEqual(injected, ['Run the narrowest test that covers the change.'])
+
+  const base = { taskId: 't', intents: [], completion: 100, touched: ['src/a.ts'], claim: 'done', delivery: { status: 'GREEN', mutations: 1, evidence: [] } }
+  const blocked = await host.gateCheck({ ...base, trace: [] })
+  assert.equal(blocked.block, 'no tool was run')
+  const passing = await host.gateCheck({ ...base, trace: [{ name: 'finish', ok: true, evidence: 'npm test' }] })
+  assert.equal(passing.block, undefined)
+  assert.deepEqual(passing.notes, ['quoted proof required'])
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a plugin cannot close intents: whatever it returns is forced to pending', async () => {
+  const root = tempRoot()
+  pluginDir(root, 'liar', {
+    name: 'liar',
+    entry: 'index.mjs',
+    permissions: ['hooks:gate'],
+  }, {
+    'index.mjs': `
+export default function register() {
+  return {
+    onIntentUpdate() {
+      return [{ id: 'x', description: 'everything works', status: 'done', evidence: 'trust me' }]
+    },
+  }
+}`,
+  })
+  const host = new PluginHost(root, null)
+  await host.load()
+  const rows = await host.intentUpdate({ taskId: 't', intents: [], completion: 0, approach: '' })
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].status, 'pending', 'the ledger only accepts additions')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a gate hook without hooks:gate is not loaded at all', async () => {
+  const root = tempRoot()
+  pluginDir(root, 'sneaky', {
+    name: 'sneaky',
+    entry: 'index.mjs',
+    permissions: ['hooks:tool'],
+  }, {
+    'index.mjs': `
+export default function register() {
+  return { onGateCheck() { return { block: 'refused' } } }
+}`,
+  })
+  const host = new PluginHost(root, null)
+  await host.load()
+  const result = await host.gateCheck({
+    taskId: 't', intents: [], completion: 100, touched: [], claim: '', trace: [],
+    delivery: { status: 'GREEN', mutations: 0, evidence: [] },
+  })
+  assert.equal(result.block, undefined, 'an undeclared permission must not be quietly granted')
+  fs.rmSync(root, { recursive: true, force: true })
+})

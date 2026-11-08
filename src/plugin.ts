@@ -285,6 +285,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '插件是一个带 manifest.json 的目录。声明式的插件只改提示词、规则、工具可见性和模型参数，不需要写代码；高级插件可以带一个模块，注册工具并在工具调用前后做检查',
           },
           {
+            key: 'library_panel',
+            type: 'library',
+            label: '规则库',
+            defaultValue: '',
+            help: '规则库在「用户消息 → 模型」之间：认出寒暄（不进任务流程）、把一次纠正记成规则、把命中的规则注入这一轮。规则按工作区存，因为它是关于某个代码库的约定',
+          },
+          {
             key: 'always_allow_tools',
             type: 'text',
             label: '免审批工具',
@@ -365,6 +372,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             label: '单次复核时限（秒）',
             defaultValue: '120',
             help: '超时视为审查不可用：放行并在结果里注明，不让复核卡死任务',
+          },
+          {
+            key: 'gate_require_plan',
+            type: 'bool',
+            label: '先计划再动手',
+            defaultValue: 'true',
+            help: '会写文件的任务，意图清单里每项都得有「打算怎么做」或者一条整体方案，否则 100% 会被清单直接打回（不花钱）。只读任务和提问不受影响',
           },
           {
             key: 'agent_self_write',
@@ -582,6 +596,7 @@ async function pollAgentSettings(): Promise<void> {
       gate_max_rejects: Number(values.gate_max_rejects ?? 3),
       gate_max_tool_steps: Number(values.gate_max_tool_steps ?? 6),
       gate_budget_seconds: Number(values.gate_budget_seconds ?? 120),
+      gate_require_plan: values.gate_require_plan !== false,
       library_enabled: values.library_enabled !== false,
       agent_self_write: values.agent_self_write === true,
     })

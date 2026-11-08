@@ -31,7 +31,7 @@ import { TOOL_GROUPS, ALWAYS_LOADED, groupOf, isAlwaysLoaded } from '../tools/gr
 import { ReconGraph, FileGraphStore } from '../analysis/recon/graph.js';
 import { AssessmentManager } from '../analysis/recon/tasks.js';
 import { shellChoice } from '../tools/shell_choice.js';
-import { DeliverySupervisor, supervisionDirective } from './supervision.js';
+import { DeliverySupervisor, supervisionDirective, type ToolTraceEntry } from './supervision.js';
 import { completeProgress } from '../tools/progress.js';
 import { setEvolveGitHubToken, setEvolveBranchPrefix } from '../tools/self_evolve.js';
 import { resolvePosture, postureDirective } from './posture.js';
@@ -219,6 +219,8 @@ export interface AgentSettings {
   gate_max_tool_steps?: number;
   /** Wall-clock budget for one review, in seconds. */
   gate_budget_seconds?: number;
+  /** Plan before code: a mutating task needs an approach on record before it can claim done. */
+  gate_require_plan?: boolean;
   /** Rules injected before the first message (the LIBRARY stage). */
   library_enabled?: boolean;
   /** Let the agent rewrite its own experience without a user/reviewer instruction. */
@@ -402,6 +404,7 @@ export class Agent {
       gate_max_rejects: 3,
       gate_max_tool_steps: 6,
       gate_budget_seconds: 120,
+      gate_require_plan: true,
       library_enabled: true,
       agent_self_write: false,
     };
@@ -523,6 +526,7 @@ export class Agent {
     if (typeof partial.gate_budget_seconds === 'number' && partial.gate_budget_seconds >= 5) {
       this.settings.gate_budget_seconds = Math.max(5, Math.min(900, Math.floor(partial.gate_budget_seconds)));
     }
+    if (typeof partial.gate_require_plan === 'boolean') this.settings.gate_require_plan = partial.gate_require_plan;
     if (typeof partial.library_enabled === 'boolean') this.settings.library_enabled = partial.library_enabled;
     if (typeof partial.agent_self_write === 'boolean') this.settings.agent_self_write = partial.agent_self_write;
     this.applyToolToggles();
@@ -1034,7 +1038,21 @@ export class Agent {
             `Workspace: ${cwd}`,
             ...(options.session_title ? [`Session: ${options.session_title}`] : []),
           ]);
-          libraryBlock = verdict.injection;
+          // Plugins add to the same block, after the rules that matched: their
+          // text is workspace policy for every turn, not a learned correction.
+          const pluginRules = [
+            ...(this.extensions?.alwaysRules() || []),
+            ...(await this.extensions?.libraryInjection({
+              message: context.prompt,
+              kind: verdict.kind,
+              rules: verdict.rules.map((rule) => rule.text),
+            }) || []),
+          ];
+          if (pluginRules.length && verdict.kind === 'task') {
+            libraryBlock = [verdict.injection, ['Plugin policy for this workspace:', ...pluginRules.map((line) => `- ${line}`)].join(String.fromCharCode(10))].join(String.fromCharCode(10, 10));
+          } else {
+            libraryBlock = verdict.injection;
+          }
           turnKind = verdict.kind;
           context.library = libraryFor(cwd);
           agentEvents.emit({
@@ -1059,10 +1077,15 @@ export class Agent {
       // Reviewers are expensive, so a chat turn gets no gate at all: there is no
       // work to check, and a "hello" that returns a reject is worse than no gate.
       const selfWrites = options.agent_self_write === '1' || this.settings.agent_self_write;
-      const gateModeSetting: GateMode = turnKind === 'chat' ? 'off' : resolveGateMode(
-        options.gate_mode || this.settings.gate_mode,
-        'full',
-      );
+      // A plugin may insist the gate stays on ("this repo must not be closed
+      // without a review"), but none may switch it off: a plugin that turned the
+      // gate off would silently withdraw the guarantee another plugin relies on.
+      // So the preference can only raise the mode, never lower it.
+      const operatorGate = resolveGateMode(options.gate_mode || this.settings.gate_mode, 'full');
+      const pluginGate = this.extensions?.gatePreference();
+      const gateModeSetting: GateMode = turnKind === 'chat'
+        ? 'off'
+        : (pluginGate === true && operatorGate === 'off' ? 'rules' : operatorGate);
       const gate = new QualityGate({
         settings: {
           mode: gateModeSetting,
@@ -1070,6 +1093,9 @@ export class Agent {
           maxRejects: Number(options.gate_max_rejects) || this.settings.gate_max_rejects,
           maxToolSteps: Number.isFinite(Number(options.gate_max_tool_steps)) ? Number(options.gate_max_tool_steps) : this.settings.gate_max_tool_steps,
           budgetMs: (Number(options.gate_budget_seconds) || this.settings.gate_budget_seconds) * 1000,
+          requirePlan: options.gate_require_plan === undefined
+            ? (this.settings.gate_require_plan ?? true)
+            : resolveGateMode(String(options.gate_require_plan)) !== 'off',
         },
         events: agentEvents,
       });
@@ -1083,6 +1109,13 @@ export class Agent {
       if (depth === 0 && this.extensions) {
         this.extensions.startTask();
         await this.extensions.taskStart({ prompt: context.prompt, cwd, taskId, sessionId: context.sessionId });
+        // Intents the plugin knows the task always needs. They land before the
+        // first turn, so the agent plans against them instead of discovering
+        // them at the gate.
+        const declared = this.extensions.declaredIntents();
+        if (declared.length && gateModeSetting !== 'off') {
+          gate.updateIntents(declared as any, '', 'agent', { taskId: context.taskId, sessionId: context.sessionId });
+        }
       }
       const gateDirective = gate.directive();
       if (depth === 0 && gateModeSetting !== 'off') {
@@ -1279,6 +1312,29 @@ export class Agent {
                 const toolResult = item.value;
                 supervisor.recordToolCall(toolCall.name, toolCall.arguments, toolResult.success);
                 this.emitToolEvent(context, toolCall.name, toolCall.arguments, toolResult, Date.now());
+                if (toolCall.name === 'intent' && toolResult.success && this.extensions) {
+                  // A plugin may know the task needs something the agent forgot
+                  // to list. It can add pending rows only; it cannot close them.
+                  const rows = await this.extensions.intentUpdate({
+                    taskId: context.taskId,
+                    intents: gate.ledger.current.intents as any,
+                    completion: gate.ledger.current.completionRate,
+                    approach: gate.ledger.current.approach,
+                  });
+                  if (rows.length) {
+                    const before = gate.ledger.current.intents.length;
+                    gate.updateIntents(rows as any, '', 'agent', { taskId: context.taskId, sessionId: context.sessionId });
+                    const added = gate.ledger.current.intents.length - before;
+                    if (added > 0) {
+                      context.history.push({
+                        role: 'user',
+                        content: [`Policy added ${added} intent(s) you had not listed; they count toward completion:`]
+                          .concat(rows.map((row) => `- ${row.description}`))
+                          .join(String.fromCharCode(10)),
+                      });
+                    }
+                  }
+                }
                 if (toolCall.name === 'finish' && toolResult.success) {
                   const output = toolResult.data?.output || 'Task completed';
                   const ruleGate = this.gateFinish(output, supervisor);
@@ -1404,6 +1460,16 @@ export class Agent {
         result += `
 
 _(Answer truncated by the model's output limit in ${truncatedTurns} place(s). Raise max_tokens, or ask it to continue in parts, for the rest.)_`;
+      }
+      if (depth === 0 && this.extensions) {
+        // Whatever happened, the plugin that opened this task gets to close it.
+        // A hook that throws is logged, never thrown at the caller: the task's
+        // own result is already decided by now.
+        void this.extensions.taskEnd({
+          taskId,
+          status: humanTakeover ? 'rejected' : 'success',
+          completion: gate.ledger.current.completionRate,
+        });
       }
       return result;
     }, depth > 0);
@@ -1783,6 +1849,44 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if (!gate.enabled) return { pass: true, exhausted: false, payload: { status: 'success' } };
     const report = supervisor.report();
     const touched = this.touchedFiles(context, supervisor);
+    // Plugin policy runs before the reviewer: a refusal here is cheap, and a
+    // plugin that knows the workspace better than the reviewer does should not
+    // have to pay for a review to be heard.
+    if (this.extensions) {
+      const check = await this.extensions.gateCheck({
+        taskId: context.taskId,
+        intents: gate.ledger.current.intents as any,
+        completion: gate.ledger.current.completionRate,
+        touched,
+        claim: output,
+        trace: ((supervisor as any).trace ?? []).map((entry: ToolTraceEntry) => ({
+          name: entry.name,
+          ok: entry.success,
+          evidence: entry.evidence,
+        })),
+        delivery: { status: report.status, mutations: report.mutations, evidence: report.evidence },
+      });
+      if (check.block) {
+        const payload = {
+          status: 'reject',
+          actual_completion: `${gate.ledger.current.completionRate}%`,
+          missing_intents: gate.ledger.current.intents.filter((row) => row.status !== 'done').map((row) => row.description),
+          fix_feedback: check.block,
+          source: 'plugin',
+        };
+        agentEvents.emit({
+          type: 'gate.rejected',
+          taskId: context.taskId, sessionId: context.sessionId, at: Date.now(),
+          data: { ...payload, toolCallId },
+        });
+        void this.recordIntentState(context, gate, payload);
+        return { pass: false, exhausted: false, payload };
+      }
+      if (check.notes.length) {
+        (context.options as any).plugin_gate_notes = check.notes.join(String.fromCharCode(10));
+      }
+    }
+
     const outcome = await gate.evaluate({
       taskId: context.taskId,
       sessionId: context.sessionId,
@@ -1795,6 +1899,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       delivery: report,
       transcript: this.recentTranscript(context),
       touched,
+      reviewerNotes: (context.options as any).plugin_gate_notes || '',
     }, (request) => this.reviewerLlm(request, context));
 
     void this.recordIntentState(context, gate, outcome.payload);
@@ -2215,6 +2320,30 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if(tool==='session_directives_ack')return {success:true,result:JSON.stringify({removed:this.directives.ack(Array.isArray(parsed.ids)?parsed.ids.map(String):[])}),error:''};
     if(tool==='question_answer'){const ok=typeof parsed.answer==='string'&&this.questions.answer(String(parsed.id),parsed.answer);return {success:ok,result:'',error:ok?'':'Question expired or invalid answer'}};
     if(tool==='extensions_list')return {success:true,result:JSON.stringify(this.extensionReport()),error:''};
+    if (tool === 'library_admin') {
+      // The rules the library learned from corrections, made visible and
+      // editable. A rule the user cannot see is a rule they cannot trust, and a
+      // wrong one would otherwise live in the workspace forever.
+      const action = String(parsed.action || 'list').toLowerCase();
+      try {
+        const workspace = path.resolve(String(parsed.workspace || process.cwd()));
+        const library = libraryFor(workspace);
+        await library.load();
+        if (action === 'add') {
+          const rule = library.add(String(parsed.text || ''), 'added from the agent settings page', 'manual');
+          await library.flush();
+          return { success: !!rule, result: JSON.stringify({ rules: library.list() }), error: rule ? '' : 'empty rule, or one that already exists' };
+        }
+        if (action === 'remove') {
+          const removed = library.remove(String(parsed.id || ''));
+          await library.flush();
+          return { success: removed, result: JSON.stringify({ rules: library.list() }), error: removed ? '' : 'no rule with that id' };
+        }
+        return { success: true, result: JSON.stringify({ workspace, rules: library.list() }), error: '' };
+      } catch (error: any) {
+        return { success: false, result: '', error: error?.message || 'library_admin failed' };
+      }
+    }
     if(tool==='extensions_reload'){
       // The settings page's toggle path: rewrite the enabled list, reload from
       // disk, and report what actually came up rather than what was requested.

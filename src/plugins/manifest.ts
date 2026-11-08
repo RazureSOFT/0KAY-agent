@@ -46,6 +46,20 @@ export interface PluginManifest {
     model?: { temperature?: number; max_tokens?: number }
     /** Extra tool names treated as safe (no approval prompt). */
     auto_approve?: string[]
+    /**
+     * Intents the plugin knows the task always needs, recorded on the ledger
+     * before the first model turn. Declarative, so a plugin can make the gate
+     * demand something specific ("the README is updated", "the changelog has an
+     * entry") without shipping code.
+     */
+    intents?: Array<{ id?: string; description: string; method?: string }>
+    /**
+     * Rules that apply to every turn in this workspace, not just the turns whose
+     * words happen to match. Declarative counterpart to a library rule.
+     */
+    always_rules?: string[]
+    /** Turn the completion gate off or on for tasks this plugin applies to. */
+    gate?: { enabled?: boolean }
   }
 
   /**
@@ -72,6 +86,8 @@ export const KNOWN_PERMISSIONS = [
   'tools:register',
   'hooks:prompt',
   'hooks:tool',
+  'hooks:gate',
+  'hooks:library',
   'network',
   'filesystem:read',
   'filesystem:write',
@@ -207,6 +223,32 @@ export function readManifest(dir: string): LoadedPlugin {
     if (b.auto_approve !== undefined) {
       if (!Array.isArray(b.auto_approve)) throw new ManifestError(file, '"behaviour.auto_approve" must be an array')
       behaviour.auto_approve = b.auto_approve.map((entry: any, index: number) => requireString(entry, `behaviour.auto_approve[${index}]`, file))
+    }
+    if (b.intents !== undefined) {
+      if (!Array.isArray(b.intents)) throw new ManifestError(file, '"behaviour.intents" must be an array')
+      behaviour.intents = b.intents.map((entry: any, index: number) => {
+        if (!entry || typeof entry !== 'object') {
+          throw new ManifestError(file, `"behaviour.intents[${index}]" must be an object`)
+        }
+        const out: { id?: string; description: string; method?: string } = {
+          description: requireString(entry.description, `behaviour.intents[${index}].description`, file),
+        }
+        if (entry.id !== undefined) out.id = requireString(entry.id, `behaviour.intents[${index}].id`, file)
+        if (entry.method !== undefined) out.method = requireString(entry.method, `behaviour.intents[${index}].method`, file)
+        return out
+      })
+    }
+    if (b.always_rules !== undefined) {
+      if (!Array.isArray(b.always_rules)) throw new ManifestError(file, '"behaviour.always_rules" must be an array')
+      behaviour.always_rules = b.always_rules.map((entry: any, index: number) =>
+        requireString(entry, `behaviour.always_rules[${index}]`, file))
+    }
+    if (b.gate !== undefined) {
+      if (!b.gate || typeof b.gate !== 'object') throw new ManifestError(file, '"behaviour.gate" must be an object')
+      if (b.gate.enabled !== undefined && typeof b.gate.enabled !== 'boolean') {
+        throw new ManifestError(file, '"behaviour.gate.enabled" must be a boolean')
+      }
+      behaviour.gate = { enabled: b.gate.enabled }
     }
     if (Object.keys(behaviour).length) manifest.behaviour = behaviour
   }

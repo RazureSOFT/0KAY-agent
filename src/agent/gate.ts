@@ -31,6 +31,8 @@ export interface GateSettings {
   maxRejects: number;
   maxToolSteps: number;
   budgetMs: number;
+  /** Plans are checked before code: a mutating task needs an approach on record. */
+  requirePlan: boolean;
   /** Patterns of files the review may look at but never grades on. */
   ignore: string[];
 }
@@ -41,6 +43,7 @@ export const DEFAULT_GATE: GateSettings = {
   maxRejects: 3,
   maxToolSteps: 6,
   budgetMs: 120_000,
+  requirePlan: true,
   ignore: ['node_modules', 'dist', 'out', '.git'],
 };
 
@@ -56,6 +59,8 @@ export interface GateInput {
   delivery: DeliveryReport;
   transcript: string;
   touched: string[];
+  /** Notes from enabled plugins, handed to the reviewer as context. */
+  reviewerNotes?: string;
 }
 
 export interface GateOutcome {
@@ -128,7 +133,11 @@ export class QualityGate {
    * The gate proper. Returns the payload to hand back as the tool's response.
    */
   async evaluate(input: GateInput, llm: LlmCaller): Promise<GateOutcome> {
-    const check = this.intents.check(input.completionRate);
+    // Plan-before-code only applies to a task that changed something. A question
+    // answered without touching a file does not owe the user a plan, and asking
+    // for one there would teach the model to write plans for everything.
+    const planRequired = this.settings.requirePlan && input.delivery.mutations > 0;
+    const check = this.intents.check(input.completionRate, { requiresPlan: planRequired, approach: input.approach });
     const intent = this.intents.serialize();
 
     // A 100% claim with open intents never reaches the reviewer: the ledger is
@@ -184,6 +193,7 @@ export class QualityGate {
       delivery: input.delivery,
       transcript: input.transcript,
       touched: input.touched,
+      reviewerNotes: input.reviewerNotes || '',
       maxToolSteps: this.settings.maxToolSteps,
       budgetMs: this.settings.budgetMs,
     };
@@ -238,6 +248,9 @@ export class QualityGate {
     return [
       'Completion gate (enforced, not advisory):',
       '- Record what the user asked for with the intent tool: one entry per request, each with id, description, method, and status. Update it when the list or the status changes.',
+      ...(this.settings.requirePlan
+        ? ['- Plan before code. Every intent needs a method (the file, the approach, the command) and the ledger needs an approach line before a change can be claimed as done. A task that writes files without a written plan is rejected by the ledger, not reviewed.']
+        : []),
       '- Your completion rate is derived from those entries. Reporting 100% while any entry is open is rejected mechanically, before any review.',
       `- A 100% claim is reviewed by a second model that reads your files. It can reject you. After ${this.settings.maxRejects} rejections the task stops and the user takes over.`,
       '- A done entry needs evidence: the command output, the file and line, or the method that proves it. "I implemented it" is not evidence.',

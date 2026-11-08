@@ -43,6 +43,25 @@ export interface ToolCallVeto {
   args?: Record<string, any>
 }
 
+export interface PluginGateCheckInput {
+  taskId: string
+  intents: PluginIntentRow[]
+  completion: number
+  touched: string[]
+  claim: string
+  /** What the agent actually ran, in order. Lets a policy check for a real proof. */
+  trace: Array<{ name: string; ok: boolean; evidence?: string }>
+  delivery: { status: string; mutations: number; evidence: string[] }
+}
+
+export interface PluginIntentRow {
+  id?: string
+  description: string
+  method?: string
+  status?: 'pending' | 'in_progress' | 'done' | 'blocked'
+  evidence?: string
+}
+
 export interface PluginHooks {
   /** Called once per task, after the system prompt is assembled. */
   onTaskStart?(input: { prompt: string; cwd: string; taskId: string; sessionId?: string }): void | Promise<void>
@@ -52,6 +71,30 @@ export interface PluginHooks {
   afterToolCall?(input: { tool: string; args: Record<string, any>; success: boolean; output: string }): void | Promise<void>
   /** Called before each model turn; may add text to that turn only. */
   beforeModelCall?(input: { iteration: number; model: string }): { prompt?: string } | void | Promise<{ prompt?: string } | void>
+  /**
+   * Called whenever the intent ledger changes. May append intents the plugin
+   * knows the task needs. Requires `hooks:gate`.
+   *
+   * It cannot mark anything done or clear a row: the ledger is the agent's
+   * account of the work, and a plugin that could close items would be able to
+   * satisfy the gate on the agent's behalf.
+   */
+  onIntentUpdate?(input: { taskId: string; intents: PluginIntentRow[]; completion: number; approach: string }): PluginIntentRow[] | void | Promise<PluginIntentRow[] | void>
+  /**
+   * Called before the reviewer runs on a 100% claim. May add a reason to reject
+   * (a `block` string) or a note that goes to the reviewer. Requires `hooks:gate`.
+   *
+   * A block is a policy refusal, not a verdict: it comes back to the agent as
+   * `source: "plugin"` so it can be told apart from a reviewer rejection.
+   */
+  onGateCheck?(input: PluginGateCheckInput): { block?: string; note?: string } | void | Promise<{ block?: string; note?: string } | void>
+  /** Called once when a task ends, whatever the outcome. Requires `hooks:gate`. */
+  onTaskEnd?(input: { taskId: string; status: 'success' | 'rejected' | 'failed' | 'cancelled'; completion: number }): void | Promise<void>
+  /**
+   * Called for every turn after the library stage, so a plugin can add a rule to
+   * this turn only. Requires `hooks:library`.
+   */
+  onLibraryInjection?(input: { message: string; kind: 'chat' | 'task'; rules: string[] }): string[] | void | Promise<string[] | void>
 }
 
 export interface LoadedModulePlugin extends LoadedPlugin {
@@ -202,6 +245,18 @@ export class PluginHost {
         }
         if (typeof hooks.afterToolCall === 'function') {
           record.hooks.afterToolCall = allowed('hooks:tool') ? hooks.afterToolCall as PluginHooks['afterToolCall'] : undefined
+        }
+        if (typeof hooks.onIntentUpdate === 'function') {
+          record.hooks.onIntentUpdate = allowed('hooks:gate') ? hooks.onIntentUpdate as PluginHooks['onIntentUpdate'] : undefined
+        }
+        if (typeof hooks.onGateCheck === 'function') {
+          record.hooks.onGateCheck = allowed('hooks:gate') ? hooks.onGateCheck as PluginHooks['onGateCheck'] : undefined
+        }
+        if (typeof hooks.onTaskEnd === 'function') {
+          record.hooks.onTaskEnd = allowed('hooks:gate') ? hooks.onTaskEnd as PluginHooks['onTaskEnd'] : undefined
+        }
+        if (typeof hooks.onLibraryInjection === 'function') {
+          record.hooks.onLibraryInjection = allowed('hooks:library') ? hooks.onLibraryInjection as PluginHooks['onLibraryInjection'] : undefined
         }
       }
     } catch (error) {
@@ -378,6 +433,134 @@ export class PluginHost {
         this.note(plugin, `afterToolCall failed: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
+  }
+
+  /**
+   * Ask plugins whether the ledger is missing anything they know about.
+   *
+   * Only additions are honoured, and only with a description. A plugin cannot
+   * mark a row done or remove one, which keeps the completion score something
+   * the agent has to earn.
+   */
+  async intentUpdate(input: { taskId: string; intents: PluginIntentRow[]; completion: number; approach: string }): Promise<PluginIntentRow[]> {
+    const added: PluginIntentRow[] = []
+    for (const plugin of this.plugins) {
+      const hook = plugin.hooks.onIntentUpdate
+      if (!hook || !this.spend(plugin.manifest.name, 'onIntentUpdate')) continue
+      try {
+        const rows = await hook(input)
+        if (!Array.isArray(rows)) continue
+        for (const row of rows) {
+          const description = String(row?.description ?? '').replace(/\s+/g, ' ').trim()
+          if (!description) continue
+          added.push({
+            description: description.slice(0, 400),
+            method: row.method ? String(row.method).slice(0, 600) : undefined,
+            ...(row.id ? { id: String(row.id).slice(0, 64) } : {}),
+            // Forced: whatever the plugin said, it can only add pending work.
+            status: 'pending',
+          })
+        }
+      } catch (error) {
+        this.note(plugin, `onIntentUpdate failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return added
+  }
+
+  /**
+   * Policy check before the reviewer is paid for.
+   *
+   * The first block wins, for the same reason the first tool veto wins: a
+   * refusal that later plugins may argue with is not a refusal.
+   */
+  async gateCheck(input: PluginGateCheckInput): Promise<{ block?: string; notes: string[] }> {
+    const notes: string[] = []
+    for (const plugin of this.plugins) {
+      const hook = plugin.hooks.onGateCheck
+      if (!hook || !this.spend(plugin.manifest.name, 'onGateCheck')) continue
+      try {
+        const verdict = await hook(input)
+        if (!verdict) continue
+        if (typeof verdict.block === 'string' && verdict.block.trim()) {
+          return { block: verdict.block.trim(), notes }
+        }
+        if (typeof verdict.note === 'string' && verdict.note.trim()) notes.push(verdict.note.trim())
+      } catch (error) {
+        this.note(plugin, `onGateCheck failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { notes }
+  }
+
+  async taskEnd(input: { taskId: string; status: 'success' | 'rejected' | 'failed' | 'cancelled'; completion: number }): Promise<void> {
+    for (const plugin of this.plugins) {
+      const hook = plugin.hooks.onTaskEnd
+      if (!hook || !this.spend(plugin.manifest.name, 'onTaskEnd')) continue
+      try {
+        await hook(input)
+      } catch (error) {
+        this.note(plugin, `onTaskEnd failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
+  /** Rules a plugin wants injected into this turn, on top of the matched ones. */
+  async libraryInjection(input: { message: string; kind: 'chat' | 'task'; rules: string[] }): Promise<string[]> {
+    const out: string[] = []
+    for (const plugin of this.plugins) {
+      const hook = plugin.hooks.onLibraryInjection
+      if (!hook || !this.spend(plugin.manifest.name, 'onLibraryInjection')) continue
+      try {
+        const rows = await hook(input)
+        if (!Array.isArray(rows)) continue
+        for (const row of rows) {
+          const text = String(row ?? '').replace(/\s+/g, ' ').trim()
+          if (text) out.push(text.slice(0, 400))
+        }
+      } catch (error) {
+        this.note(plugin, `onLibraryInjection failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return out
+  }
+
+  /** Every rule the declarative half declares, matched or not. */
+  alwaysRules(): string[] {
+    const out: string[] = []
+    for (const plugin of this.plugins) {
+      for (const text of plugin.manifest.behaviour?.always_rules || []) out.push(text)
+    }
+    return out
+  }
+
+  /** Intents a plugin declares the task always needs. */
+  declaredIntents(): PluginIntentRow[] {
+    const out: PluginIntentRow[] = []
+    for (const plugin of this.plugins) {
+      for (const row of plugin.manifest.behaviour?.intents || []) out.push({ ...row })
+    }
+    return out
+  }
+
+  /**
+   * Whether the enabled plugins want the gate off, or on.
+   *
+   * `undefined` means nobody expressed an opinion and the operator's setting
+   * stands. A disagreement resolves to "on": a plugin that wants the gate
+   * cannot switch off a gate another plugin relies on.
+   */
+  gatePreference(): boolean | undefined {
+    let sawOff = false
+    let sawOn = false
+    for (const plugin of this.plugins) {
+      const enabled = plugin.manifest.behaviour?.gate?.enabled
+      if (enabled === true) sawOn = true
+      if (enabled === false) sawOff = true
+    }
+    if (sawOn) return true
+    if (sawOff) return false
+    return undefined
   }
 
   private note(plugin: LoadedModulePlugin, message: string): void {

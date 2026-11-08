@@ -1,0 +1,20 @@
+{
+  "name": "delivery-policy",
+  "title": "交付纪律",
+  "version": "1.0.0",
+  "description": "演示不改代码就能改质量门：内置一条始终生效的规则，声明每次任务都该有的意图，并在没有验证证据时拒绝放行。",
+  "author": "0KAY",
+  "api": "1",
+  "entry": "index.mjs",
+  "permissions": ["hooks:gate", "hooks:library"],
+  "behaviour": {
+    "gate": { "enabled": true },
+    "always_rules": [
+      "Before claiming a task is done, run the narrowest command that proves it (a type check, one test file, a build) and quote its output.",
+      "Never report a change you did not make, and never report a command you did not run."
+    ],
+    "intents": [
+      { "id": "ap1", "description": "Verify the change with a command whose output proves it", "method": "run the narrowest test/build/typecheck and paste the result" }
+    ]
+  }
+}

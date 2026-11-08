@@ -38,6 +38,8 @@ export interface ReviewRequest {
   transcript: string;
   /** Files this task wrote or edited, relative to cwd where possible. */
   touched: string[];
+  /** Notes from enabled plugins, given to the reviewer as policy context. */
+  reviewerNotes: string;
   maxToolSteps: number;
   /** Hard deadline for the whole review, in milliseconds. */
   budgetMs: number;
@@ -234,6 +236,7 @@ function buildPrompt(request: ReviewRequest, stepsLeft: number): string {
     intents.join('\n') || '(empty — the agent never recorded an intent, which is itself a finding)',
     '',
     request.approach ? `AGENT'S STATED APPROACH:\n${clip(request.approach, 800)}` : '',
+    request.reviewerNotes ? `PLUGIN NOTES (workspace policy; weigh them, but verify):\n${clip(request.reviewerNotes, 1600)}` : '',
     `AGENT'S CLOSING CLAIM:\n${clip(request.claim, 4000)}`,
     '',
     `TOOL CALLS (${request.trace.length} total, last 40):\n${trace.join('\n') || '(none)'}`,

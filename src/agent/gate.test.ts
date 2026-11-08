@@ -11,7 +11,9 @@ function gateInput(overrides: Partial<GateInput> = {}): GateInput {
     cwd: process.cwd(),
     userIntent: 'Add a login form to the settings page',
     claim: 'Done: the login form is in place.',
-    approach: 'edit SettingsPage.vue',
+    // The default gate has plan-before-code on, and this fixture is a mutating
+    // task, so it carries the plan a real run would have recorded.
+    approach: 'edit SettingsPage.vue, then run vue-tsc',
     completionRate: 100,
     trace: [],
     delivery: { status: 'GREEN', reasons: [], warnings: [], evidence: [], mutations: 1, repeats: 0 },
@@ -181,4 +183,52 @@ test('an intent matched by description merges even when the id changed', () => {
   ledger.update([{ id: 'x9', description: 'Login Form', status: 'in_progress' }]);
   assert.equal(ledger.current.intents.length, 1);
   assert.equal(ledger.current.intents[0].status, 'in_progress');
+});
+
+test('plan before code: a mutating task with no approach is rejected by the ledger', async () => {
+  const gate = new QualityGate({ settings: { mode: 'full' } });
+  gate.updateIntents([{ id: 'i1', description: 'login form', status: 'done', evidence: 'src/SettingsPage.vue:40' }]);
+  let calls = 0;
+  const outcome = await gate.evaluate(gateInput({ approach: '' }), async () => { calls++; return '{"verdict":"pass"}' });
+  assert.equal(outcome.pass, false);
+  assert.equal(calls, 0, 'an unplanned claim never reaches the reviewer');
+  assert.match(String(outcome.payload.fix_feedback), /Plan first/);
+});
+
+test('plan before code: the approach line satisfies the rule', async () => {
+  const gate = new QualityGate({ settings: { mode: 'full' } });
+  gate.updateIntents([{ id: 'i1', description: 'login form', status: 'done', evidence: 'src/SettingsPage.vue:40' }], 'edit SettingsPage.vue, run vue-tsc');
+  const outcome = await gate.evaluate(gateInput(), async () => '{"verdict":"pass"}');
+  assert.equal(outcome.pass, true);
+});
+
+test('plan before code: every intent having a method also satisfies it', async () => {
+  const gate = new QualityGate({ settings: { mode: 'full' } });
+  gate.updateIntents([{ id: 'i1', description: 'login form', method: 'edit SettingsPage.vue', status: 'done', evidence: 'src/SettingsPage.vue:40' }]);
+  const outcome = await gate.evaluate(gateInput(), async () => '{"verdict":"pass"}');
+  assert.equal(outcome.pass, true);
+});
+
+test('plan before code: a read-only task owes no plan', async () => {
+  const gate = new QualityGate({ settings: { mode: 'full' } });
+  gate.updateIntents([{ id: 'i1', description: 'explain the gate', status: 'done', evidence: 'read gate.ts' }]);
+  const outcome = await gate.evaluate(
+    gateInput({ delivery: { status: 'GREEN', reasons: [], warnings: [], evidence: [], mutations: 0, repeats: 0 } }),
+    async () => '{"verdict":"pass"}',
+  );
+  assert.equal(outcome.pass, true, 'answering a question is not a change and must not need a plan');
+});
+
+test('plan before code can be switched off for a project that does not want it', async () => {
+  const gate = new QualityGate({ settings: { mode: 'rules', requirePlan: false } });
+  gate.updateIntents([{ id: 'i1', description: 'login form', status: 'done', evidence: 'src/SettingsPage.vue:40' }]);
+  const outcome = await gate.evaluate(gateInput(), async () => '{"verdict":"pass"}');
+  assert.equal(outcome.pass, true);
+});
+
+test('the directive tells the model about the plan rule only when it is on', () => {
+  const on = new QualityGate({ settings: { requirePlan: true } }).directive();
+  const off = new QualityGate({ settings: { requirePlan: false } }).directive();
+  assert.match(on, /Plan before code/);
+  assert.doesNotMatch(off, /Plan before code/);
 });
