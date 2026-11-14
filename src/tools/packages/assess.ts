@@ -1,6 +1,7 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
+import { RetestTool } from './retest.js'
 
 // RECON's task system as one tool: background assessment tasks that run the
 // RECON loop on the session graph, outliving the call that started them. The
@@ -23,7 +24,7 @@ export class AssessmentsTool extends Tool {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report'] },
+        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report', 'findings', 'retests', 'retest'] },
         kind: { type: 'string', enum: ['recon', 'engineering'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering aims at changing a code base or a deployed system.' },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
         objective: { type: 'string', description: 'create: the objective, in one sentence.' },
@@ -33,7 +34,8 @@ export class AssessmentsTool extends Tool {
         intents: { type: 'integer', minimum: 1, maximum: 120 },
         concurrency: { type: 'integer', minimum: 1, maximum: 6 },
         timeoutMs: { type: 'integer', minimum: 10000, maximum: 3600000 },
-        id: { type: 'string', description: 'get/control/hint/report: the task id.' },
+        id: { type: 'string', description: 'get/control/hint/report/findings: the task id.' },
+        finding_id: { type: 'string', description: 'retests/retest: the durable finding row id (from findings).' },
         operation: { type: 'string', enum: ['pause', 'resume', 'cancel', 'delete'], description: 'control: what to do.' },
         text: { type: 'string', description: 'hint: steering for the planner.' },
         path: { type: 'string', description: 'report: output file, default assessment-<id>.md in the working directory.' },
@@ -101,6 +103,24 @@ export class AssessmentsTool extends Tool {
         case 'trace': {
           const steps = manager.trace(String(args.id || ''), String(args.intent_id || ''))
           return success({ steps })
+        }
+        // The task page reads findings as rows, not graph nodes: a row is what a
+        // retest can point at, and it survives the run that produced it.
+        case 'findings':
+          return success({ findings: manager.findings.forTask(String(args.id || '')) })
+        case 'retests': {
+          const findingId = String(args.finding_id || '').trim()
+          if (!findingId) return failure('finding_id is required for retests')
+          return success({ retests: manager.findings.forFinding(findingId) })
+        }
+        case 'retest': {
+          // One call that starts and finishes: the caller is the agent asking for
+          // the retest, so there is no queued state to poll. Delegated to the
+          // retester tool so the verdict rules live in one place.
+          const findingId = String(args.finding_id || '').trim()
+          if (!findingId) return failure('finding_id is required for retest')
+          const retester = new RetestTool()
+          return retester.execute({ action: 'start', finding_id: findingId, notes: args.notes }, context)
         }
         case 'report': {
           const result = await manager.report(String(args.id || ''), args.path ? String(args.path) : undefined, context.cwd || process.cwd(), args.preview === true)
