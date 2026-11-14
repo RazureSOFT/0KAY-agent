@@ -9,6 +9,7 @@ import { TraceStore } from './traces.js'
 import type { TraceStep } from './traces.js'
 import { ReconEngine } from './engine.js'
 import { plantGoals, makePlanner, makeWorker, makeSummarizer } from './loop.js'
+import { FindingStore } from './findings.js'
 import type { LoopRuntime, LoopContext, ReviewOutcome } from './loop.js'
 import { renderAssessmentReport } from './report.js'
 import { writeFileAtomic } from '../../tools/atomic_write.js'
@@ -215,6 +216,13 @@ export class AssessmentManager {
   private cancelRequested = new Set<string>()
   private loaded = false
 
+  /**
+   * Findings outlive the task that produced them, and a retest addresses one by
+   * id from outside that task — so the store belongs to the manager, not to a
+   * run.
+   */
+  readonly findings = new FindingStore()
+
   constructor(
     private readonly graphFor: (sessionId: string) => Promise<ReconGraph>,
     private readonly dir?: string,
@@ -250,6 +258,31 @@ export class AssessmentManager {
         this.states.set(state.id, state)
       } catch {
         // A corrupted task file is skipped, not fatal.
+      }
+    }
+  }
+
+  /**
+   * Turn this run's finding nodes into durable rows.
+   *
+   * Idempotent on purpose: a resumed task harvests again, and a finding that
+   * already exists must not be duplicated. The node id is the identity, because
+   * it is the only thing stable across a resume.
+   */
+  private harvestFindings(state: AssessmentState, graph: ReconGraph): void {
+    const existing = new Set(this.findings.forTask(state.id).map((finding) => finding.nodeId).filter(Boolean))
+    for (const node of graph.nodesOfKind('finding')) {
+      if (existing.has(node.id)) continue
+      try {
+        this.findings.add({
+          taskId: state.id,
+          sessionId: state.sessionId,
+          nodeId: node.id,
+          text: node.text,
+          assets: node.assetIds.map((assetId: string) => graph.asset(assetId)?.raw || graph.node(assetId)?.text || assetId).filter(Boolean),
+        })
+      } catch {
+        // A finding with no text is not a finding; skip it rather than fail the run.
       }
     }
   }
@@ -462,6 +495,7 @@ export class AssessmentManager {
         state.endedAt = new Date().toISOString()
         state.planSteps = plan.toJSON()
         state.traceSteps = traces.toJSON()
+        this.harvestFindings(state, graph)
         await this.persist(state)
       })
       .catch(async (error: any) => {

@@ -273,3 +273,28 @@ test('say refuses an unknown id and empty text', async () => {
   })
   await assert.rejects(() => manager.say('t2', '   '), /message text is required/)
 })
+
+test('a finished run harvests its findings into durable rows', async () => {
+  const graph = new ReconGraph()
+  const manager = managerFor(graph)
+  const runtime = fakeRuntime({
+    planner: [INTENTS('probe the login')],
+    worker: '{"facts":[{"text":"login accepts POST"}],"findings":[{"text":"auth bypass with empty password"}]}',
+  })
+  const state = await manager.create({ objective: 'find one hole', targets: ['example.com'] }, 'session-harvest', runtime)
+  // `get` is async: awaiting it inside the predicate is what makes the wait
+  // observe the real status instead of a pending Promise.
+  await waitFor(async () => (await manager.get(state.id)).state.status === 'done', 8000, () => state.status)
+
+  const findings = manager.findings.forTask(state.id)
+  assert.equal(findings.length, 1, 'the finding node became a row')
+  assert.match(findings[0].text, /auth bypass/)
+  assert.ok(findings[0].id.startsWith('fi_'), 'the row has an id that outlives the task')
+
+  // Harvesting twice must not duplicate: the node id is the identity, which is
+  // the only thing stable across a resume. Driven directly rather than through a
+  // second run, because that run needs its own planner replies and this test is
+  // about the harvest, not the loop.
+  manager['harvestFindings']((await manager.get(state.id)).state, graph)
+  assert.equal(manager.findings.forTask(state.id).length, 1, 'harvest is idempotent')
+})

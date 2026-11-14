@@ -465,6 +465,11 @@ export class ReconGraph {
       .sort((a, b) => (b.priority ?? 5) - (a.priority ?? 5) || a.createdAt.localeCompare(b.createdAt))
   }
 
+  /** Every node of one kind. Used by the harvest, which turns findings into rows. */
+  nodesOfKind(kind: ExplorationNode['kind']): ExplorationNode[] {
+    return [...this.nodes.values()].filter((node) => node.kind === kind)
+  }
+
   openIntents(): ExplorationNode[] {
     return this.frontier()
   }
