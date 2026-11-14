@@ -76,6 +76,15 @@ export async function egressFetch(url:string,options:RequestInit={},timeoutMs=60
  });
  const data:any=await res.json().catch(()=>({}));
  if(!res.ok)throw new Error(data?.error||`egress HTTP ${res.status}`);
+ // Core reports a connection that never reached the server as 200 with
+ // {status:0, error:"..."} — the request itself succeeded, the fetch it
+ // performed did not. Folding that into a Response would give the caller a
+ // silent 502 with no body, so "the host is down" would look identical to
+ // "the server answered 502": the failure the pentest tools exist to
+ // distinguish. Throwing carries Core's own reason to the caller instead.
+ if(!data?.status){
+  throw new Error(`egress request failed: ${data?.error||'Core returned no status'}`);
+ }
  const outHeaders=new Headers();
  for(const[key,value]of Object.entries(data?.headers||{}))outHeaders.set(key,String(value));
  return new Response(data?.body??'',{status:data?.status||502,headers:outHeaders});

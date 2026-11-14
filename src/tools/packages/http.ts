@@ -1,6 +1,7 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure, egressOrDirect } from '../helpers.js'
+import { coreHttpBase } from '../../connection.js'
 import { compactOutput } from '../compact.js'
 
 // strix's "HTTP interception proxy", reduced to what an agent actually needs from
@@ -106,12 +107,46 @@ export function bodyExcerpt(body: string, limit = 500): string {
 /**
  * Is this URL this machine's own Core?
  *
- * 127.0.0.1 and ::1 are obvious. The port matters less than the host: Core is
- * the only thing on loopback an agent must never treat as a target, and a
- * request to the wrong port fails harmlessly.
+ * The rule being enforced is narrow and deliberate: an agent must not be able
+ * to drive Core's own gateway, because that can install a plugin (and run npm
+ * lifecycle scripts), rewrite a file, or flip a setting — privilege the model
+ * does not get to grant itself. See the guard in execute() above.
+ *
+ * What it is NOT is "the agent may never touch loopback". That reading was the
+ * old implementation, and it was too wide in a way that broke legitimate work:
+ * a service the user is running on their own machine — a dev server, a local
+ * API they are testing, anything on 127.0.0.1 that is not Core — was refused by
+ * hostname alone, with a message claiming it was "this machine's Core API" when
+ * it was nothing of the sort.
+ *
+ * Core's address is knowable exactly (`coreHttpBase()`), so the check is made
+ * against that: the same host AND the same port. A request to a different port
+ * on loopback is a different service and is allowed through — where the egress
+ * guard (strict by default for plugin traffic) still applies to it.
  */
 function isCoreAddress(url: URL): boolean {
-  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
-  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0'
-  return loopback
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0';
+  if (!isLoopback) return false;
+
+  // Parse Core's own base rather than assuming a port: it is configurable, and
+  // guessing it wrong would either block the wrong service or miss Core.
+  let core: URL;
+  try {
+    core = new URL(coreHttpBase());
+  } catch {
+    // If Core's address cannot be parsed, fall back to refusing all loopback.
+    // Failing closed is right here: the alternative is letting a malformed
+    // config turn off the guard entirely.
+    return true;
+  }
+  const coreHost = core.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const corePort = core.port || (core.protocol === 'https:' ? '443' : '80');
+  const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+
+  // `localhost` and `127.0.0.1` are the same machine and must resolve to the
+  // same decision, so a loopback pair counts as a host match.
+  const bothLoopback = (h: string) => h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  const hostMatches = host === coreHost || (bothLoopback(host) && bothLoopback(coreHost));
+  return hostMatches && port === corePort;
 }
