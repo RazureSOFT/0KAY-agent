@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ReconGraph } from '../../analysis/recon/graph.js'
 import { TraceStore } from '../../analysis/recon/traces.js'
-import { RecordFactTool, InsertAssetsTool, AddIntentTool, ProveGoalTool, GoalMetTool, SetConstraintsTool, GraphOverviewTool, SearchAllWorkerTracesTool, KillWorkTool } from './recon_ops.js'
+import { RecordFactTool, InsertAssetsTool, AddIntentTool, ProveGoalTool, GoalMetTool, SetConstraintsTool, GraphOverviewTool, SearchAllWorkerTracesTool, KillWorkTool, AddCompanyScopeTool, GetWorkerOutputTool, ListWorkerTracesTool } from './recon_ops.js'
 import type { ToolContext } from '../types.js'
 
 // The RECON tool surface runs on a run context (graph + traces + live
@@ -112,4 +112,60 @@ test('without a run context the tools fail with a pointer to the fallback', asyn
   const result = await new RecordFactTool().execute({ summary: 'x' }, { cwd: process.cwd(), taskId: 't', agentType: 'general' } as unknown as ToolContext)
   assert.equal(result.success, false)
   assert.match(result.error || '', /run context unavailable/)
+})
+
+test('add_company_scope claims assets for an owner and puts that owner in scope', async () => {
+  const graph = new ReconGraph()
+  const tool = new AddCompanyScopeTool()
+  const result = await tool.execute({
+    company: 'Acme',
+    assets: ['https://api.acme.test/login', 'acme.test', '10.9.0.0/24'],
+  }, contextWith(graph))
+  assert.equal(result.success, true, result.error)
+  const data = result.data as any
+  assert.equal(data.claimed, 2, 'domains and URLs are assets')
+  assert.deepEqual(data.cidrs, ['10.9.0.0/24'], 'a CIDR range is a scope entry, not an asset')
+  assert.ok(data.scope.includes('company:Acme'), 'the owner became a scope row')
+  assert.ok(data.scope.some((row: string) => row.endsWith('10.9.0.0/24')), 'the range is in scope too')
+  const owned = graph.toJSON().assets.filter((asset) => asset.company === 'Acme')
+  assert.ok(owned.length >= 2, 'the tag reached the assets')
+  assert.equal(graph.coverage().scope.denominator >= 1, true, 'scope has a denominator')
+})
+
+test('get_worker_output reports what an intent produced and how it ended', async () => {
+  const graph = new ReconGraph()
+  const traces = new TraceStore()
+  const intent = graph.addNode({ kind: 'intent', text: 'probe the api', assets: ['api.acme.test'] })
+  const fact = graph.addNode({ kind: 'fact', text: 'the api answers json', assets: ['api.acme.test'], derivedFrom: [intent.id] })
+  graph.addNode({ kind: 'fact', text: 'unrelated', derivedFrom: [] })
+  traces.record({ intentId: intent.id, worker: 'w1', action: 'curl', detail: 'POST /auth → 200', ok: true })
+  const tool = new GetWorkerOutputTool()
+
+  const result = await tool.execute({ intentId: intent.id }, contextWith(graph, traces))
+  assert.equal(result.success, true, result.error)
+  const data = result.data as any
+  assert.equal(data.steps, 1)
+  assert.equal(data.lastStep.action, 'curl')
+  assert.deepEqual(data.produced.map((node: any) => node.id), [fact.id])
+
+  const empty = await tool.execute({ intentId: 'i_missing' }, contextWith(graph, traces))
+  assert.equal(empty.success, true)
+  assert.match((empty.data as any).note, /no execution trace/)
+})
+
+test('list_worker_traces returns an index, or the steps of one intent', async () => {
+  const graph = new ReconGraph()
+  const traces = new TraceStore()
+  const intent = graph.addNode({ kind: 'intent', text: 'probe' })
+  traces.record({ intentId: intent.id, worker: 'w1', action: 'nmap', detail: '22/tcp open', ok: true })
+  traces.record({ intentId: intent.id, worker: 'w1', action: 'curl', detail: '200', ok: true })
+  const tool = new ListWorkerTracesTool()
+
+  const index = await tool.execute({}, contextWith(graph, traces))
+  assert.equal((index.data as any).intents, 1)
+  assert.equal((index.data as any).entries[0].steps, 2)
+
+  const steps = await tool.execute({ intentId: intent.id, limit: 1 }, contextWith(graph, traces))
+  assert.equal((steps.data as any).steps, 1)
+  assert.equal((steps.data as any).entries[0].action, 'curl', 'the limit keeps the newest step')
 })

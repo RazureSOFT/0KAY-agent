@@ -633,10 +633,116 @@ export class ListCompaniesTool extends Tool {
   }
 }
 
+/** add_company_scope — tag assets with an owner and put that owner in scope. */
+export class AddCompanyScopeTool extends Tool {
+  get name(): string { return 'add_company_scope'; }
+  get description(): string {
+    return 'Tag assets with the organisation that owns them and add that organisation to the task scope. Assets already known are claimed, not duplicated; the owner tag is carried up the parent chain. Returns the claimed assets and the resulting scope.'
+  }
+  get parameters(): Record<string, any> {
+    return {
+      type: 'object', required: ['company'],
+      properties: {
+        company: { type: 'string', description: 'Organisation name as it should appear in reports.' },
+        assets: { type: 'array', items: { type: 'string' }, description: 'Domains, IPs, CIDR ranges or keywords to claim for this organisation.' },
+      },
+    }
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const company = String(args.company || '').trim()
+    if (!company) return failure('company is required')
+    // A CIDR range is a scope entry, not an asset: there is nothing to classify.
+    const cidrs: string[] = []
+    const claimed: Array<{ id: string; kind: string; key: string; company: string }> = []
+    for (const raw of Array.isArray(args.assets) ? args.assets : []) {
+      const text = String(raw || '').trim()
+      if (!text) continue
+      if (/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(text)) { cidrs.push(text); continue }
+      const asset = reconRun.graph.addAsset(text, company)
+      claimed.push({ id: asset.id, kind: asset.kind, key: asset.key, company: asset.company || company })
+    }
+    reconRun.graph.addScope([`company:${company}`, ...cidrs])
+    return success({
+      company,
+      claimed: claimed.length,
+      assets: claimed,
+      cidrs,
+      scope: reconRun.graph.scope().map((row) => `${row.kind}:${row.value}`),
+      coverage: reconRun.graph.coverage().scope,
+    })
+  }
+}
+
+/** get_worker_output — the conclusion an intent produced, plus its last step. */
+export class GetWorkerOutputTool extends Tool {
+  get name(): string { return 'get_worker_output'; }
+  get description(): string {
+    return 'Read what one intent (work item) concluded: the facts and findings derived from it, and the last step it recorded. Use it when a worker finished and you need its result rather than its process. An intent with no recorded steps says so instead of returning an empty result.'
+  }
+  get parameters(): Record<string, any> {
+    return {
+      type: 'object', required: ['intentId'],
+      properties: {
+        intentId: { type: 'string', description: 'The intent node id, e.g. i_7.' },
+      },
+    }
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const intentId = String(args.intentId || '').trim()
+    if (!intentId) return failure('intentId is required')
+    const steps = reconRun.traces.get(intentId)
+    const serialized = reconRun.graph.toJSON()
+    const produced = (serialized.nodes || [])
+      .filter((node) => Array.isArray(node.derivedFrom) && node.derivedFrom.includes(intentId))
+      .map((node) => ({ id: node.id, kind: node.kind, text: node.text, status: node.status }))
+    const last = steps[steps.length - 1]
+    return success({
+      intentId,
+      steps: steps.length,
+      lastStep: last ? { worker: last.worker, action: last.action, detail: last.detail, ok: last.ok, at: last.at } : null,
+      produced,
+      ...(steps.length ? {} : { note: 'no execution trace was recorded for this intent; the result may have been written straight to the graph' }),
+    })
+  }
+}
+
+/** list_worker_traces — the per-intent index of execution steps. */
+export class ListWorkerTracesTool extends Tool {
+  get name(): string { return 'list_worker_traces'; }
+  get description(): string {
+    return 'List execution traces: with intentId, the steps of that intent; without it, one row per intent with its step count, workers and last timestamp. This is the index — use search_all_worker_traces to look for what someone already tried.'
+  }
+  get parameters(): Record<string, any> {
+    return {
+      type: 'object',
+      properties: {
+        intentId: { type: 'string', description: 'Show the steps of this intent instead of the index.' },
+        limit: { type: 'integer', minimum: 1, maximum: 500 },
+      },
+    }
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    const reconRun = run(context)
+    if (!reconRun) return failure('reconRun run context unavailable')
+    const limit = Math.max(1, Math.min(Number(args.limit) || 50, 500))
+    const intentId = String(args.intentId || '').trim()
+    if (intentId) {
+      const steps = reconRun.traces.get(intentId).slice(-limit)
+      return success({ intentId, steps: steps.length, entries: steps })
+    }
+    const index = reconRun.traces.list().slice(0, limit)
+    return success({ intents: index.length, entries: index })
+  }
+}
+
 export const RECON_OPS_TOOLS = [
   new GraphOverviewTool(), new ListGoalsTool(), new ListFactsTool(), new ListFindingsTool(), new NodeDetailTool(), new ExpandDigestTool(),
-  new ListAssetsTool(), new ListUntestedAssetsTool(), new ListCompaniesTool(), new AddTaskScopeTool(),
+  new ListAssetsTool(), new ListUntestedAssetsTool(), new ListCompaniesTool(), new AddTaskScopeTool(), new AddCompanyScopeTool(),
   new AddIntentTool(), new ProveGoalTool(), new GoalMetTool(), new KillWorkTool(), new SteerWorkTool(),
   new RecordFactTool(), new ReportFindingTool(), new InsertAssetsTool(), new AddHintTool(), new SetGoalsTool(), new SetConstraintsTool(),
-  new SearchAllWorkerTracesTool(), new GetWorkerTraceTool(),
+  new SearchAllWorkerTracesTool(), new GetWorkerTraceTool(), new GetWorkerOutputTool(), new ListWorkerTracesTool(),
 ]

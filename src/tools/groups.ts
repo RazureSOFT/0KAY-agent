@@ -53,7 +53,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   reconOps: {
     label: 'recon ops',
     hint: 'RECON graph tools: record facts/findings, add intents & assets, prove goals, read the situation — live while an assessment runs',
-    tools: ['graph_overview', 'list_goals', 'list_facts', 'list_findings', 'node_detail', 'expand_digest', 'list_assets', 'list_untested_assets', 'list_companies', 'add_task_scope', 'add_intent', 'prove_goal', 'goal_met', 'kill_work', 'steer_work', 'record_fact', 'report_finding', 'insert_assets', 'add_hint', 'set_goals', 'set_constraints', 'search_all_worker_traces', 'get_worker_trace'],
+    tools: ['graph_overview', 'list_goals', 'list_facts', 'list_findings', 'node_detail', 'expand_digest', 'list_assets', 'list_untested_assets', 'list_companies', 'add_task_scope', 'add_company_scope', 'add_intent', 'prove_goal', 'goal_met', 'kill_work', 'steer_work', 'record_fact', 'report_finding', 'insert_assets', 'add_hint', 'set_goals', 'set_constraints', 'search_all_worker_traces', 'get_worker_trace', 'get_worker_output', 'list_worker_traces'],
   },
   research: {
     label: 'research',
