@@ -622,10 +622,17 @@ async function discoverExtensionDir(): Promise<string> {
 
 async function pollAgentSettings(): Promise<void> {
   try {
-    const res = await coreFetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() })
+    // Two sections matter: the agent's own settings and the experiments
+    // section, which is where the forge credentials live. Reading only the
+    // first meant github_token was written by the UI and never seen here.
+    const [res, experimentsRes] = await Promise.all([
+      coreFetch(`${CORE_HTTP}/api/settings/agent`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() }),
+      coreFetch(`${CORE_HTTP}/api/settings/experiments`, { signal: AbortSignal.timeout(5000), headers:coreHeaders() }),
+    ])
     if (!res.ok) return
     const body = await res.json()
-    const values = body?.values || {}
+    const experiments = experimentsRes.ok ? await experimentsRes.json() : {}
+    const values = { ...(experiments?.values || {}), ...(body?.values || {}) }
     agent.applySettings({
       model_id: typeof values.model_id === 'string' ? values.model_id : '',
       temperature: Number(values.temperature ?? 0.7),
