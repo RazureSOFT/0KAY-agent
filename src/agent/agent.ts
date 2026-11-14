@@ -42,6 +42,7 @@ import { extractDocumentText, isDocumentAttachment } from './attachment_text.js'
 import { PluginHost, toRegistryTool } from '../plugins/host.js';
 import { agentEvents } from './events.js';
 import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
+import { planReviewOptions } from './plan_review_options.js';
 import { FactMemory } from './facts.js';
 import { PermissionLedger } from './permission.js';
 import { prepareTurn, libraryFor } from './library.js';
@@ -221,6 +222,12 @@ export interface AgentSettings {
   gate_budget_seconds?: number;
   /** Plan before code: a mutating task needs an approach on record before it can claim done. */
   gate_require_plan?: boolean;
+  /**
+   * The plan-quality floor, 0-100. A plan whose weakest of feasibility /
+   * confidence / completeness falls below this goes back to the planner with
+   * the reviewer's objections instead of being built. 0 disables the check.
+   */
+  plan_threshold?: number;
   /** Rules injected before the first message (the LIBRARY stage). */
   library_enabled?: boolean;
   /** Let the agent rewrite its own experience without a user/reviewer instruction. */
@@ -405,6 +412,9 @@ export class Agent {
       gate_max_tool_steps: 6,
       gate_budget_seconds: 120,
       gate_require_plan: true,
+      // 70 is a starting point, not a magic number: below it a plan is usually
+      // missing part of the request or guessing at something it could check.
+      plan_threshold: 70,
       library_enabled: true,
       agent_self_write: false,
     };
@@ -527,6 +537,11 @@ export class Agent {
       this.settings.gate_budget_seconds = Math.max(5, Math.min(900, Math.floor(partial.gate_budget_seconds)));
     }
     if (typeof partial.gate_require_plan === 'boolean') this.settings.gate_require_plan = partial.gate_require_plan;
+    if (typeof partial.plan_threshold === 'number' && Number.isFinite(partial.plan_threshold)) {
+      // Clamped rather than rejected: 0 is meaningful ("do not review plans"),
+      // and anything above 100 would block every plan forever.
+      this.settings.plan_threshold = Math.max(0, Math.min(100, Math.round(partial.plan_threshold)));
+    }
     if (typeof partial.library_enabled === 'boolean') this.settings.library_enabled = partial.library_enabled;
     if (typeof partial.agent_self_write === 'boolean') this.settings.agent_self_write = partial.agent_self_write;
     this.applyToolToggles();
@@ -2066,6 +2081,12 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       ledger: context.ledger,
       signal: context.signal,
       llm: (request) => this.toolLlm(request, context),
+      // The plan tool reviews against the user's own words and the configured
+      // threshold, so both travel with the task's options.
+      options: {
+        ...context.options,
+        ...planReviewOptions(this.settings.plan_threshold ?? 0, context.prompt),
+      },
       // Background assessment tasks outlive this call, so their model calls
       // must not inherit this context's abort signal.
       backgroundLlm: (request) => this.toolLlm(request, { taskId: context.taskId, sessionId: context.sessionId }),

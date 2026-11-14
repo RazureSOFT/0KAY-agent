@@ -10,6 +10,8 @@ import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { success, failure } from './helpers.js';
 import { taskRecorder } from '../task/records.js';
 import { PLAN_SUFFIX } from '../sandbox/policy.js';
+import { planVerdict, reviewPlan, type PlanReview } from '../agent/plan_review.js';
+import { reviewOptions } from '../agent/plan_review_options.js';
 
 export interface PlanRecord {
   title: string;
@@ -58,7 +60,7 @@ export class PlanTool extends Tool {
   }
 
   get description(): string {
-    return 'Submit the finished implementation plan for this planning run. Call it once, at the end, instead of finish. The user gets a card with a Build button that starts an execution task from this plan, so write it for an executor with no context: exact file paths, exact commands, verification steps, risks and rollback.';
+    return 'Submit the finished implementation plan for this planning run. Call it once, at the end, instead of finish. The user gets a card with a Build button that starts an execution task from this plan, so write it for an executor with no context: exact file paths, exact commands, verification steps, risks and rollback. A plan reviewer may reject the plan for falling below the quality bar; when it does, the reply lists the objections — address them and call this again with the revised plan.';
   }
 
   get parameters(): Record<string, any> {
@@ -90,6 +92,22 @@ export class PlanTool extends Tool {
       ...(args.demo_html ? { demoHtml: String(args.demo_html) } : {}),
       createdAt: Date.now(),
     };
+
+    // The plan is checked before it is recorded as ready. A plan below the
+    // threshold goes back to the planner with the reviewer's objections rather
+    // than being published for a Build the user would regret.
+    const outcome = await reviewPlanIfConfigured(record, context);
+    if (outcome?.review && planVerdict(outcome.review, outcome.threshold) === 'revise') {
+      const { review, threshold } = outcome;
+      return failure(
+        [
+          `the plan did not reach the quality threshold (${review.score} < ${threshold}). Fix these and submit again:`,
+          ...review.objections.map((item) => `- [${item.severity}] ${item.where}: ${item.problem}${item.suggestion ? ` → ${item.suggestion}` : ''}`),
+          review.revise ? `\n${review.revise}` : '',
+        ].filter(Boolean).join('\n'),
+      );
+    }
+
     plans.set(context.taskId, record);
     // The plan also lands on disk. A plan that exists only in memory is gone
     // when the process is, and the file is what makes it reviewable later,
@@ -118,6 +136,28 @@ export class PlanTool extends Tool {
       ...(missing.length ? { missing_sections: missing, note: 'the plan can still be built; add these sections if they change the approach' } : {}),
     });
   }
+}
+
+/**
+ * Review a plan when a threshold and a model are available.
+ *
+ * Returns null when there is nothing to do, which keeps the "no review
+ * configured" path free — the plan proceeds exactly as it did before this
+ * existed. A review that could not run comes back degraded and passes; see
+ * plan_review.ts.
+ */
+async function reviewPlanIfConfigured(
+  record: PlanRecord,
+  context: ToolContext,
+): Promise<{ review?: PlanReview; threshold: number } | null> {
+  const { threshold, userIntent, constraints } = reviewOptions(context.options);
+  if (threshold <= 0) return null;
+  if (!context.llm) return null;
+  const review = await reviewPlan(
+    { userIntent: userIntent || record.title, plan: record.markdown, constraints },
+    context.llm,
+  );
+  return { review, threshold };
 }
 
 /**

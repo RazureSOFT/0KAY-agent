@@ -89,6 +89,13 @@ export interface ToolContext {
   history?: any[];
   ledger?: any;
   llm?: LlmCaller;
+  /**
+   * Per-task options, the same map the agent uses for per-turn overrides.
+   * Present so a tool (the plan tool) can read the user's own words and the
+   * plan-quality threshold without a second channel. Absent in tests, which is
+   * what "no review configured" looks like.
+   */
+  options?: Record<string, string>;
 }
 
 export abstract class Tool {

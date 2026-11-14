@@ -381,6 +381,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '会写文件的任务，意图清单里每项都得有「打算怎么做」或者一条整体方案，否则 100% 会被清单直接打回（不花钱）。只读任务和提问不受影响',
           },
           {
+            key: 'plan_threshold',
+            type: 'number',
+            label: '方案合格阈值',
+            defaultValue: '70',
+            help: '出方案后先由方案审查模型打分（可行性 / 把握度 / 完整度，取三者最低分）。低于此分数或带 blocker 的方案不会交给用户，而是把具体修改意见退回规划者重写。0 = 不审查方案',
+          },
+          {
             key: 'agent_self_write',
             type: 'bool',
             label: '允许 Agent 自行改写经验',
@@ -597,6 +604,7 @@ async function pollAgentSettings(): Promise<void> {
       gate_max_tool_steps: Number(values.gate_max_tool_steps ?? 6),
       gate_budget_seconds: Number(values.gate_budget_seconds ?? 120),
       gate_require_plan: values.gate_require_plan !== false,
+      plan_threshold: Number(values.plan_threshold ?? 70),
       library_enabled: values.library_enabled !== false,
       agent_self_write: values.agent_self_write === true,
     })

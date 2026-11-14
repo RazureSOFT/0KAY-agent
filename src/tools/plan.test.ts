@@ -73,3 +73,75 @@ test('a demo document is kept alongside the plan', async () => {
   await tool.execute({ markdown: FULL_PLAN, demo_html: '<!doctype html><p>demo</p>' }, context('p5'))
   assert.equal(planFor('p5')?.demoHtml, '<!doctype html><p>demo</p>')
 })
+
+// --- plan review ------------------------------------------------------------
+
+const reviewReply = (over: Record<string, unknown> = {}) => JSON.stringify({
+  feasibility: 90, confidence: 85, completeness: 80,
+  strengths: [], objections: [], revise: '', ...over,
+})
+
+function reviewingContext(taskId: string, llm: any, threshold = 70, intent = 'add a provider kind field'): ToolContext {
+  return {
+    cwd: process.cwd(), taskId, sessionId: `s-${taskId}`, agentType: 'general',
+    llm,
+    options: { plan_threshold: String(threshold), user_intent: intent },
+  } as ToolContext
+}
+
+test('with no threshold configured the plan is not reviewed and not blocked', async () => {
+  clearPlan('r1')
+  let called = false
+  const result = await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r1', async () => { called = true; return reviewReply() }, 0))
+  assert.equal(called, false)
+  assert.equal(result.success, true)
+})
+
+test('a plan above the threshold is accepted', async () => {
+  clearPlan('r2')
+  const result = await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r2', async () => reviewReply()))
+  assert.equal(result.success, true)
+})
+
+test('a plan below the threshold goes back with the reviewer objection', async () => {
+  clearPlan('r3')
+  const llm = async () => reviewReply({
+    completeness: 40,
+    objections: [{ where: 'Steps', problem: 'no step migrates the existing file', suggestion: 'add a migration step', severity: 'blocker' }],
+    revise: 'Add a migration step before the filter is added.',
+  })
+  const result = await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r3', llm))
+  assert.equal(result.success, false)
+  assert.match(result.error || '', /quality threshold/)
+  assert.match(result.error || '', /no step migrates the existing file/)
+  assert.match(result.error || '', /Add a migration step/)
+  // The rejected plan must not be published for a Build the user would regret.
+  assert.equal(planFor('r3'), undefined)
+})
+
+test('a blocker alone sends the plan back even when it scored well', async () => {
+  clearPlan('r4')
+  const llm = async () => reviewReply({
+    objections: [{ where: 'Step 2', problem: 'deletes the table before reading it', severity: 'blocker' }],
+  })
+  const result = await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r4', llm))
+  assert.equal(result.success, false)
+  assert.match(result.error || '', /deletes the table/)
+})
+
+test('a reviewer that cannot be reached does not block the build', async () => {
+  clearPlan('r5')
+  const llm = async () => { throw new Error('reviewer offline') }
+  const result = await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r5', llm))
+  assert.equal(result.success, true, result.error)
+  assert.ok(planFor('r5'))
+})
+
+test('the user intent is what the plan is judged against', async () => {
+  clearPlan('r6')
+  let seen = ''
+  const llm = async (request: any) => { seen = String(request.messages[0].content); return reviewReply() }
+  await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r6', llm, 70, 'turn the modal into a page'))
+  assert.match(seen, /turn the modal into a page/)
+  assert.match(seen, /Add provider kinds/)
+})
