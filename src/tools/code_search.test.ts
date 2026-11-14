@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { CodeSearchTool, buildIndex, vocabularyFromIndex } from './code_search.js';
+import { createServer } from 'node:http';
+import { CodeSearchTool, buildLexicalIndex, vocabularyFromIndex } from './code_search.js';
+import { chunkText } from '../analysis/codeindex/vectors.js';
 import { isTestPath, pathWeight } from '../analysis/codeindex/lexical.js';
 import type { ToolContext } from './types.js';
 
@@ -187,19 +189,167 @@ test('node_modules and build output are never indexed', async () => {
   assert.equal(indexed.data.files, 1);
 });
 
-test('buildIndex and the store agree on what a chunk is', async () => {
-  // The tool builds vectors against a vocabulary; the store attributes them to
-  // lines by re-chunking. If the two disagree, a hit lands on the wrong line.
+test('the lexical builder and the store agree on what a chunk is', async () => {
+  // The builder writes a vector per chunk; the search path re-chunks to lay the
+  // sparse weights out against a vocabulary. If the two disagree, a hit lands on
+  // the wrong line.
   const text = Array.from({ length: 200 }, (_, i) => `export const value${i} = ${i}`).join('\n');
   const root = await repo({ 'src/big.ts': text });
   const files = [{ file: 'src/big.ts', text }];
-  const built = buildIndex(root, files);
-  const storedChunks = built.index.files['src/big.ts'].chunks.length;
-  const { vocabulary } = vocabularyFromIndex(built.index);
-  assert.equal(storedChunks, built.vocabulary.size > 0 ? storedChunks : -1);
-  assert.equal(built.index.files['src/big.ts'].chunks.length, built.index.files['src/big.ts'].chunks.length);
-  // Every stored chunk carries a vector of the vocabulary's width.
-  for (const chunk of built.index.files['src/big.ts'].chunks) {
+  const stored = buildLexicalIndex(root, files);
+  const chunks = stored.files['src/big.ts'].chunks;
+  assert.ok(chunks.length > 1, 'a 200-line file should span several chunks');
+
+  const { vocabulary } = vocabularyFromIndex(stored);
+  // Every stored chunk carries a vector of the vocabulary's width, or the search
+  // path cannot lay it out.
+  for (const chunk of chunks) {
     assert.equal(chunk.vector.length, vocabulary.size);
+  }
+  // The chunk lines are the ones the splitter produces, not a re-derivation.
+  assert.deepEqual(chunks.map((chunk) => chunk.line), chunkText(text, {}).map((chunk) => chunk.line));
+});
+
+// --- the two backends -------------------------------------------------------
+
+test('with no embeddings provider the index is lexical and says so', async () => {
+  // No embeddings model is a normal state, and the reply has to make it obvious
+  // which vectors answered — otherwise a user who configured a model and got
+  // lexical results cannot tell whether the fallback fired.
+  const root = await repo(PROJECT);
+  // No Core running, so provider discovery finds nothing.
+  const saved = process.env.CORE_HTTP_ADDR;
+  process.env.CORE_HTTP_ADDR = 'http://127.0.0.1:1';
+  try {
+    const tool = new CodeSearchTool();
+    const indexed = await tool.execute({ action: 'index' }, ctx(root));
+    assert.equal(indexed.success, true, indexed.error);
+    assert.equal(indexed.data.backend, 'lexical');
+    assert.match(String(indexed.data.backendReason), /no embeddings provider/);
+
+    const found = await tool.execute({ action: 'search', query: 'palette blue' }, ctx(root));
+    assert.equal(found.data.backend, 'lexical');
+    assert.equal(found.data.hits[0].file, 'src/colours.ts');
+  } finally {
+    if (saved === undefined) delete process.env.CORE_HTTP_ADDR;
+    else process.env.CORE_HTTP_ADDR = saved;
+  }
+});
+
+test('with an embeddings provider configured, search uses it', async () => {
+  // The whole point of the second backend: a query that shares no words with the
+  // target still finds it, because the model supplies the synonymy.
+  const root = await repo({
+    'src/extract.ts': 'export function readable(body, kind) { return body }\n',
+  });
+
+  // A stand-in Core that advertises an embeddings provider, and a stand-in
+  // embeddings endpoint that maps its inputs onto a tiny fixed space: "readable"
+  // and "extract text" land on the same direction, which is what a real model
+  // would do and what lexical search cannot.
+  const embeddingServer = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+    const inputs: string[] = Array.isArray(body.input) ? body.input : [body.input];
+    const data = inputs.map((text: string, index: number) => {
+      const lower = String(text).toLowerCase();
+      const semantic = lower.includes('extract text') || lower.includes('readable');
+      return { embedding: semantic ? [1, 0] : [0, 1], index };
+    });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data }));
+  });
+  await new Promise<void>((resolve) => embeddingServer.listen(0, '127.0.0.1', () => resolve()));
+  const embedPort = (embeddingServer.address() as { port: number }).port;
+
+  const coreServer = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({
+      providers: [{
+        id: 'p-embed', provider: 'test', kind: 'embedding',
+        base_url: `http://127.0.0.1:${embedPort}`, api_key: '',
+        models: ['tiny'], default_model: 'tiny', enabled: true,
+      }],
+      default_provider_id: 'p-embed',
+    }));
+    void req;
+  });
+  await new Promise<void>((resolve) => coreServer.listen(0, '127.0.0.1', () => resolve()));
+  const corePort = (coreServer.address() as { port: number }).port;
+
+  const saved = process.env.CORE_HTTP_ADDR;
+  process.env.CORE_HTTP_ADDR = `http://127.0.0.1:${corePort}`;
+  try {
+    const tool = new CodeSearchTool();
+    const indexed = await tool.execute({ action: 'index' }, ctx(root));
+    assert.equal(indexed.success, true, indexed.error);
+    assert.equal(indexed.data.backend, 'embedding');
+    assert.equal(indexed.data.model, 'tiny');
+
+    // "extract text" shares no word with the file; only the vectors connect them.
+    const found = await tool.execute({ action: 'search', query: 'extract text' }, ctx(root));
+    assert.equal(found.data.backend, 'embedding');
+    assert.equal(found.data.hits[0]?.file, 'src/extract.ts', `got ${JSON.stringify(found.data.hits)}`);
+  } finally {
+    if (saved === undefined) delete process.env.CORE_HTTP_ADDR;
+    else process.env.CORE_HTTP_ADDR = saved;
+    embeddingServer.close();
+    coreServer.close();
+  }
+});
+
+test('an embeddings endpoint that fails falls back to lexical rather than failing', async () => {
+  // An endpoint being down must not take code search down with it.
+  const root = await repo(PROJECT);
+  const coreServer = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({
+      providers: [{ id: 'p', kind: 'embedding', base_url: 'http://127.0.0.1:1', models: ['m'], default_model: 'm', enabled: true }],
+      default_provider_id: 'p',
+    }));
+    void req;
+  });
+  await new Promise<void>((resolve) => coreServer.listen(0, '127.0.0.1', () => resolve()));
+  const corePort = (coreServer.address() as { port: number }).port;
+
+  const saved = process.env.CORE_HTTP_ADDR;
+  process.env.CORE_HTTP_ADDR = `http://127.0.0.1:${corePort}`;
+  try {
+    const tool = new CodeSearchTool();
+    const indexed = await tool.execute({ action: 'index' }, ctx(root));
+    assert.equal(indexed.success, true, indexed.error);
+    // The build fell back, and it says so instead of pretending.
+    assert.equal(indexed.data.backend, 'lexical');
+    assert.match(String(indexed.data.warning), /embeddings failed/);
+
+    const found = await tool.execute({ action: 'search', query: 'palette blue' }, ctx(root));
+    assert.equal(found.success, true, found.error);
+    assert.equal(found.data.hits[0].file, 'src/colours.ts');
+  } finally {
+    if (saved === undefined) delete process.env.CORE_HTTP_ADDR;
+    else process.env.CORE_HTTP_ADDR = saved;
+    coreServer.close();
+  }
+});
+
+test('switching backend invalidates the cache rather than mixing vector spaces', async () => {
+  // A lexical index and an embedding index cannot be compared, so reusing one
+  // for the other would rank a query against incompatible vectors.
+  const root = await repo(PROJECT);
+  const saved = process.env.CORE_HTTP_ADDR;
+  process.env.CORE_HTTP_ADDR = 'http://127.0.0.1:1';
+  try {
+    const tool = new CodeSearchTool();
+    await tool.execute({ action: 'index' }, ctx(root));
+    const lexical = await tool.execute({ action: 'status' }, ctx(root));
+    assert.equal(lexical.data.backend, 'lexical');
+    // The indexer name is part of the stored record, so a different backend reads
+    // as "nothing stored" and rebuilds.
+    const stored = JSON.parse(await fs.readFile(path.join(root, '.0kay-agent', 'code-index.json'), 'utf8'));
+    assert.equal(stored.model, 'lexical-tfidf-1');
+  } finally {
+    if (saved === undefined) delete process.env.CORE_HTTP_ADDR;
+    else process.env.CORE_HTTP_ADDR = saved;
   }
 });
