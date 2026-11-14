@@ -42,3 +42,7 @@ github_check.py
 
 # Self-iteration worktrees (evolve_begin creates one per iteration).
 /.evolve/
+
+# Local scratch files that must never be committed.
+make_excel.py
+nul
