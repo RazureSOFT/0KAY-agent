@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url'
 import { Agent, DEFAULT_AUTO_APPROVE_TOOLS } from './agent/agent.js'
 import { TaskManager } from './task/task.js'
 import { startWorkspaceRootsSync } from './workspace/paths.js'
+import { configureIdleEvolve, touchAgentActivity } from './evolve_idle_runtime.js'
 
 const __filename = fileURLToPath(import.meta.url)
 async function manifestVersion(): Promise<string> {
@@ -431,6 +432,21 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '留空 = agent 自己的仓库；填绝对路径可让它在别的仓库里迭代',
           },
           {
+            key: 'evolve_idle_trigger',
+            type: 'select',
+            label: '空闲时提议自我改进',
+            defaultValue: 'off',
+            options: ['off', 'notify', 'auto'],
+            help: 'off = 不触发；notify = 只写日志；auto = 建一个暂停的任务等你确认。任何模式都不会自动改工作区。',
+          },
+          {
+            key: 'evolve_idle_minutes',
+            type: 'number',
+            label: '空闲多少分钟后提议',
+            defaultValue: '30',
+            help: '最小 1。提议之间有 6 小时冷却，不会反复弹。',
+          },
+          {
             key: 'github_token',
             type: 'text',
             label: 'GitHub Token',
@@ -623,6 +639,10 @@ async function pollAgentSettings(): Promise<void> {
       guard_rules: typeof values.guard_rules === 'string' ? values.guard_rules : '',
       library_enabled: values.library_enabled !== false,
       agent_self_write: values.agent_self_write === true,
+    })
+    configureIdleEvolve({
+      action: values.evolve_idle_trigger === 'notify' || values.evolve_idle_trigger === 'auto' ? values.evolve_idle_trigger : 'off',
+      idleMinutes: Math.max(1, Number(values.evolve_idle_minutes || 30)),
     })
     taskManager.setMaxConcurrentTasks(Number(values.max_concurrent_tasks ?? 5))
   } catch {

@@ -21,6 +21,7 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 import { taskRecorder } from '../task/records.js';
+import { touchAgentActivity } from '../evolve_idle_runtime.js'
 import { coreFetch, coreHeaders, coreHttpBase, listPluginTools, executorIdentity } from '../connection.js';
 import { browserController } from '../tools/browser.js';
 import { WorkspaceRegistry, type Workspace } from '../workspace/registry.js';
@@ -823,6 +824,7 @@ export class Agent {
   }
 
   async executeTask(taskId: string, prompt: string, agentType?: string, metadata: Record<string, string> = {}): Promise<string> {
+    touchAgentActivity()
     return this.executeTaskInternal(taskId, prompt, agentType, 0, metadata.session_id || '', metadata);
   }
 
