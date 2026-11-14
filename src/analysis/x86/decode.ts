@@ -25,6 +25,12 @@ export interface Operand {
   /** For `rel`: the absolute target of the branch. */
   target?: number;
   size: number;
+  /** Structured address parts, so callers do not have to parse `mem`. */
+  base?: string;
+  index?: string;
+  scale?: number;
+  disp?: number;
+  rip?: boolean;
 }
 
 export type Flow = 'call' | 'jump' | 'condition' | 'ret' | 'int' | 'syscall' | 'nop' | 'stop';
@@ -183,47 +189,63 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
 
     let text = '';
     let hasBase = false;
+    let base: string | undefined;
+    let indexReg: string | undefined;
+    let scale: number | undefined;
+    let disp = 0;
 
     if (lowBits === 4) {
       const sib = read();
-      const scale = 1 << (sib >> 6);
+      scale = 1 << (sib >> 6);
       const indexField = (sib >> 3) & 7;
       const baseField = sib & 7;
       const hasIndex = indexField !== 4;
       if (baseField === 5 && mod === 0) {
         // No base register: the displacement is the whole address.
-        const disp = read32(bytes, index);
+        disp = read32(bytes, index);
         index += 4;
         text = `0x${disp.toString(16)}`;
       } else {
-        text = REG64[baseField + (rexB ? 8 : 0)];
+        base = REG64[baseField + (rexB ? 8 : 0)];
+        text = base;
         hasBase = true;
       }
       if (hasIndex) {
-        const indexReg = REG64[indexField + (rexX ? 8 : 0)];
+        indexReg = REG64[indexField + (rexX ? 8 : 0)];
         const term = scale === 1 ? indexReg : `${indexReg}*${scale}`;
         text = hasBase ? `${text}+${term}` : term;
       }
     } else if (lowBits === 5 && mod === 0) {
       // RIP-relative in 64-bit mode: the displacement is the whole operand.
-      const disp = readInt32(bytes, index);
+      const d = readInt32(bytes, index);
       const value = read32(bytes, index);
       index += 4;
-      return { kind: 'mem', mem: `rip${disp < 0 ? '-' : '+'}0x${value.toString(16)}`, size, value: disp };
+      return {
+        kind: 'mem', mem: `rip${d < 0 ? '-' : '+'}0x${value.toString(16)}`, size,
+        value: d, rip: true, disp: d,
+      };
     } else {
-      text = REG64[lowBits + (rexB ? 8 : 0)];
+      base = REG64[lowBits + (rexB ? 8 : 0)];
+      text = base;
       hasBase = true;
     }
 
     if (mod === 1) {
-      const disp = (bytes[index++] << 24) >> 24;
-      text += `${disp < 0 ? '-' : '+'}0x${Math.abs(disp).toString(16)}`;
+      const d = (bytes[index++] << 24) >> 24;
+      disp += d;
+      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
     } else if (mod === 2) {
-      const disp = readInt32(bytes, index);
+      const d = readInt32(bytes, index);
       index += 4;
-      text += `${disp < 0 ? '-' : '+'}0x${Math.abs(disp).toString(16)}`;
+      disp += d;
+      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
     }
-    return { kind: 'mem', mem: text.startsWith('+') ? text.slice(1) : text, size };
+    return {
+      kind: 'mem', mem: text.startsWith('+') ? text.slice(1) : text, size,
+      ...(base ? { base } : {}),
+      ...(indexReg ? { index: indexReg, scale } : {}),
+      ...(disp ? { disp } : {}),
+    };
   };
 
   const imm = (size: number): Operand => {
@@ -348,6 +370,14 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
       const { reg, operand } = modrm(operandSize);
       if (!operand) return rawByte(bytes, start, address, prefixText);
       return finish('lea', [register(reg, operandSize), operand]);
+    }
+    // Segment-register moves. The segment name is not worth modelling, but the
+    // length is: without this the ModRM byte is decoded as an instruction.
+    case 0x8c: case 0x8e: {
+      const { operand } = modrm(operandSize);
+      if (!operand) return rawByte(bytes, start, address, prefixText);
+      const segment: Operand = { kind: 'reg', reg: 'seg', size: 16 };
+      return finish('mov', opcode === 0x8c ? [operand, segment] : [segment, operand]);
     }
     case 0x8f: {
       const { operand } = modrm(64);
@@ -535,6 +565,12 @@ function decodeTwoByte(
     return finish('nop', [], 'nop');
   }
 
+  // BSWAP has no ModRM: the low three bits of the opcode name the register.
+  if (second >= 0xc8 && second <= 0xcf) {
+    const reg = regName((second - 0xc8) + (state.rexB ? 8 : 0), state.operandSize, state.hasRex);
+    return finish('bswap', [{ kind: 'reg', reg, size: state.operandSize }]);
+  }
+
   const modrmByte = bytes[index] ?? 0;
   const mod = modrmByte >> 6;
   const regField = ((modrmByte >> 3) & 7) + (state.rexR ? 8 : 0);
@@ -542,8 +578,16 @@ function decodeTwoByte(
   index++;
 
   let operand: Operand | null = null;
+  // Only the SSE block uses XMM registers. `0f ba` (bt) and `0f 40-4f` (cmov)
+  // sit in the same numeric range and would otherwise get a vector operand.
+  const generalPurpose = (second >= 0x40 && second <= 0x4f)
+    || second === 0xaf || second === 0xb6 || second === 0xb7 || second === 0xbe || second === 0xbf
+    || (second >= 0x90 && second <= 0x9f)
+    || (second >= 0xa3 && second <= 0xbb)
+    || second === 0xbc || second === 0xbd;
+  const isSse = !generalPurpose && ((second >= 0x10 && second <= 0x2f) || (second >= 0x50 && second <= 0x7f));
   if (mod === 3) {
-    operand = second >= 0x6f
+    operand = isSse
       ? { kind: 'reg', reg: XMM[rmField], size: 128 }
       : { kind: 'reg', reg: regName(rmField, second === 0xb6 || second === 0xb7 || second === 0xbe || second === 0xbf ? 8 : state.operandSize, state.hasRex), size: state.operandSize };
   } else {
@@ -551,6 +595,35 @@ function decodeTwoByte(
     const dispBytes = mod === 1 ? 1 : mod === 2 ? 4 : ((modrmByte & 7) === 5 ? 4 : 0);
     index += dispBytes;
     operand = { kind: 'mem', mem: '[mem]', size: state.operandSize };
+  }
+
+  if (second >= 0x90 && second <= 0x9f && operand) {
+    const rm8: Operand = mod === 3
+      ? { kind: 'reg', reg: regName(rmField, 8, state.hasRex), size: 8 }
+      : { ...operand, size: 8 };
+    return finish(`set${COND[second - 0x90]}`, [rm8]);
+  }
+  if (second >= 0x40 && second <= 0x4f && operand) {
+    return finish(`cmov${COND[second - 0x40]}`, [
+      { kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize }, operand,
+    ]);
+  }
+  if (second === 0xba && operand) {
+    const verb = ['bt', 'bts', 'btr', 'btc'][regField & 3];
+    const immByte = bytes[index] ?? 0;
+    index += 1;
+    return finish(verb, [operand, { kind: 'imm', value: immByte, size: 8 }]);
+  }
+  if ((second === 0xa3 || second === 0xab || second === 0xb3 || second === 0xbb) && operand) {
+    const verb = second === 0xa3 ? 'bt' : second === 0xab ? 'bts' : second === 0xb3 ? 'btr' : 'btc';
+    return finish(verb, [
+      { kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize }, operand,
+    ]);
+  }
+  if ((second === 0xbc || second === 0xbd) && operand) {
+    return finish(second === 0xbc ? 'bsf' : 'bsr', [
+      { kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize }, operand,
+    ]);
   }
 
   if (known && operand) {

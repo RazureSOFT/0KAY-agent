@@ -55,7 +55,10 @@ export function disassembleFunction(
   let unknown = 0;
   let truncated = false;
 
-  const inRange = (address: number) => address >= baseVaddr && address < hardEnd && address - baseVaddr < code.length;
+  // Lower bound is the function entry, not the section: a jump to an address
+  // before the entry is a tail call or an exception edge, and following it
+  // would splice the previous function's code into this one.
+  const inRange = (address: number) => address >= entry && address < hardEnd && address - baseVaddr < code.length;
   const accept = (address: number | null) => {
     if (address == null) return;
     if (inRange(address)) worklist.push(address);

@@ -79,11 +79,32 @@ friendly name.
 | `function.ts` | Recursive traversal from an entry: conditional branches fork, calls fall through, undecodable bytes stop that path. |
 | `cfg.ts` | Basic blocks and edges. |
 | `pseudoc.ts` | A reading aid in C-like syntax; untranslatable instructions remain as comments. |
+| `frame.ts` | Calling convention, stack slots, saved argument registers. |
+| `ir.ts` | Lifted IR: assignments, loads, conditions folded from flags, call arguments. |
+| `structure.ts` | Post-dominator driven recovery of `if` / `while` / `do`; irreducible flow keeps a label and a `goto`. |
+| `types.ts` | Small type lattice; ambiguity widens rather than truncates. |
+| `decompile.ts` | The pipeline and the C printer. |
+| `xref.ts` | Callers, callees and data references. |
 
-`src/tools/binary_analysis.ts` exposes `summary`, `functions`, `disasm`, `cfg`
-and `pseudoc`. Every response names the entry-point source it used; when no
-function table or symbol table is available, only the image entry is walked and
-the response says so.
+`src/tools/binary_analysis.ts` exposes `summary`, `functions`, `disasm`, `cfg`,
+`pseudoc`, `decompile` and `xref`. Every response names the entry-point source
+it used; when no function table or symbol table is available, only the image
+entry is walked and the response says so.
+
+### What the decompiler does and does not do
+
+It prints what the instructions do: named stack slots and saved arguments,
+conditions folded from `cmp`/`test`/`bt`, `if`/`else`, `while`/`do`, call
+arguments from the argument registers, and a C type per value. Go's stack-growth
+prologue (a branch to a `morestack` thunk that jumps back to the entry) is folded
+so it does not turn every function into `while (1)`.
+
+It is not a source-level reconstruction. Registers stay registers (there is no
+SSA renaming), the type lattice only distinguishes widths and pointers, and
+anything undecodable stays as an `unknown` comment. Go's register ABI does not
+save arguments to the stack, so a Go function often decompiles with no named
+parameters — the body still reads the argument registers directly, and the
+output says so instead of inventing a signature.
 
 ## Tests
 

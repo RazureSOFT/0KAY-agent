@@ -19,6 +19,8 @@ import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
 import { buildCfg, cfgSummary } from '../analysis/x86/cfg.js';
 import { toPseudoC } from '../analysis/x86/pseudoc.js';
+import { decompileFunction } from '../analysis/x86/decompile.js';
+import { scanCallGraph, callersOf, calleesOf } from '../analysis/x86/xref.js';
 
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 
@@ -124,16 +126,18 @@ export class BinaryAnalysisTool extends Tool {
       'Analyze an executable with the built-in disassembler. Read-only: the target is never executed.',
       'action=summary reports the container, executable sections and how function entry points were found.',
       'action=functions lists real function entries from the Go function table or the linker symbol table; action=disasm disassembles one function by following control flow from its entry; action=cfg returns basic blocks and edges; action=pseudoc renders a reading aid.',
+      'action=decompile prints the function as C: named stack slots and arguments, folded conditions, structured if/while/do, and an unknown comment for anything it cannot express. action=xref reports callers, callees and data references.',
       'Select a function with functionName or address (decimal or 0x hex). Every result states which entry-point source was used; without one only the image entry is walked.',
     ].join(' ');
   }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action', 'path'], properties: {
-      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc'] },
+      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc', 'decompile', 'xref'] },
       path: { type: 'string', description: 'Binary to inspect, absolute or workspace-relative.' },
       functionName: { type: 'string', description: 'Substring of a function name.' },
       address: { type: 'string', description: 'Hex (0x...) or decimal virtual address.' },
       limit: { type: 'integer', minimum: 1, maximum: 20000, description: 'Maximum instructions / functions to return.' },
+      scanLimit: { type: 'integer', minimum: 1, maximum: 20000, description: 'xref: how many functions to scan for callers (default 500).' },
       out: { type: 'string', description: 'Optional workspace path to write the listing or pseudo-C.' },
     }};
   }
@@ -212,6 +216,55 @@ export class BinaryAnalysisTool extends Tool {
           const rendered = toPseudoC(result, buildCfg(result.instructions));
           payload = { ...base, function: fn.name, ...coverageOf(result), pseudoc: rendered };
           text = rendered;
+          break;
+        }
+        case 'decompile': {
+          const fn = pickFunction(loaded, args);
+          const section = codeSection(loaded.image, fn.entry || loaded.textStart);
+          if (!section) return failure('no executable section was found in this image');
+          const imageBase = section.vaddr - section.offset;
+          const end = fn.end > fn.entry
+            ? Math.min(fn.end, section.vaddr + section.size)
+            : section.vaddr + section.size;
+          const decompiled = decompileFunction(loaded.bytes, imageBase, fn.entry || section.vaddr, {
+            name: fn.name,
+            end,
+            imageFormat: loaded.image.format,
+            maxInstructions: limit,
+          });
+          payload = { ...base, ...decompiled };
+          text = decompiled.c;
+          break;
+        }
+        case 'xref': {
+          const fn = pickFunction(loaded, args);
+          const section = codeSection(loaded.image, fn.entry || loaded.textStart);
+          if (!section) return failure('no executable section was found in this image');
+          const imageBase = section.vaddr - section.offset;
+          const graph = scanCallGraph(loaded.bytes, imageBase, loaded.functions, {
+            limit: Math.max(1, Math.min(Number(args.scanLimit) || 500, 20000)),
+            isMapped: (address) => loaded.image.sections.some((s) => address >= s.vaddr && address < s.vaddr + s.size),
+          });
+          const names = new Map(loaded.functions.map((entry) => [entry.entry, entry.name]));
+          const label = (address: number) => ({ address: `0x${address.toString(16)}`, name: names.get(address) || null });
+          const fnEnd = fn.end > fn.entry ? fn.end : Number.POSITIVE_INFINITY;
+          const dataRefs = [...graph.dataRefs.entries()]
+            .filter(([, instructions]) => instructions.some((address) => address >= fn.entry && address < fnEnd))
+            .slice(0, 200)
+            .map(([address, instructions]) => ({
+              address: `0x${address.toString(16)}`,
+              from: instructions.filter((a) => a >= fn.entry && a < fnEnd).map((a) => `0x${a.toString(16)}`),
+            }));
+          payload = {
+            ...base,
+            function: fn.name,
+            callers: callersOf(graph, fn.entry).map(label),
+            callees: calleesOf(graph, fn.entry).map(label),
+            dataRefs,
+            scanned: graph.scanned,
+            total: graph.total,
+            truncated: graph.truncated,
+          };
           break;
         }
         default:
