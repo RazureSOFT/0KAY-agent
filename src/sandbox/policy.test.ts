@@ -97,3 +97,72 @@ test('a read of an absolute path is not treated as a write', () => {
   const outside = process.platform === 'win32' ? 'C:\\Windows\\win.ini' : '/etc/hosts'
   assert.equal(policy.checkShell(`cat ${outside}`).allowed, true)
 })
+
+// -- plan mode -------------------------------------------------------------
+//
+// A planning run reads the project to write a plan about it. The mode exists
+// so "the plan is the only artefact" is enforced by the sandbox rather than
+// asked of the model politely.
+
+test('plan mode writes the plan and nothing else', () => {
+  const policy = new SandboxPolicy('plan', [root])
+  assert.equal(policy.checkWrite(path.join(root, '.0kay', 'plans', 'auth.plan.md')).allowed, true)
+  const source = policy.checkWrite(path.join(root, 'src', 'app.ts'))
+  assert.equal(source.allowed, false)
+  assert.match(source.reason || '', /plan/)
+})
+
+test('plan mode still refuses to write outside the workspace', () => {
+  const policy = new SandboxPolicy('plan', [root])
+  const outside = path.resolve(root, '..', 'elsewhere.plan.md')
+  assert.equal(policy.checkWrite(outside).allowed, false)
+})
+
+test('plan mode reads the project', () => {
+  const policy = new SandboxPolicy('plan', [root])
+  assert.equal(policy.checkRead(path.join(root, 'src', 'app.ts')).allowed, true)
+})
+
+test('plan mode runs read-only commands and refuses the rest', () => {
+  const policy = new SandboxPolicy('plan', [root])
+  assert.equal(policy.checkShell('git log --oneline -5').allowed, true)
+  assert.equal(policy.checkShell('rg -n TODO src').allowed, true)
+  for (const command of ['npm install', 'git commit -m x', 'rm -rf src', 'echo x > file.txt']) {
+    const verdict = policy.checkShell(command)
+    assert.equal(verdict.allowed, false, `${command} must be refused while planning`)
+  }
+})
+
+test('plan is a recognised sandbox mode', () => {
+  assert.ok(SANDBOX_MODES.includes('plan'))
+  assert.equal(parseSandboxMode('plan'), 'plan')
+})
+
+test('the WriteTool refuses a source file while planning', async () => {
+  const fs = await import('node:fs/promises')
+  const plansDir = path.join(root, '.0kay', 'plans')
+  await fs.mkdir(plansDir, { recursive: true })
+  const tool = new WriteTool()
+  const context: ToolContext = {
+    cwd: root,
+    taskId: 't-plan',
+    agentType: 'general',
+    sandbox: new SandboxPolicy('plan', [root]),
+  }
+  const plan = await tool.execute({ filePath: path.join(plansDir, 'x.plan.md'), content: '# Plan\n\nDo the thing.' }, context)
+  assert.equal(plan.success, true, `the plan itself is writable: ${plan.error || ''}`)
+  const source = await tool.execute({ filePath: path.join(root, 'src', 'nope.ts'), content: 'export {}' }, context)
+  assert.equal(source.success, false, 'source is not writable while planning')
+  await fs.rm(path.join(plansDir, 'x.plan.md'), { force: true })
+})
+
+test('a package manager may only read, in every restricted mode', () => {
+  for (const mode of ['plan', 'read-only'] as const) {
+    const policy = new SandboxPolicy(mode, [root])
+    assert.equal(policy.checkShell('npm ls').allowed, true, `${mode}: npm ls reads`)
+    assert.equal(policy.checkShell('go list ./...').allowed, true, `${mode}: go list reads`)
+    for (const command of ['npm install', 'npm ci', 'go build ./...', 'pnpm add left-pad', 'npx some-package']) {
+      assert.equal(policy.checkShell(command).allowed, false, `${mode}: ${command} must be refused`)
+    }
+  }
+})

@@ -986,6 +986,11 @@ export class Agent {
     // Not awaited: refreshing must never delay the task reaching RUNNING. The
     // tool list this task sees is the one from the previous refresh.
     void this.maybeRefreshPluginTools();
+    // Only a task the user started takes a concurrency slot. A subtask is
+    // spawned by a parent that is already holding one and cannot return until
+    // its children finish, so waiting for a slot would deadlock as soon as the
+    // limit is reached (and a parallel explore fan-out would serialise itself
+    // to nothing). Children share their parent's slot instead.
     return this.taskManager.executeTask(taskId, async () => {
       let workdir = options.workdir;
       const workspaceSelector = options.workspace || options.project;

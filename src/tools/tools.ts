@@ -20,6 +20,8 @@ export { CompressContextTool, DecompressContextTool, SearchContextTool, AcpStatu
 import { withWindowsShellHint } from './shell_hint.js';
 import { shellChoice } from './shell_choice.js';
 import { compactOutput, compactionNote } from './compact.js';
+import { readable } from './readable.js';
+import { DEFAULT_USER_AGENT } from './web_util.js';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -482,11 +484,12 @@ export class ShellTool extends Tool {
 
 export class WebFetchTool extends Tool {
   get name(): string { return 'webfetch'; }
-  get description(): string { return 'Fetch a URL and return text, markdown-like HTML stripping, or raw HTML. You may set the User-Agent when a site serves different content to different clients (mobile layout, bot wall, API-only).'; }
+  get description(): string { return 'Fetch a URL and return its readable content as markdown. Scripts, styles, navigation and footers are dropped, so what comes back is prose, headings, lists, code and tables -- not markup. Set raw=true only when the task is about the markup itself (scraping a selector, inspecting metadata). You may set the User-Agent when a site serves different content to different clients.'; }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['url'], properties: {
       url: { type: 'string', format: 'uri' },
-      format: { type: 'string', enum: ['text', 'markdown', 'html'] },
+      raw: { type: 'boolean', description: 'Return the page verbatim instead of extracting its content. Only for markup-level work.' },
+      format: { type: 'string', enum: ['markdown', 'text'], description: 'markdown keeps headings, lists, links and code fences; text is plain prose. Default markdown.' },
       timeout: { type: 'integer', minimum: 1, maximum: 120 },
       user_agent: { type: 'string', description: 'Override the User-Agent. Useful when a site returns a login wall or a degraded page to the default browser UA, or when the mobile page is the readable one.' },
       accept_language: { type: 'string', description: 'Override Accept-Language, e.g. "en-US,en;q=0.9".' },
@@ -495,13 +498,14 @@ export class WebFetchTool extends Tool {
   async execute(args: Record<string, any>, context?: ToolContext): Promise<ToolResult> {
     try {
       if (typeof args.url !== 'string' || !/^https?:\/\//i.test(args.url)) throw new Error('url must be an http(s) URL');
-      const timeout = AbortSignal.timeout(clamp(args.timeout, 30, 1, 120) * 1000);
+      const timeoutSeconds = clamp(args.timeout, 30, 1, 120);
+      const timeout = AbortSignal.timeout(timeoutSeconds * 1000);
       const signal = context?.signal ? AbortSignal.any([timeout, context.signal]) : timeout;
       // The model chooses the client identity; the default is a plain desktop
       // browser because most sites are happier with that than with a bot string.
       const userAgent = typeof args.user_agent === 'string' && args.user_agent.trim()
         ? args.user_agent.trim().slice(0, 400)
-        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+        : DEFAULT_USER_AGENT;
       const acceptLanguage = typeof args.accept_language === 'string' && args.accept_language.trim()
         ? args.accept_language.trim().slice(0, 120)
         : 'zh-CN,zh;q=0.9,en;q=0.8';
@@ -509,22 +513,20 @@ export class WebFetchTool extends Tool {
         'User-Agent': userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': acceptLanguage,
-      } }, clamp(args.timeout, 30, 1, 120) * 1000);
+      } }, timeoutSeconds * 1000);
       const html = await response.text();
-      const format = args.format || 'markdown';
-      const content = format === 'html' ? html : html
-        .replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<\/(p|div|h[1-6]|li|br|tr)>/gi, '\n')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/&amp;/gi, '&')
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/[ \t]+\n/g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-      const limited = limitOutput(content);
-      return success({ url: response.url, status: response.status, contentType: response.headers.get('content-type') || '', content: limited.text, truncated: limited.truncated });
+      const contentType = response.headers.get('content-type') || '';
+      const page = readable(html, contentType, {
+        raw: args.raw === true,
+        plain: args.format === 'text',
+        base: response.url || args.url,
+      });
+      const limited = limitOutput(page.content);
+      return success({
+        url: response.url, status: response.status, contentType,
+        title: page.title, content: limited.text, truncated: limited.truncated,
+        ...(page.kind === 'binary' ? { note: 'the body is not text; content is a description of it' } : {}),
+      });
     } catch (error) { return failure(error); }
   }
 }

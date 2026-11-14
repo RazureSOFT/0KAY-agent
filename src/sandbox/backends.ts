@@ -57,6 +57,10 @@ function onPath(binary: string): boolean {
 export function buildLaunch(input: LaunchInput): LaunchSpec {
   const available = input.available || onPath
   const unrestricted = input.mode === 'danger-full-access'
+  // `plan` counts as writable here on purpose: the OS sandbox binds whole
+  // directories and cannot express "only files named *.plan.md", so the
+  // suffix rule lives in SandboxPolicy.checkWrite. What this layer must not
+  // do is make the workspace read-only and leave the plan nowhere to land.
   const writable = input.mode !== 'read-only'
   const network = input.network === true
 

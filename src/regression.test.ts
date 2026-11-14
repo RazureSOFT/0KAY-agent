@@ -9,6 +9,7 @@ import { ShellTool, ComputerUseTool, BrowserTool, DocumentTool, SlidesTool, Rese
 import { posixInput } from './tools/posix_native.js';
 import { buildDocx, buildPptx } from './tools/office.js';
 import * as fs from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ApprovalManager } from './task/approvals.js';
@@ -19,6 +20,20 @@ import { ContextLedger } from './context/ledger.js';
 import { authorized, setPluginIdentity } from './connection.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+// `permission_mode:'full_access'` is only a request; the operator's saved
+// setting has to agree before the agent stops asking (Agent.fullAccessGranted).
+// Tests that dispatch a tool outside DEFAULT_AUTO_APPROVE_TOOLS must grant that
+// blanket too, or they block on an approval prompt nobody can answer — for the
+// full ten-minute timeout, which is why the suite used to look like it hung.
+//
+// The setting is written directly rather than through applySettings(): that
+// call ends in applyToolToggles(), which replaces the whole tool registry and
+// would throw away a test's `(agent as any).tools.call` mock.
+const fullAccess = (agent: Agent) => {
+  (agent as any).settings.always_allow_tools = '*';
+  return { permission_mode: 'full_access' };
+};
 
 test('inbound authentication rejects missing credentials and accepts issued identity only', () => {
   const keys = ['CORE_PAIR_TOKEN', 'CORE_API_TOKEN', 'AGENT_GRPC_TOKEN'];
@@ -163,7 +178,7 @@ test('a synchronous subtask shares the parent slot without deadlocking at limit 
       yield { done: true, toolCalls: [{ id: 'child', name: 'task', arguments: JSON.stringify({ prompt: 'child' }) }] };
     } else yield { chunk: 'completed', done: true };
   }};
-  assert.equal(await agent.executeTask('parent', 'parent',undefined,{permission_mode:'full_access'}), 'completed');
+  assert.equal(await agent.executeTask('parent', 'parent',undefined,fullAccess(agent)), 'completed');
   assert.equal(agent.getTaskManager().getAllTasks().length, 2);
   assert.ok(agent.getTaskManager().getAllTasks().every(task => task.state === 'DONE'));
 });
@@ -183,7 +198,7 @@ test('execution continues beyond the old iteration setting', async () => {
     if (request.toolChoice === 'none' || iterations++>=12) yield {chunk:'completed',done:true};
     else yield { done: true, toolCalls: [{ id: `c${iterations}`, name: 'missing', arguments: '{}' }] };
   }};
-  assert.equal(await agent.executeTask('budget', 'test',undefined,{permission_mode:'full_access'}),'completed');
+  assert.equal(await agent.executeTask('budget', 'test',undefined,fullAccess(agent)),'completed');
   assert.ok(iterations>10);
 });
 
@@ -345,7 +360,7 @@ test('subagent wrapper task_id equals children parent_id', async () => {
       }
     },
   };
-  await agent.executeTask('parent-task', 'parent prompt', undefined, { permission_mode: 'full_access', session_id: 's1' });
+  await agent.executeTask('parent-task', 'parent prompt', undefined, { ...fullAccess(agent), session_id: 's1' });
   assert.ok(wrapperTaskId.startsWith('parent-task:sub:'), wrapperTaskId);
   assert.equal(wrapperTaskId, childModelTaskId);
 });
@@ -403,7 +418,7 @@ test('thinking chunks are recorded on assistant history for the next turn', asyn
       }
     },
   };
-  await agent.executeTask('reason', 'go', undefined, { permission_mode: 'full_access', session_id: 's2' });
+  await agent.executeTask('reason', 'go', undefined, { ...fullAccess(agent), session_id: 's2' });
   const assistant = requests[1].messages.find((message: any) => message.role === 'assistant');
   assert.equal(assistant?.reasoningContent, 'chain of thought');
 });
@@ -438,7 +453,7 @@ test('multiple native tool calls in one turn run in parallel with ordered result
       }
     },
   };
-  assert.equal(await agent.executeTask('parallel', 'go', undefined, { permission_mode: 'full_access', session_id: 's3' }), 'completed');
+  assert.equal(await agent.executeTask('parallel', 'go', undefined, { ...fullAccess(agent), session_id: 's3' }), 'completed');
   assert.equal(maxActive, 2, 'tool calls should overlap');
   assert.deepEqual(order, ['alpha', 'beta']);
   const second = requests[1];
@@ -677,9 +692,28 @@ test('document and slides tools write files', async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-const RESEARCH_AVAILABLE = (() => { try { resolveResearchSrc(); return true; } catch { return false; } })();
+// resolveResearchSrc() only proves the package is on disk. The tool then runs it
+// with `python -m life.tools.research`, so the interpreter on PATH also has to
+// be able to import it — otherwise the test fails with a ModuleNotFoundError
+// about httpx rather than being skipped, which reads as a broken research tool
+// instead of a host that never had the life dependencies installed.
+const RESEARCH_SKIP: string | false = (() => {
+  let src: string;
+  try { src = resolveResearchSrc(); } catch {
+    return 'life.tools.research not found on this host (set LIFE_SRC)';
+  }
+  const python = process.env.RESEARCH_PYTHON || process.env.PYTHON || 'python';
+  try {
+    const probe = spawnSync(python, ['-c', 'import life.tools.research'], {
+      timeout: 20000,
+      windowsHide: true,
+      env: { ...process.env, PYTHONPATH: [src, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) },
+    });
+    return probe.status === 0 ? false : `"${python}" cannot import life.tools.research (its dependencies are not installed)`;
+  } catch { return `could not run "${python}" to probe life.tools.research`; }
+})();
 
-test('research tool generates a figure and a table', { skip: RESEARCH_AVAILABLE ? false : 'life.tools.research not found on this host (set LIFE_SRC)' }, async () => {
+test('research tool generates a figure and a table', { skip: RESEARCH_SKIP }, async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-research-'));
   const context: any = { cwd: dir, taskId: 't', agentType: 'general', todo: [] };
   const fig = await new ResearchTool().execute({ action: 'figure', kind: 'line', path: 'figs/curve.png', spec: { x: [0, 1, 2], series: { loss: [0.9, 0.5, 0.2] }, title: 'loss' } }, context);

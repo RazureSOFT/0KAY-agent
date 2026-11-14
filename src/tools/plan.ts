@@ -9,6 +9,7 @@
 import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { success, failure } from './helpers.js';
 import { taskRecorder } from '../task/records.js';
+import { PLAN_SUFFIX } from '../sandbox/policy.js';
 
 export interface PlanRecord {
   title: string;
@@ -90,6 +91,10 @@ export class PlanTool extends Tool {
       createdAt: Date.now(),
     };
     plans.set(context.taskId, record);
+    // The plan also lands on disk. A plan that exists only in memory is gone
+    // when the process is, and the file is what makes it reviewable later,
+    // diffable in git, and buildable from the file manager.
+    const saved = await savePlan(context.cwd, record);
 
     void taskRecorder
       .record({
@@ -109,7 +114,38 @@ export class PlanTool extends Tool {
       accepted: true,
       title: record.title,
       steps: record.steps,
+      ...(saved ? { file: saved } : {}),
       ...(missing.length ? { missing_sections: missing, note: 'the plan can still be built; add these sections if they change the approach' } : {}),
     });
+  }
+}
+
+/**
+ * Write the plan beside the project as `<slug>.plan.md`.
+ *
+ * `.plan.md` is the extension the whole system looks for: the file manager
+ * offers Build on these files, and a planning task's sandbox may write no
+ * other kind of file. The name comes from the title so a directory of plans
+ * reads like a list of what was decided.
+ */
+async function savePlan(cwd: string, record: PlanRecord): Promise<string> {
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const dir = path.join(cwd || process.cwd(), '.0kay', 'plans');
+    await fs.mkdir(dir, { recursive: true });
+    const slug = record.title
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 60) || 'plan';
+    const file = path.join(dir, `${slug}${PLAN_SUFFIX}`);
+    const header = `<!-- 0kay plan · ${new Date(record.createdAt).toISOString()} · ${record.steps} steps -->\n\n`;
+    await fs.writeFile(file, header + record.markdown + '\n', 'utf8');
+    return file;
+  } catch {
+    // A plan that could not be written is still a plan; the card and the
+    // build button work off the record, so this is not worth failing over.
+    return '';
   }
 }

@@ -15,9 +15,18 @@ import { buildLaunch, type LaunchSpec } from './backends.js'
 //   workspace-write      writes only inside the workspace roots (default)
 //   danger-full-access   no restriction, and the caller said so out loud
 
-export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export type SandboxMode = 'read-only' | 'plan' | 'workspace-write' | 'danger-full-access'
 
-export const SANDBOX_MODES: SandboxMode[] = ['read-only', 'workspace-write', 'danger-full-access']
+export const SANDBOX_MODES: SandboxMode[] = ['read-only', 'plan', 'workspace-write', 'danger-full-access']
+
+// A planning run reads the project and writes exactly one thing: the plan.
+// Keeping that as a sandbox mode rather than a convention means a planning
+// task cannot edit source even if the model decides it would be helpful.
+export const PLAN_SUFFIX = '.plan.md'
+
+export function isPlanPath(target: string): boolean {
+  return path.resolve(target).toLowerCase().endsWith(PLAN_SUFFIX)
+}
 
 export interface SandboxDecision {
   allowed: boolean
@@ -31,7 +40,7 @@ const ALLOWED: SandboxDecision = { allowed: true }
 const READ_ONLY_COMMANDS = new Set([
   'ls', 'dir', 'pwd', 'cd', 'cat', 'type', 'head', 'tail', 'less', 'more',
   'grep', 'rg', 'find', 'findstr', 'wc', 'sort', 'uniq', 'diff', 'file',
-  'git', 'node', 'python', 'python3', 'go', 'npm', 'npx', 'tsc', 'echo', 'which', 'where', 'env', 'printenv',
+  'git', 'node', 'python', 'python3', 'go', 'npm', 'pnpm', 'yarn', 'tsc', 'echo', 'which', 'where', 'env', 'printenv',
 ])
 
 // Read-only subcommands for the tools where the verb decides, not the binary.
@@ -39,6 +48,29 @@ const READ_ONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'remot
 const READ_ONLY_NPM = new Set(['ls', 'list', 'view', 'outdated', 'why'])
 const READ_ONLY_GO = new Set(['version', 'env', 'list', 'vet'])
 const READ_ONLY_NODE = new Set(['--version', '-v'])
+
+// Package managers write to node_modules or the module cache for nearly every
+// verb, so the ones that only read are listed rather than the ones that write:
+// a verb nobody thought of must not be allowed by default.
+const PACKAGE_MANAGERS: Record<string, Set<string>> = {
+  npm: READ_ONLY_NPM,
+  pnpm: READ_ONLY_NPM,
+  yarn: new Set(['list', 'info', 'why']),
+  go: READ_ONLY_GO,
+}
+
+/**
+ * Whether a package-manager invocation only reads.
+ *
+ * `npm install` was allowed by read-only mode because the binary was on the
+ * read-only list for the sake of `npm ls`. The verb is what decides, so it is
+ * checked here for both restricted modes.
+ */
+function packageManagerWrites(binary: string, sub: string): boolean {
+  const readOnly = PACKAGE_MANAGERS[binary]
+  if (!readOnly) return false
+  return !readOnly.has(sub)
+}
 
 // Shell syntax that writes regardless of the command name.
 const WRITE_OPERATORS = /(^|[^>])>{1,2}(?!&)|>>|\btee\b|\bdd\b|\bmv\b|\bcp\b|\brm\b|\bdel\b|\brmdir\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|\btruncate\b|\bsed\s+-i\b|\bgit\s+(commit|push|merge|reset|checkout|clean)\b/i
@@ -61,6 +93,21 @@ export class SandboxPolicy {
     if (this.isUnrestricted) return ALLOWED
     if (this.mode === 'read-only') {
       return { allowed: false, reason: 'sandbox is read-only: writes are disabled for this task' }
+    }
+    if (this.mode === 'plan') {
+      const resolved = path.resolve(target)
+      if (!isPlanPath(resolved)) {
+        return {
+          allowed: false,
+          reason: `sandbox is plan: this task may only write a ${PLAN_SUFFIX} file, not ${resolved}`,
+        }
+      }
+      const inside = this.roots.some((root) => resolved === root || resolved.startsWith(root + path.sep))
+      if (inside) return ALLOWED
+      return {
+        allowed: false,
+        reason: `sandbox is plan: ${resolved} is outside ${this.roots.join(', ')}`,
+      }
     }
     const resolved = path.resolve(target)
     const inside = this.roots.some((root) => resolved === root || resolved.startsWith(root + path.sep))
@@ -113,6 +160,31 @@ export class SandboxPolicy {
     if (!text) return { allowed: false, reason: 'empty command' }
     if (this.isUnrestricted) return ALLOWED
 
+    if (this.mode === 'plan') {
+      // Planning reads the project to write a plan about it. Anything that
+      // would change the project belongs to the build that comes after.
+      const writes = WRITE_OPERATORS.exec(text)
+      if (writes) {
+        return { allowed: false, reason: `sandbox is plan: "${writes[0].trim()}" changes the project; plans are built, not planned, with that` }
+      }
+      const [head, ...rest] = text.split(/\s+/)
+      const binary = path.basename(head).replace(/\.exe$/i, '').toLowerCase()
+      if (!READ_ONLY_COMMANDS.has(binary)) {
+        return { allowed: false, reason: `sandbox is plan: "${binary}" is not a read-only command` }
+      }
+      const sub = (rest[0] || '').toLowerCase()
+      if (binary === 'git' && sub && !READ_ONLY_GIT.has(sub)) {
+        return { allowed: false, reason: `sandbox is plan: "git ${sub}" changes the repository` }
+      }
+      if (packageManagerWrites(binary, sub)) {
+        return { allowed: false, reason: `sandbox is plan: "${binary} ${sub}" installs or builds; a plan describes that, it does not do it` }
+      }
+      if ((binary === 'node' || binary === 'python' || binary === 'python3' || binary === 'sh' || binary === 'bash') && sub && !READ_ONLY_NODE.has(sub)) {
+        return { allowed: false, reason: `sandbox is plan: running ${binary} with a script can write` }
+      }
+      return ALLOWED
+    }
+
     if (this.mode === 'read-only') {
       const writes = WRITE_OPERATORS.exec(text)
       if (writes) {
@@ -126,6 +198,9 @@ export class SandboxPolicy {
       const sub = (rest[0] || '').toLowerCase()
       if (binary === 'git' && sub && !READ_ONLY_GIT.has(sub)) {
         return { allowed: false, reason: `sandbox is read-only: "git ${sub}" is not read-only` }
+      }
+      if (packageManagerWrites(binary, sub)) {
+        return { allowed: false, reason: `sandbox is read-only: "${binary} ${sub}" writes to disk` }
       }
       if (binary === 'npm' && sub && !READ_ONLY_NPM.has(sub)) {
         return { allowed: false, reason: `sandbox is read-only: "npm ${sub}" is not read-only` }
