@@ -2,13 +2,13 @@ import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
 import { findGhidra, analyzeBinary, decompileFunction, missingGhidraHint } from '../../analysis/ghidra/ghidra.js'
-import { validatePoc, verdictLine } from '../../analysis/strix/validate.js'
-import type { PocSpec } from '../../analysis/strix/validate.js'
+import { validatePoc, verdictLine } from '../../analysis/poc/validate.js'
+import type { PocSpec } from '../../analysis/poc/validate.js'
 
 // Three analysis tools, each rebuilt from a larger project rather than vendored:
 //
 //   recon_graph      the dual-graph model from RECON (assets vs. what we tried)
-//   validate_finding the PoC verdict from strix (reproduced / fixed / cannot confirm)
+//   validate_finding the PoC verdict (reproduced / fixed / cannot confirm)
 //   ghidra_analyze   an adapter to a local Ghidra install, because rewriting a
 //                    400MB Java suite is not a thing
 

@@ -98,7 +98,7 @@ export const CLI_CAPABILITIES: CliCapability[] = [
       { manager: 'brew', args: ['install', 'binwalk'] },
       { manager: 'apt', args: ['install', '-y', 'binwalk'] },
     ] } },
-  { name: 'docker', commands: ['docker'], versionArg: ['--version'], purpose: 'Isolated sandbox for pentest payload validation (Strix-style)',
+  { name: 'docker', commands: ['docker'], versionArg: ['--version'], purpose: 'Isolated sandbox for pentest payload validation ',
     install: { packages: [
       { manager: 'winget', args: ['install', '--id', 'Docker.DockerDesktop', '-e', '--accept-source-agreements', '--accept-package-agreements'] },
       { manager: 'brew', args: ['install', '--cask', 'docker'] },

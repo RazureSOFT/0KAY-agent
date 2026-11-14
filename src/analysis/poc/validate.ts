@@ -1,4 +1,4 @@
-// The one rule from strix worth keeping: a finding is not a finding until a
+// The rule worth keeping: a finding is not a finding until a
 // proof-of-concept reproduces it.
 //
 // Scanners report "potentially vulnerable" and call it a day, which is why

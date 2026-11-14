@@ -12,14 +12,12 @@ import type { ReconGraph } from './graph.js'
 // settlement, the budget — is code. A model is allowed to be optimistic; the
 // loop is not.
 
-// ── Prompt provenance ───────────────────────────────────────────────────────
-// The three prompt bodies below are PORTED from jaykwok/RECON (v0.3.15,
-// e6ec569; AGPL-3.0, © the RECON authors) — goalsDefaultTmpl, plannerDefaultTmpl
-// and workerDefaultTmpl, with tool names adapted to this repo's surface
-// (recon_graph actions instead of insert_assets / record_fact /
-// report_finding, a JSON reply envelope instead of native tool calls) and the
-// norma-dependent sections removed. The project owner accepted AGPL-3.0 for
-// this module on 2026-10-25 — recorded in analysis/README.md.
+// ── Prompt bodies ───────────────────────────────────────────────────────────
+// Three templates drive the loop: goals, planner and worker. They speak in
+// terms of this repo's own tool surface (recon_graph actions and a JSON reply
+// envelope) and contain no provider-specific sections. Keeping them in one
+// place is what makes a synchronous scan and a background task behave the
+// same way.
 
 /** Pull the first JSON object out of a model reply, fences and prose included. */
 export function extractJson(text: string): any | null {

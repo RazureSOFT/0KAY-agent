@@ -111,7 +111,7 @@ export class DeepScanTool extends Tool {
 }
 
 /**
- * strix's "custom exploit runtime": write a snippet, run it, see what it printed.
+ * A custom exploit runtime: write a snippet, run it, see what it printed.
  * The sandbox decides whether it is allowed to run at all.
  */
 export class ExploitRuntimeTool extends Tool {

@@ -293,7 +293,7 @@ export class ReconGraph {
     return [...this.scopeRows]
   }
 
-  /** ARTEX add_task_scope: merge scope rows without dropping existing ones. */
+  /** add_task_scope: merge scope rows without dropping existing ones. */
   addScope(patterns: string[]): ScopeEntry[] {
     const added = this.buildScope(patterns)
     const known = new Set(this.scopeRows.map((row) => `${row.kind}:${row.value}`))

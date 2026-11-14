@@ -3,7 +3,7 @@ import { Tool } from '../types.js'
 import type { ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
 
-// strix's reconnaissance step, without the shelling out to a dozen CLI tools:
+// A reconnaissance step, without the shelling out to a dozen CLI tools:
 // what does this host resolve to, and what does its edge say about itself.
 //
 // Both halves are facts a report can quote. "It runs nginx" is an observation;

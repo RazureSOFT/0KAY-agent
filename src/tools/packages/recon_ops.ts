@@ -4,21 +4,20 @@ import { success, failure } from '../helpers.js'
 import type { ReconGraph } from '../../analysis/recon/graph.js'
 import type { TraceStore } from '../../analysis/recon/traces.js'
 
-// The RECON tool surface, 1:1: the same tool names, the same argument shapes
-// and the same model-facing descriptions (ported from agent/tools.go, AGPL-3.0,
-// see analysis/README.md for the licence record). They operate on the run
-// context (context.reconRun) — the session's shared graph and the active run's
-// trace store — instead of RECON's per-task DB stores.
+// The recon tool surface: stable names, argument shapes and model-facing
+// descriptions that the planner and workers are prompted with. They operate on
+// the run context (context.reconRun) — the session's shared graph and the
+// active run's trace store — so a task and a scan write to the same canvas.
 //
-// Known divergences, kept honest:
-//   - report_finding returns only the exploration node id (RECON also keeps a
-//     separate findings table bound to recorded traffic);
-//   - steer_work queues a steering trace for the intent (RECON injects it into
-//     the worker's live conversation);
+// Boundaries worth knowing:
+//   - report_finding returns only the exploration node id; wire evidence lives
+//     in the traffic and evidence ledgers (traffic_log / evidence tools);
+//   - steer_work queues a steering trace for the intent rather than editing a
+//     worker's live conversation;
 //   - a company carries no coverage rule of its own: assets are tagged with an
 //     owner and reported per owner, but scope stays keyed on domains/IPs.
-// Tool names not ported: traffic_* (no MITM layer yet), add_company_scope,
-// mcp/skill wrappers (already exist as their own tools).
+//   - traffic, notices, model failover and side questions are separate tools,
+//     not recon actions, so they can be used outside an assessment run too.
 
 export interface ReconRun {
   graph: ReconGraph

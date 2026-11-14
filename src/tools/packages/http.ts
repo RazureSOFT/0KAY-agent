@@ -4,7 +4,7 @@ import { success, failure, egressOrDirect } from '../helpers.js'
 import { coreHttpBase } from '../../connection.js'
 import { compactOutput } from '../compact.js'
 
-// strix's "HTTP interception proxy", reduced to what an agent actually needs from
+// An HTTP request tool, reduced to what an agent actually needs from
 // one: send exactly the request you meant to send, and see exactly what came
 // back — status, headers, and a compacted body.
 //

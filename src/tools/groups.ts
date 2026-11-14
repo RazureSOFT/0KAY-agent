@@ -42,8 +42,13 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   },
   analysis: {
     label: 'analysis',
-    hint: 'static binary analysis (incl. Ghidra), web assessment, PoC validation, recon graphs, background assessment tasks, diagrams, workspace architecture maps',
-    tools: ['reverse_engineer', 'pentest', 'diagram', 'architecture', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'assessments', 'exploit_runtime'],
+    hint: 'static binary analysis, built-in disassembly and control-flow graphs, web assessment, PoC validation, recon graphs, background assessment tasks, diagrams, workspace architecture maps',
+    tools: ['reverse_engineer', 'binary_analyze', 'pentest', 'diagram', 'architecture', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'assessments', 'exploit_runtime'],
+  },
+  assessmentRuntime: {
+    label: 'assessment runtime',
+    hint: 'traffic and evidence ledgers, interception rules, notices, model failover, side questions, asset enrichment and evidence-gated reports — live during a long assessment',
+    tools: ['traffic_log', 'evidence', 'intercept_rule', 'notify', 'llm_pool', 'side_question', 'asset_enrich', 'assessment_report'],
   },
   reconOps: {
     label: 'recon ops',

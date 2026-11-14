@@ -2,7 +2,7 @@ import { Tool } from '../types.js'
 import type { ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
 
-// strix's "Vulnerability Knowledge Base": a finding should leave with a severity
+// A vulnerability knowledge base: a finding should leave with a severity
 // that someone else can check, not an adjective.
 //
 // The scoring is CVSS 3.1 base, computed from the vector rather than looked up,
