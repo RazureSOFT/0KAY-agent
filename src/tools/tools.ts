@@ -7,6 +7,7 @@ import { VulnKbTool } from './packages/vuln.js';
 import { OsintTool } from './packages/recon.js';
 import { DeepScanTool, ExploitRuntimeTool } from './packages/scan.js';
 import { AssessmentsTool } from './packages/assess.js';
+import { RetestTool } from './packages/retest.js';
 import { SessionTool } from './packages/session.js';
 import { RECON_OPS_TOOLS } from './packages/recon_ops.js';
 import { RUNTIME_TOOLS } from './packages/runtime.js';
@@ -1305,7 +1306,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
   const registry = new ToolRegistry();
   for (const tool of [
     new ReadTool(), new WriteTool(), new EditTool(), new ApplyPatchTool(), new GlobTool(), new GrepTool(), new ShellTool(),
-    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new SessionTool(), ...RECON_OPS_TOOLS, ...RUNTIME_TOOLS,
+    new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new RetestTool(), new SessionTool(), ...RECON_OPS_TOOLS, ...RUNTIME_TOOLS,
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new IntentTool(), new FactTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new BinaryAnalysisTool(), new PentestTool(), new DiagramTool(), new ArchitectureTool(), new SetupDepsTool(),
