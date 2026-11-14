@@ -33,7 +33,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   web: {
     label: 'web',
     hint: 'fetching pages, search, papers, API docs, GitHub',
-    tools: ['webfetch', 'websearch', 'papersearch', 'apidocsearch', 'github_search', 'forge'],
+    tools: ['webfetch', 'websearch', 'papersearch', 'apidocsearch', 'github_search', 'forge', 'forge_repo'],
   },
   docs: {
     label: 'docs',

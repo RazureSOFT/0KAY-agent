@@ -16,7 +16,7 @@ import type { ToolContext } from './types.js';
  * The handler receives the tool's request (url, method, headers, parsed body)
  * and answers with `reply(status, jsonBody)`.
  */
-async function withForge<T>(
+export async function withForge<T>(
   handler: (request: { url: string; method: string; headers: Record<string, string>; body: any }, reply: (status: number, body: unknown) => void) => void,
   run: (hits: Array<{ url: string; method: string; headers: Record<string, string>; body: any }>) => Promise<T>,
 ): Promise<T> {
@@ -67,7 +67,7 @@ async function withForge<T>(
 }
 
 /** Answer with a fixed status and body, as the egress endpoint would. */
-function answer(reply: (status: number, body: unknown) => void, status: number, body: unknown) {
+export function answer(reply: (status: number, body: unknown) => void, status: number, body: unknown) {
   reply(status, body);
 }
 
@@ -78,7 +78,7 @@ function answer(reply: (status: number, body: unknown) => void, status: number, 
  * case on the way out, so asserting on `Authorization` would be asserting on
  * something the transport is free to change.
  */
-function header(headers: Record<string, string>, name: string): string | undefined {
+export function header(headers: Record<string, string>, name: string): string | undefined {
   const wanted = name.toLowerCase();
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() === wanted) return value;

@@ -50,7 +50,7 @@ export class ForgeError extends Error {
   }
 }
 
-function apiBase(target: ForgeTarget): string {
+export function apiBase(target: ForgeTarget): string {
   if (target.forge === 'gitlab') {
     const host = (target.host || 'gitlab.com').replace(/^https?:\/\//, '').replace(/\/$/, '');
     return `https://${host}/api/v4`;
@@ -60,12 +60,12 @@ function apiBase(target: ForgeTarget): string {
   return host === 'github.com' ? 'https://api.github.com' : `https://${host}/api/v3`;
 }
 
-function encodedRepo(target: ForgeTarget): string {
+export function encodedRepo(target: ForgeTarget): string {
   // GitLab wants the whole path URL-encoded, slashes included.
   return target.forge === 'gitlab' ? encodeURIComponent(target.repo) : target.repo;
 }
 
-function headers(target: ForgeTarget, token: string): Record<string, string> {
+export function headers(target: ForgeTarget, token: string): Record<string, string> {
   const base: Record<string, string> = { Accept: 'application/json', 'User-Agent': '0kay-agent' };
   if (!token) return base;
   return target.forge === 'gitlab' ? { ...base, 'PRIVATE-TOKEN': token } : { ...base, Authorization: `Bearer ${token}` };
@@ -128,6 +128,11 @@ export class ForgeTool extends Tool {
 
   static setTokenReader(reader: (forge: Forge) => string): void {
     ForgeTool.tokenReader = reader;
+  }
+
+  /** Shared with `forge_repo`, so both tools see the same token. */
+  static readToken(forge: Forge): string {
+    return ForgeTool.tokenReader(forge);
   }
 
   constructor(tokenFor?: (forge: Forge) => string) {

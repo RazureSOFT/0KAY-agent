@@ -45,6 +45,7 @@ import { ScreenshotToCodeTool } from './screenshot_to_code.js';
 import { ReverseEngineerTool } from './reverse_engineer.js';
 import { BinaryAnalysisTool } from './binary_analysis.js';
 import { McpServeTool } from './mcp_server.js';
+import { ForgeRepoTool } from './forge_repo.js';
 import { PentestTool } from './pentest.js';
 import { DiagramTool } from './diagram.js';
 import { ArchitectureTool } from './architecture.js';
@@ -1308,7 +1309,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new IntentTool(), new FactTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
     new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new BinaryAnalysisTool(), new PentestTool(), new DiagramTool(), new ArchitectureTool(), new SetupDepsTool(),
-    new GitHubSearchTool(), new ForgeTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),
+    new GitHubSearchTool(), new ForgeTool(), new ForgeRepoTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),
     new TaskListTool(), new TaskOutputTool(), new TaskStopTool(), new SleepTool(), new MonitorTool(),
     new ShellSessionTool(),
     new EvolveBeginTool(), new EvolveCommitTool(), new EvolveUpstreamTool(), new EvolveFinishTool(),
