@@ -47,6 +47,15 @@ export interface ToolContext {
   agentType: string;
   todo?: TodoItem[];
   runSubAgent?: (prompt: string, agentType?: string) => Promise<string>;
+  /**
+   * The same runner, with options overlaid for this call.
+   *
+   * A long-running task must carry its own permission mode: it outlives the
+   * conversation that started it, and resuming it hours later should not silently
+   * inherit whatever the panel is set to at that moment. Overlaying per call is
+   * what keeps that decision on the task instead of on the caller.
+   */
+  runSubAgentWith?: (prompt: string, agentType: string | undefined, options: Record<string, string>) => Promise<string>;
   /** Spawn/list/cancel child agents. Absent at the deepest level, which is how recursion stops. */
   subagents?: SubAgentRunner;
   /** What this task may touch. Absent means "no policy", used only by tests. */

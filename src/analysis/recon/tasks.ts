@@ -32,6 +32,16 @@ export type AssessmentStatus = 'running' | 'paused' | 'done' | 'cancelled' | 'fa
 export interface AssessmentSpec {
   /** Defaults to recon. */
   kind?: AssessmentKind
+  /**
+   * Permission mode for this task's workers, not the caller's.
+   *
+   * A task outlives the call that started it: it keeps running after the
+   * conversation moves on, and resumes hours later. Inheriting the caller's mode
+   * at creation time only would mean a task started under full access loses it on
+   * resume, and one started under normal access gains it if the panel is later
+   * switched. The mode belongs to the task.
+   */
+  permissionMode?: 'normal' | 'full_access'
   objective: string
   targets: string[]
   /** Refuse to prove goals until this percent of the scope is tested. */
@@ -121,6 +131,8 @@ export interface AssessmentState {
   sessionId: string
   /** Defaults to `recon` when absent. */
   kind?: AssessmentKind
+  /** Absent means `normal`, which is what every task created before this field was. */
+  permissionMode?: 'normal' | 'full_access'
   objective: string
   targets: string[]
   coverageArg?: number
@@ -322,6 +334,7 @@ export class AssessmentManager {
     }
 
     const kind: AssessmentKind = spec.kind === 'engineering' ? 'engineering' : 'recon'
+    const permissionMode: 'normal' | 'full_access' = spec.permissionMode === 'full_access' ? 'full_access' : 'normal'
     const graph = await this.graphFor(sessionId)
     const priorScope = graph.scope().map((row) => row.value)
     const scopeValues = [...new Set([...priorScope, ...targets])]
@@ -335,6 +348,7 @@ export class AssessmentManager {
       fallbackAssets: targets,
       graph,
       ...(spec.model ? { model: String(spec.model).trim() } : {}),
+      permissionMode,
     }
     const recordReview = (outcome: ReviewOutcome) => {
       state.reviews = state.reviews || []
@@ -373,6 +387,7 @@ export class AssessmentManager {
       id: `as_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`,
       sessionId,
       kind,
+      permissionMode,
       objective,
       targets,
       coverageArg: spec.coverage != null ? Number(spec.coverage) : undefined,
@@ -556,6 +571,8 @@ export class AssessmentManager {
         fallbackAssets: state.targets,
         graph,
         ...(state.model ? { model: state.model } : {}),
+        // A resumed task keeps the mode it was created with.
+        permissionMode: state.permissionMode || 'normal',
       }
       loop.onReview = (outcome: ReviewOutcome) => {
         state.reviews = state.reviews || []

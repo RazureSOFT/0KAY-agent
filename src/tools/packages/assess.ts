@@ -26,6 +26,7 @@ export class AssessmentsTool extends Tool {
       properties: {
         action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report', 'findings', 'retests', 'retest'] },
         kind: { type: 'string', enum: ['recon', 'engineering'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering aims at changing a code base or a deployed system.' },
+        permission_mode: { type: 'string', enum: ['normal', 'full_access'], description: 'create: what this task\'s workers may do without asking. full_access skips approval for dangerous tools; the mode sticks to the task, so a resume does not inherit the caller\'s current setting.' },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
         objective: { type: 'string', description: 'create: the objective, in one sentence.' },
         targets: { type: 'array', items: { type: 'string' }, description: 'create: in-scope assets — also the coverage denominator.' },
@@ -52,9 +53,19 @@ export class AssessmentsTool extends Tool {
     const sessionId = context.sessionId || context.taskId
     // Every call refreshes the model plumbing bound to this session, which is
     // what lets a paused task resume later — even after a restart.
+    // A task carries its own permission mode; the loop overlays it per worker call
+    // through `subagentOverrides`. The runner itself stays the same object so a
+    // resume does not need a new closure.
     const runtime = {
       llm: context.backgroundLlm || context.llm!,
-      ...(context.runSubAgent ? { subagent: context.runSubAgent } : {}),
+      ...(context.runSubAgent
+        ? {
+            subagent: context.runSubAgent,
+            ...(context.runSubAgentWith
+              ? { subagentWith: (prompt: string, agentType: string | undefined, options: Record<string, string>) => context.runSubAgentWith!(prompt, agentType, options) }
+              : {}),
+          }
+        : {}),
     }
     manager.rememberRuntime(sessionId, runtime)
     try {
@@ -62,6 +73,7 @@ export class AssessmentsTool extends Tool {
         case 'create': {
           const state = await manager.create({
             ...(args.kind === 'engineering' ? { kind: 'engineering' as const } : {}),
+            ...(args.permission_mode === 'full_access' ? { permissionMode: 'full_access' as const } : {}),
             objective: String(args.objective || ''),
             targets: Array.isArray(args.targets) ? args.targets.map(String).filter(Boolean) : [],
             ...(args.coverage != null ? { coverage: Number(args.coverage) } : {}),

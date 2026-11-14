@@ -234,6 +234,8 @@ export interface LoopRequest {
 export interface LoopRuntime {
   llm: (request: LoopRequest) => Promise<string | null>
   subagent?: (prompt: string, agentType?: string) => Promise<string>
+  /** The same runner with options overlaid; a task passes its permission mode here. */
+  subagentWith?: (prompt: string, agentType: string | undefined, options: Record<string, string>) => Promise<string>
 }
 
 export interface LoopContext {
@@ -252,6 +254,14 @@ export interface LoopContext {
   graph?: ReconGraph
   /** Model override for this task's model calls; empty = the executor's active model. */
   model?: string
+  /**
+   * What this task's workers may do without asking.
+   *
+   * Absent means the caller's setting, which is what every task created before
+   * this field did. Present means the task decided, and a resume keeps deciding
+   * the same way.
+   */
+  permissionMode?: 'normal' | 'full_access'
   /**
    * Called once per planner round with the verdict on that round's plan.
    *
@@ -451,9 +461,16 @@ export function makeWorker(runtime: LoopRuntime, loop: LoopContext): Worker {
       priorLine,
       ...(intent.overview ? [workerOverviewFrame(intent.overview)] : []),
     ].filter((line) => line !== undefined).join('\n')
-    if (runtime.subagent) {
+    // The worker runs under the task's permission mode, not the caller's.
+    // `subagentWith` is how that mode is applied without rebuilding the runner:
+    // the task outlives the conversation, so the decision has to travel with it.
+    const runner = runtime.subagentWith && loop.permissionMode
+      ? (prompt: string, agentType?: string) =>
+          runtime.subagentWith!(prompt, agentType, { permission_mode: loop.permissionMode! })
+      : runtime.subagent
+    if (runner) {
       try {
-        return parse(await runtime.subagent(subagentBrief))
+        return parse(await runner(subagentBrief))
       } catch (error: any) {
         return { note: `worker failed: ${error?.message || error}` }
       }

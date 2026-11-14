@@ -2210,6 +2210,17 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
               () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, childOptions(context.options)),
               subTaskId);
           },
+      // The same runner with per-call options. A background task passes its own
+      // permission mode here so resuming it does not inherit whatever the caller
+      // is set to at that moment.
+      runSubAgentWith: depth >= 2 || context.options.no_subagents === '1'
+        ? undefined
+        : async (subPrompt, subType, overrides) => {
+            const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
+            return this.recorder.run('subagent', subPrompt, context.taskId, context.sessionId,
+              () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, childOptions({ ...context.options, ...overrides })),
+              subTaskId);
+          },
       // The policy every write and shell call is checked against. Defaults to
       // workspace-write; a task can only widen it by saying so in its metadata.
       sandbox: new SandboxPolicy(parseSandboxMode(context.options.sandbox_mode), allowedWorkspaceRoots()),
