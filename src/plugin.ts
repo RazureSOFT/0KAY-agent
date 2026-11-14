@@ -447,6 +447,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '最小 1。提议之间有 6 小时冷却，不会反复弹。',
           },
           {
+            key: 'github_oauth_scope',
+            type: 'text',
+            label: 'GitHub 授权 scope',
+            defaultValue: 'repo',
+            help: 'OAuth App 填 repo；GitHub App 留空——它的权限由 App 定义决定，传 scope 会被拒绝。',
+          },
+          {
             key: 'github_token',
             type: 'text',
             label: 'GitHub Token',
