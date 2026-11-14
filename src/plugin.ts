@@ -514,6 +514,41 @@ async function registerWithCore(proto: any): Promise<string | null> {
   })
 }
 
+/**
+ * The plugin's own verdicts, sent with every heartbeat.
+ *
+ * Two things are worth reporting because they fail quietly otherwise: no model
+ * configured (every task fails at the first call) and extensions that did not
+ * load (the tools they carry are simply missing). Core shows these next to the
+ * heartbeat age, so a green dot no longer hides a broken plugin.
+ */
+function agentHealthChecks(): Array<{ id: string; ok: boolean; detail?: string }> {
+  const checks: Array<{ id: string; ok: boolean; detail?: string }> = []
+  try {
+    const settings = agent.getSettings()
+    const hasModel = Boolean(settings.model_id || process.env.MODEL_ID)
+    checks.push({
+      id: 'llm',
+      ok: hasModel,
+      ...(hasModel ? {} : { detail: 'no model configured; tasks fail at the first call' }),
+    })
+  } catch (error: any) {
+    checks.push({ id: 'llm', ok: false, detail: error?.message || String(error) })
+  }
+  try {
+    const report = agent.extensionReport()
+    const failed = report.errors?.length || 0
+    checks.push({
+      id: 'extensions',
+      ok: failed === 0,
+      ...(failed ? { detail: `${failed} extension(s) failed to load` } : {}),
+    })
+  } catch (error: any) {
+    checks.push({ id: 'extensions', ok: false, detail: error?.message || String(error) })
+  }
+  return checks
+}
+
 function sendHeartbeat(proto: any): void {
   if (shuttingDown) return
   void agent.flushTaskRecords().catch(error => console.warn('Task ledger retry failed:', error.message))
@@ -530,6 +565,7 @@ function sendHeartbeat(proto: any): void {
     status: 'PLUGIN_STATUS_HEALTHY',
     activeTasks,
     host: buildHostInfo(),
+    checks: agentHealthChecks(),
   }
 
   client.Heartbeat(request, coreMetadata(), { deadline: Date.now() + 5000 }, (err: grpc.ServiceError | null, resp: any) => {
