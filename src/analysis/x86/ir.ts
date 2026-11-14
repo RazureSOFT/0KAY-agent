@@ -9,6 +9,7 @@
 import type { Instruction, Operand } from './decode.js';
 import type { BasicBlock } from './cfg.js';
 import type { Frame } from './frame.js';
+import type { SwitchInfo } from './switch.js';
 
 export type Expr =
   | { t: 'const'; v: number; size: number }
@@ -40,6 +41,8 @@ export interface LiftedBlock {
   instructions: number;
   /** Removed from the structured output (e.g. a stack-growth thunk). */
   folded?: boolean;
+  /** Present when the block ends in an indexed jump table. */
+  switch?: SwitchInfo;
 }
 
 const SIZE_OF_REG: Record<string, number> = {};
@@ -270,6 +273,13 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if (m === 'mov' || m === 'movabs') {
         // Segment-register moves do not affect the value flow this IR models.
         if (a?.kind === 'reg' && a.reg === 'seg' || b?.kind === 'reg' && b.reg === 'seg') continue;
+        // `mov [rbp-8], rdi` is the prologue spilling an argument. The slot is
+        // already named arg0, so printing `arg0 = rdi` would overwrite the
+        // parameter with itself.
+        if (a?.kind === 'mem' && a.base === 'rbp' && typeof a.disp === 'number' && b?.kind === 'reg') {
+          const slot = frame.slots.get(a.disp);
+          if (slot && /^arg\d+$/.test(slot.name) && frame.argRegisters.includes(registerBase(b.reg || ''))) continue;
+        }
         if (a && b) {
           const targetExpr = operandExpr(a, ins, frame);
           const valueExpr = operandExpr(b, ins, frame);

@@ -57,9 +57,9 @@ test('the frame turns [rbp-8] into a local and the saved argument into a paramet
   const result = decompileFunction(code, BASE, BASE, { name: 'keep', end: BASE + code.length, convention: 'sysv' });
   // [rbp-8] holds the saved first argument, so it is a parameter named arg0.
   assert.ok(result.params.some((param) => param.name === 'arg0'), JSON.stringify(result.params));
-  assert.match(result.c, /arg0 = rdi;/);
-  assert.match(result.c, /arg0 = rdi;/);
+  // The prologue spill is recognised, so the body is just the return.
   assert.match(result.c, /return arg0;/);
+  assert.doesNotMatch(result.c, /arg0 = rdi;/);
 });
 
 test('a call prints its argument register as an argument', () => {
@@ -104,4 +104,27 @@ test('xref finds callers, callees and data references', () => {
   assert.deepEqual(callersOf(graph, 0x1020), [0x1000]);
   assert.equal(graph.scanned, 2);
   assert.equal(graph.truncated, false);
+});
+
+test('an indexed jump table becomes a switch', () => {
+  const buffer = new Uint8Array(0x3000);
+  // cmp edi,3; ja +0x20; jmp qword [rdi*8 + 0x2000]
+  buffer.set([0x83, 0xff, 0x03], 0);
+  buffer.set([0x77, 0x20], 3);
+  buffer.set([0xff, 0x24, 0xfd, 0x00, 0x20, 0x00, 0x00], 5);
+  // case 0 / 1 / 2 return 1 / 2 / 3; default returns 0
+  buffer.set([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3], 0x10);
+  buffer.set([0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3], 0x15);
+  buffer.set([0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3], 0x1a);
+  buffer.set([0x31, 0xc0, 0xc3], 0x25);
+  // table at file offset 0x1000 (virtual 0x2000): three absolute addresses
+  [0x1010, 0x1015, 0x101a].forEach((value, index) => {
+    // Shifting by 32 wraps to 0 in JS; divide instead.
+    for (let byte = 0; byte < 8; byte++) buffer[0x1000 + index * 8 + byte] = Math.floor(value / 2 ** (8 * byte)) & 0xff;
+  });
+  const result = decompileFunction(buffer, 0x1000, 0x1000, { name: 'pick', end: 0x1030, convention: 'sysv' });
+  assert.match(result.c, /switch \(rdi\)/, result.c);
+  assert.match(result.c, /case 0:/);
+  assert.match(result.c, /case 2:/);
+  assert.match(result.c, /return 1;|return 3;/);
 });

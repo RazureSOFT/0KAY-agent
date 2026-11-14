@@ -385,6 +385,30 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
       return finish('pop', [operand]);
     }
 
+    // VEX prefixes (AVX). The instruction itself is not modelled, but its
+    // length must be: a wrong length turns every following byte into garbage.
+    case 0xc4: case 0xc5: {
+      let cursor = index;
+      cursor += opcode === 0xc5 ? 1 : 2;
+      const avxOpcode = bytes[cursor] ?? 0;
+      cursor += 1;
+      if (avxOpcode !== 0x77) { // vzeroupper has no ModRM
+        const modrmByte = bytes[cursor] ?? 0;
+        cursor += 1;
+        const mod = modrmByte >> 6;
+        if (mod !== 3) {
+          if ((modrmByte & 7) === 4) cursor += 1;
+          if (mod === 1) cursor += 1;
+          else if (mod === 2) cursor += 4;
+          else if ((modrmByte & 7) === 5) cursor += 4;
+        }
+      }
+      index = Math.min(cursor, bytes.length);
+      return {
+        ...finish(avxOpcode === 0x77 ? 'vzeroupper' : `vex_${avxOpcode.toString(16).padStart(2, '0')}`, []),
+        ...(avxOpcode === 0x77 ? {} : { unknown: true }),
+      };
+    }
     case 0x90: return finish('nop', [], 'nop');
     case 0x98: return finish(operandSize === 64 ? 'cdqe' : operandSize === 16 ? 'cbw' : 'cwde', []);
     case 0x99: return finish(operandSize === 64 ? 'cqo' : operandSize === 16 ? 'cwd' : 'cdq', []);

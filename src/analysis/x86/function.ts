@@ -86,7 +86,23 @@ export function disassembleFunction(
     const fallthrough = address + instruction.length;
     if (flow === 'ret' || flow === 'stop') continue;
     if (flow === 'jump') {
-      accept(branchTarget(instruction));
+      const direct = branchTarget(instruction);
+      if (direct != null) { accept(direct); continue; }
+      // An indexed jump is a switch: read the table so its cases are decoded
+      // and can be structured later. Without this the cases are unreachable
+      // and the whole switch collapses into a single indirect branch.
+      const operand = instruction.operands[0];
+      if (operand?.kind === 'mem' && !operand.base && operand.index && operand.scale === 8 && operand.disp) {
+        for (let entryIndex = 0; entryIndex < 256; entryIndex++) {
+          const offset = (operand.disp as number) - baseVaddr + entryIndex * 8;
+          if (offset < 0 || offset + 8 > code.length) break;
+          let value = 0n;
+          for (let byteIndex = 7; byteIndex >= 0; byteIndex--) value = (value << 8n) | BigInt(code[offset + byteIndex]);
+          const target = Number(value);
+          if (!inRange(target)) break;
+          accept(target);
+        }
+      }
       continue;
     }
     if (flow === 'condition') {

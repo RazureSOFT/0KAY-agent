@@ -13,6 +13,8 @@ import { buildCfg } from './cfg.js';
 import { analyzeFrame, inferRegisterParams, type Convention, type Frame } from './frame.js';
 import { lift, type Expr, type Stmt } from './ir.js';
 import { structure, type CtrlStmt } from './structure.js';
+import { optimizeStatements } from './optimize.js';
+import { recoverSwitch } from './switch.js';
 import { typeForSize, typeOfExpr, refineParam, type CType } from './types.js';
 
 export interface DecompileOptions {
@@ -54,9 +56,16 @@ export function decompileFunction(
   const blocks = buildCfg(fn.instructions);
   const frame = analyzeFrame(fn.instructions, convention);
   const lifted = lift(fn.instructions, blocks, frame);
+  for (let index = 0; index < lifted.length; index++) {
+    const info = recoverSwitch(
+      lifted[index], blocks[index]?.instructions || [], code, baseVaddr,
+      (address) => address >= baseVaddr && address - baseVaddr < code.length,
+    );
+    if (info) lifted[index].switch = info;
+  }
   foldStackCheck(lifted, entry);
   const structured = structure(lifted, entry);
-  const body = optimize(structured.body);
+  const body = optimizeControl(optimize(structured.body));
 
   // Go does not spill its register arguments, so when the frame has no saved
   // arguments the inputs are recovered from the first reads instead.
@@ -285,6 +294,31 @@ function renameStmt(stmt: CtrlStmt, mapping: Map<string, string>): CtrlStmt {
   }
 }
 
+
+/** Apply value propagation to each run of straight-line statements. */
+function optimizeControl(stmts: CtrlStmt[]): CtrlStmt[] {
+  const out: CtrlStmt[] = [];
+  let buffer: Stmt[] = [];
+  const flush = () => {
+    if (!buffer.length) return;
+    out.push(...optimizeStatements(buffer));
+    buffer = [];
+  };
+  for (const stmt of stmts) {
+    if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown') {
+      buffer.push(stmt);
+      continue;
+    }
+    flush();
+    if (stmt.t === 'if') out.push({ ...stmt, then: optimizeControl(stmt.then), ...(stmt.else ? { else: optimizeControl(stmt.else) } : {}) });
+    else if (stmt.t === 'while') out.push({ ...stmt, body: optimizeControl(stmt.body) });
+    else if (stmt.t === 'do') out.push({ ...stmt, body: optimizeControl(stmt.body) });
+    else out.push(stmt);
+  }
+  flush();
+  return out;
+}
+
 function optimize(stmts: CtrlStmt[]): CtrlStmt[] {
   const out: CtrlStmt[] = [];
   for (const stmt of stmts) {
@@ -402,6 +436,21 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       const lines = [`${pad}do {`];
       for (const inner of stmt.body) lines.push(...printStmt(inner, level + 1));
       lines.push(`${pad}} while (${printExpr(stmt.cond)});`);
+      return lines;
+    }
+    case 'switch': {
+      const lines = [`${pad}switch (${printExpr(stmt.value)}) {`];
+      for (const entry of stmt.cases) {
+        lines.push(`${pad}case ${entry.value}:`);
+        for (const inner of entry.body) lines.push(...printStmt(inner, level + 1));
+        lines.push(`${pad}    break;`);
+      }
+      if (stmt.defaultBody) {
+        lines.push(`${pad}default:`);
+        for (const inner of stmt.defaultBody) lines.push(...printStmt(inner, level + 1));
+        lines.push(`${pad}    break;`);
+      }
+      lines.push(`${pad}}`);
       return lines;
     }
     case 'goto':

@@ -14,6 +14,7 @@ export type CtrlStmt =
   | { t: 'if'; cond: Expr; then: CtrlStmt[]; else?: CtrlStmt[] }
   | { t: 'while'; cond: Expr | null; body: CtrlStmt[] }
   | { t: 'do'; body: CtrlStmt[]; cond: Expr }
+  | { t: 'switch'; value: Expr; cases: Array<{ value: number; body: CtrlStmt[] }>; defaultBody?: CtrlStmt[] }
   | { t: 'goto'; label: string }
   | { t: 'label'; name: string };
 
@@ -42,7 +43,10 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
   for (const block of blocks) {
     const next = nextBlock(block, byStart, order);
     const out: number[] = [];
-    if (block.term === 'jmp' && block.target != null) out.push(block.target);
+    if (block.switch) {
+      for (const entry of block.switch.cases) out.push(entry.target);
+      if (block.switch.defaultTarget != null) out.push(block.switch.defaultTarget);
+    } else if (block.term === 'jmp' && block.target != null) out.push(block.target);
     else if (block.term === 'jcc') {
       if (block.target != null) out.push(block.target);
       if (next != null) out.push(next);
@@ -91,6 +95,14 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       out.push(...block.stmts);
 
       if (block.term === 'ret') break;
+      if (block.switch) {
+        const join = ipdom(current);
+        const cases = block.switch.cases.map((entry) => ({ value: entry.value, body: emitRange(entry.target, join) }));
+        const defaultBody = block.switch.defaultTarget != null ? emitRange(block.switch.defaultTarget, join) : undefined;
+        out.push({ t: 'switch', value: block.switch.value, cases, ...(defaultBody ? { defaultBody } : {}) });
+        current = join;
+        continue;
+      }
       const next = nextBlock(block, byStart, order);
 
       if (block.term === 'jmp') {
