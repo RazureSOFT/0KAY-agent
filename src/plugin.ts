@@ -388,6 +388,13 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '出方案后先由方案审查模型打分（可行性 / 把握度 / 完整度，取三者最低分）。低于此分数或带 blocker 的方案不会交给用户，而是把具体修改意见退回规划者重写。0 = 不审查方案',
           },
           {
+            key: 'guard_rules',
+            type: 'text',
+            label: '拦截规则（JSON）',
+            defaultValue: '',
+            help: '在审批之前生效的规则，让你一次决定、长期执行，不必每次点确认。JSON 数组，每项形如 {"name":"禁止删库","tool":"bash","contains":"rm -rf","verdict":"block","reason":"不允许"}。\\n\\n**规则不会硬编码进代码** —— 内置的"危险命令表"是谁也看不到、无法反对、也无法修改的策略，而且对某些人永远是错的。所以默认是空的，也就是"照旧弹审批"。\\n\\ntool 支持 * 通配；contains 是子串匹配（写 rm -rf 就够，不必写正则）；pathEndsWith 匹配路径结尾（例如 .env）；block 一律优先于 allow。每次调用都会记进审计轨迹，可在 /api/agent/audit 查看。',
+          },
+          {
             key: 'agent_self_write',
             type: 'bool',
             label: '允许 Agent 自行改写经验',
@@ -613,6 +620,7 @@ async function pollAgentSettings(): Promise<void> {
       gate_budget_seconds: Number(values.gate_budget_seconds ?? 120),
       gate_require_plan: values.gate_require_plan !== false,
       plan_threshold: Number(values.plan_threshold ?? 70),
+      guard_rules: typeof values.guard_rules === 'string' ? values.guard_rules : '',
       library_enabled: values.library_enabled !== false,
       agent_self_write: values.agent_self_write === true,
     })

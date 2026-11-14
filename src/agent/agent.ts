@@ -44,6 +44,7 @@ import { agentEvents } from './events.js';
 import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
 import { planReviewOptions } from './plan_review_options.js';
 import { ForgeTool } from '../tools/forge.js';
+import { AuditLog, evaluateRules, parseRules, summarizeCall, type GuardRule } from './guard.js';
 import { applyRoleBrief, childOptions, resolveRole, roleAllowsTool, roleForAgentType } from './roles.js';
 import { FactMemory } from './facts.js';
 import { PermissionLedger } from './permission.js';
@@ -259,6 +260,14 @@ export interface AgentSettings {
    * the reviewer's objections instead of being built. 0 disables the check.
    */
   plan_threshold?: number;
+  /**
+   * Guard rules as JSON, evaluated before approval.
+   *
+   * No dangerous-command list ships with this: a built-in list is a policy
+   * nobody can see, disagree with or update, and it is always wrong for
+   * somebody. The default is empty, which means "ask as before".
+   */
+  guard_rules?: string;
   /** Rules injected before the first message (the LIBRARY stage). */
   library_enabled?: boolean;
   /** Let the agent rewrite its own experience without a user/reviewer instruction. */
@@ -337,6 +346,15 @@ export class Agent {
   private settings: Required<AgentSettings>;
   private recorder = taskRecorder;
   private approvals = new ApprovalManager();
+  /**
+   * The audit trail and the operator's rules.
+   *
+   * Instantiated here rather than injected: the log is process-wide state (it
+   * answers "what has this agent tried this session"), and a per-task log would
+   * forget exactly the calls a reader wants to see across tasks.
+   */
+  private audit = new AuditLog();
+  private guardRules: GuardRule[] = [];
   /** Session UI directives (titles, toasts) — collected by core's inbox poll. */
   private directives = new SessionDirectives();
   private questions = new QuestionManager();
@@ -447,6 +465,7 @@ export class Agent {
       // 70 is a starting point, not a magic number: below it a plan is usually
       // missing part of the request or guessing at something it could check.
       plan_threshold: 70,
+      guard_rules: '',
       library_enabled: true,
       agent_self_write: false,
     };
@@ -573,6 +592,13 @@ export class Agent {
       this.settings.gate_budget_seconds = Math.max(5, Math.min(900, Math.floor(partial.gate_budget_seconds)));
     }
     if (typeof partial.gate_require_plan === 'boolean') this.settings.gate_require_plan = partial.gate_require_plan;
+    if (typeof partial.guard_rules === 'string') {
+      this.settings.guard_rules = partial.guard_rules;
+      // Parsed once here, not on every call: a rule set that fails to parse is
+      // reported by its absence, and re-parsing on each tool call would hide a
+      // typo behind a per-call cost nobody looks at.
+      this.guardRules = parseRules(partial.guard_rules);
+    }
     if (typeof partial.plan_threshold === 'number' && Number.isFinite(partial.plan_threshold)) {
       // Clamped rather than rejected: 0 is meaningful ("do not review plans"),
       // and anything above 100 would block every plan forever.
@@ -2108,6 +2134,20 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         error: `${toolCall.name} is disabled: the ${role?.name || 'current'} role may not call it${role ? `. ${role.summary}` : ''}`,
       };
     }
+    // The operator's rules, then the audit trail. Rules run before approval
+    // because a rule is a decision already made — asking a human to re-answer a
+    // question they answered in settings wastes the prompt and, worse, invites
+    // the wrong answer. Every call that reaches this point is recorded, allowed
+    // or refused, so "who let that run" has an answer later.
+    const guardDecision = evaluateRules(this.guardRules, toolCall.name, args);
+    if (guardDecision.verdict === 'block') {
+      this.audit.record({
+        at: Date.now(), tool: toolCall.name, verdict: 'block',
+        reason: guardDecision.reason, rule: guardDecision.rule,
+        summary: summarizeCall(toolCall.name, args),
+      });
+      return { success: false, data: null, error: `${toolCall.name} blocked: ${guardDecision.reason}` };
+    }
     // A deferred tool is still callable by name; loading its group here is what
     // makes progressive disclosure safe rather than a guessing game.
     const toolGroup = groupOf(toolCall.name);
@@ -2122,10 +2162,18 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       }
       if (verdict.args) args = verdict.args;
     }
-    if (!this.fullAccessGranted(context) && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name)) {
+    if (!this.fullAccessGranted(context) && !this.autoApproved(toolCall.name) && !this.readOnlyComputerUse(toolCall.name, args) && !ALWAYS_SAFE_TOOLS.has(toolCall.name) && !readOnlyInvocation(toolCall.name, args)) {
       try { await this.approvals.request(context.taskId, context.sessionId, toolCall.name, args, context.cwd, context.signal); }
       catch (error: any) { context.signal.throwIfAborted(); return { success:false, data:null, error:error.message }; }
     }
+    // Recorded after the gate, so the entry describes what will actually run —
+    // including the fact that a human approved it — rather than what was asked
+    // for before anyone looked.
+    this.audit.record({
+      at: Date.now(), tool: toolCall.name, verdict: 'allow',
+      reason: guardDecision.reason, rule: guardDecision.rule,
+      summary: summarizeCall(toolCall.name, args),
+    });
     // Resolved before the (synchronous) tool-context closure below: the graph
     // may need a disk read the first time a session touches it.
     const recon = await this.reconFor(context.sessionId || context.taskId);
