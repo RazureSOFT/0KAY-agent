@@ -81,7 +81,8 @@ export interface AssessmentReview {
 /** One row of the task's conversation tree — planner rounds, worker intents, system events. */
 export interface AssessmentSession {
   id: string
-  kind: 'planner' | 'worker' | 'system'
+  /** `retest` is its own lane: a retest has its own conversation and its own verdict. */
+  kind: 'planner' | 'worker' | 'system' | 'retest'
   title: string
   /** Worker entries carry the intent node id; the live read joins the real status. */
   refId?: string
@@ -631,6 +632,34 @@ export class AssessmentManager {
    * of waiting for a restart. A run that is not live still records the message in
    * its activity and keeps it for the next resume.
    */
+  /**
+   * Record a retest as a session of its own.
+   *
+   * A retest is a separate conversation against a separate target question, so it
+   * belongs in the session list next to the planners and workers rather than
+   * being a line under a finding. The finding id travels as `refId`, which is what
+   * the UI uses to join the lane back to its retest record.
+   */
+  async recordRetestSession(id: string, input: { findingId: string; retestId: string; title: string; verdict?: string }): Promise<void> {
+    await this.ensureLoaded()
+    const state = this.states.get(id)
+    if (!state) return
+    const at = new Date().toISOString()
+    state.sessions = state.sessions || []
+    state.sessions.push({
+      id: `ses_rt_${Date.now().toString(36)}_${input.retestId.slice(-6)}`,
+      kind: 'retest',
+      title: input.title,
+      refId: input.retestId,
+      round: -1,
+      startedAt: at,
+    })
+    if (state.sessions.length > MAX_SESSIONS) state.sessions.splice(0, state.sessions.length - MAX_SESSIONS)
+    state.activity.push({ at, round: -1, kind: 'retest', text: input.verdict ? `${input.title} · ${input.verdict}` : input.title })
+    if (state.activity.length > MAX_ACTIVITY) state.activity.splice(0, state.activity.length - MAX_ACTIVITY)
+    await this.persist(state)
+  }
+
   async say(id: string, text: string): Promise<{ delivered: boolean; queued: boolean }> {
     await this.ensureLoaded()
     const state = this.states.get(id)

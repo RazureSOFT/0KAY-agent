@@ -96,12 +96,26 @@ export class RetestTool extends Tool {
           try {
             const reply = await runRetestAgent(context, finding, String(args.notes || ''));
             const done = store.complete(record.id, reply);
+            // Recorded as its own lane in the task's session list: a retest is a
+            // separate conversation, and a person expects to open it and read what
+            // the retester did, not just see a verdict appear under a finding.
+            void manager.recordRetestSession(finding.taskId, {
+              findingId: finding.id,
+              retestId: done.id,
+              title: finding.text,
+              ...(done.verdict ? { verdict: done.verdict } : {}),
+            }).catch(() => {});
             return success({
               retest: done,
               finding: { id: finding.id, text: finding.text },
             });
           } catch (error: any) {
             const failed = store.fail(record.id, error?.message || String(error));
+            void manager.recordRetestSession(finding.taskId, {
+              findingId: finding.id,
+              retestId: failed.id,
+              title: finding.text,
+            }).catch(() => {});
             return success({ retest: failed, error: failed.error });
           }
         }

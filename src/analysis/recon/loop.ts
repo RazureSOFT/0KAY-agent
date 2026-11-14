@@ -201,8 +201,12 @@ const WORKER_SUBAGENT_PROMPT = `你是一个网络安全平台授权渗透测试
 - **确认漏洞 → report_finding（探索图，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
 完成本意图后，最后单独输出一段 JSON 总结（这是系统读取的契约）：
-{"steps":[{"action":"...","detail":"...","ok":true}],"note":"一句话：做了什么、得到哪些关键结论","facts":[],"findings":[]}
-"steps" 列你实际执行过的工具调用与结果。facts/findings 留空——已写回图；只有确实无法用 record_fact/report_finding 写回的观察才作兜底写在这里。`
+{"steps":[{"tool":"bash","action":"...","detail":"...","ok":true}],"note":"一句话：做了什么、得到哪些关键结论","facts":[],"findings":[]}
+"steps" 列你实际执行过的**工具调用**与结果，一条调用一条记录：
+- "tool" 写你实际用的工具名（bash / httpx / read / grep / webfetch / recon_graph …），不是工具就用 "step"。
+- "action" 写动作（命令行、请求行、要读的文件），"detail" 写看到的关键输出（截断到一行）。
+- 不要把推理过程写进 steps：没有发生工具调用的思考不是 step。
+facts/findings 留空——已写回图；只有确实无法用 record_fact/report_finding 写回的观察才作兜底写在这里。`
 
 // Ported from RECON renderWorkerGraphOverview: the read-only situation frame —
 // awareness without mandate creep, coverage deliberately removed.
@@ -412,7 +416,14 @@ export function makeWorker(runtime: LoopRuntime, loop: LoopContext): Worker {
       facts: Array.isArray(parsed.facts) ? parsed.facts.map((entry: any) => ({ text: String(entry?.text || '') })).filter((entry: any) => entry.text) : [],
       findings: Array.isArray(parsed.findings) ? parsed.findings.map((entry: any) => ({ text: String(entry?.text || '') })).filter((entry: any) => entry.text) : [],
       steps: Array.isArray(parsed.steps)
-        ? parsed.steps.map((entry: any) => ({ action: String(entry?.action || 'step'), detail: String(entry?.detail || ''), ok: entry?.ok !== false }))
+        ? parsed.steps.map((entry: any) => ({
+            // A step without a tool name is a step, not a tool call: `step` is the
+            // marker the UI uses to pick a different icon and no monospace body.
+            tool: String(entry?.tool || 'step'),
+            action: String(entry?.action || 'step'),
+            detail: String(entry?.detail || ''),
+            ok: entry?.ok !== false,
+          }))
         : [],
       note: typeof parsed.note === 'string' ? parsed.note : undefined,
     }

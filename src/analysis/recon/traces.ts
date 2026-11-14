@@ -9,6 +9,14 @@
 export interface TraceStep {
   intentId: string
   worker: string
+  /**
+   * The tool the worker actually called ('bash', 'httpx', 'read', 'step').
+   *
+   * Absent on older traces, where every entry was a free-form action line. The UI
+   * draws a tool call differently from a sentence, so the distinction has to be
+   * carried rather than inferred from the text.
+   */
+  tool?: string
   action: string
   detail: string
   ok: boolean
