@@ -34,6 +34,9 @@ function fakeRuntime(parts: { planner?: string[]; worker?: string | null; gate?:
     llm: async (request) => {
       const content = String(request.messages[0]?.content || '')
       if (content.includes('"targets"')) return GOALS
+      // Checked before the planner branch: a review call carries the situation
+      // too, so without this it would consume a planner reply.
+      if (content.includes('"reviewer":true')) return JSON.stringify({ verdict: 'accept', dimensions: [] })
       if (content.includes('"openIntents"')) {
         const reply = plannerReplies[Math.min(round++, plannerReplies.length - 1)]
         return reply ?? JSON.stringify({ intents: [] })

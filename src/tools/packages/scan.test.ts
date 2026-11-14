@@ -7,13 +7,22 @@ import type { ToolContext } from '../types.js'
 // deep_scan is the RECON loop with a model bolted on. The model is faked here on
 // purpose: what needs testing is the stopping logic, not the prompt.
 
+// The loop reviews every plan, which is one extra model call per round. Rather
+// than thread that through every reply list, the fake answers review calls with
+// an accept and leaves the ordered list for planner/worker traffic.
+const ACCEPT = JSON.stringify({ verdict: 'accept', dimensions: [] })
+
 function contextWithPlanner(replies: string[]): ToolContext {
   let index = 0
   return {
     cwd: process.cwd(),
     taskId: 'scan',
     agentType: 'general',
-    llm: async () => replies[Math.min(index++, replies.length - 1)] ?? null,
+    llm: async (request) => {
+      const content = String(request?.messages?.[0]?.content || '')
+      if (content.includes('"reviewer":true')) return ACCEPT
+      return replies[Math.min(index++, replies.length - 1)] ?? null
+    },
   } as ToolContext
 }
 

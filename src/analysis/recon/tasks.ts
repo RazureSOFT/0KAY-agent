@@ -9,7 +9,7 @@ import { TraceStore } from './traces.js'
 import type { TraceStep } from './traces.js'
 import { ReconEngine } from './engine.js'
 import { plantGoals, makePlanner, makeWorker, makeSummarizer } from './loop.js'
-import type { LoopRuntime, LoopContext } from './loop.js'
+import type { LoopRuntime, LoopContext, ReviewOutcome } from './loop.js'
 import { renderAssessmentReport } from './report.js'
 import { writeFileAtomic } from '../../tools/atomic_write.js'
 
@@ -50,6 +50,31 @@ export interface AssessmentActivityEntry {
   round: number
   kind: string
   text: string
+}
+
+const MAX_REVIEWS = 80
+
+/**
+ * A planner round's plan as the reviewer judged it.
+ *
+ * Kept apart from `activity` on purpose: activity is a flat event log, and the
+ * plan-review relationship is structured (one plan, five dimension verdicts, one
+ * revision request). Flattening it would lose which note belongs to which
+ * dimension.
+ */
+export interface AssessmentReview {
+  round: number
+  at: string
+  plan: Array<{ id: string; text: string; needs: string[] }>
+  intents: string[]
+  verdict: 'accept' | 'revise' | 'reject'
+  dimensions: Array<{ id: string; question: string; verdict: 'ok' | 'weak' | 'fails'; note?: string }>
+  /** The single change the reviewer asked for; absent when accepted. */
+  revision?: string
+  /** True when the planner was asked again and its second plan is the one shown. */
+  revised: boolean
+  /** Set when the reviewer itself failed; the plan ran unreviewed. */
+  error?: string
 }
 
 /** One row of the task's conversation tree — planner rounds, worker intents, system events. */
@@ -109,6 +134,12 @@ export interface AssessmentState {
   goalIds: string[]
   goalTexts: Array<{ id: string; text: string }>
   constraints: string[]
+  /**
+   * One entry per planner round: the plan it wrote, how the reviewer scored it,
+   * and whether it was sent back. This is what the task page shows next to each
+   * plan, so a person can see the judgement rather than only its effect.
+   */
+  reviews?: AssessmentReview[]
   /**
    * Operator messages that arrived while no run was live. They are folded into
    * the constraints when the task is resumed, so a paused task does not lose what
@@ -261,6 +292,22 @@ export class AssessmentManager {
       graph,
       ...(spec.model ? { model: String(spec.model).trim() } : {}),
     }
+    const recordReview = (outcome: ReviewOutcome) => {
+      state.reviews = state.reviews || []
+      state.reviews.push({
+        round: outcome.round,
+        at: new Date().toISOString(),
+        plan: outcome.plan,
+        intents: outcome.intents,
+        verdict: outcome.result.verdict,
+        dimensions: outcome.result.dimensions,
+        ...(outcome.result.revision ? { revision: outcome.result.revision } : {}),
+        revised: outcome.revised,
+        ...(outcome.result.error ? { error: outcome.result.error } : {}),
+      })
+      if (state.reviews.length > MAX_REVIEWS) state.reviews.splice(0, state.reviews.length - MAX_REVIEWS)
+    }
+    loop.onReview = recordReview
     // One choke point for every model call the loop makes — this is where the
     // task's token counters live. Estimates only: the underlying caller does
     // not expose provider usage or cache hits.
@@ -458,11 +505,27 @@ export class AssessmentManager {
       }
       const loop: LoopContext = {
         objective: state.objective,
+        kind: state.kind || 'recon',
         scopeLine: `Scope (never leave it): ${state.scope.join(', ')}`,
         constraints: state.constraints,
         fallbackAssets: state.targets,
         graph,
         ...(state.model ? { model: state.model } : {}),
+      }
+      loop.onReview = (outcome: ReviewOutcome) => {
+        state.reviews = state.reviews || []
+        state.reviews.push({
+          round: outcome.round,
+          at: new Date().toISOString(),
+          plan: outcome.plan,
+          intents: outcome.intents,
+          verdict: outcome.result.verdict,
+          dimensions: outcome.result.dimensions,
+          ...(outcome.result.revision ? { revision: outcome.result.revision } : {}),
+          revised: outcome.revised,
+          ...(outcome.result.error ? { error: outcome.result.error } : {}),
+        })
+        if (state.reviews.length > MAX_REVIEWS) state.reviews.splice(0, state.reviews.length - MAX_REVIEWS)
       }
       this.startActivity(state, graph, this.runtimeFor(state), loop)
       await this.persist(state)

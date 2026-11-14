@@ -1,5 +1,7 @@
 import type { Planner, Worker, Summarizer, IntentSpec, WorkerResult } from './engine.js'
 import type { Plan } from './plan.js'
+import { reviewPlan, type ReviewResult } from './review.js'
+import type { Situation } from './engine.js'
 import type { ReconGraph } from './graph.js'
 
 // The model side of the RECON loop, shared by the synchronous deep_scan tool and
@@ -212,6 +214,23 @@ export interface LoopContext {
   graph?: ReconGraph
   /** Model override for this task's model calls; empty = the executor's active model. */
   model?: string
+  /**
+   * Called once per planner round with the verdict on that round's plan.
+   *
+   * The host writes these into the task transcript, which is what lets the UI
+   * show every plan alongside its score and whether it was sent back.
+   */
+  onReview?: (round: ReviewOutcome) => void
+}
+
+/** One planner round as the UI needs to see it: the plan, the verdict, the note. */
+export interface ReviewOutcome {
+  round: number
+  plan: Array<{ id: string; text: string; needs: string[] }>
+  intents: string[]
+  result: ReviewResult
+  /** True when the planner was asked again because the reviewer said revise. */
+  revised: boolean
 }
 
 /** One call before the loop: the objective becomes provable goals on the graph. */
@@ -247,13 +266,16 @@ export async function plantGoals(
 /** The planner: situation in, up to three intents out, plan refreshed in passing. */
 export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext): Planner {
   const constraintLine = loop.constraints.length ? `\nConstraints: ${loop.constraints.join(' | ')}` : ''
-  return async (situation) => {
+
+  /** One planner call. `notes` is the reviewer's revision, when there is one. */
+  const ask = async (situation: Situation, notes?: string) => {
     const reply = await runtime.llm({
       systemPrompt: `${PLANNER_PROMPT}\n\n${loop.scopeLine}${constraintLine}`,
       messages: [{
         role: 'user',
         content: JSON.stringify({
           objective: loop.objective,
+          kind: loop.kind || 'recon',
           goals: situation.overview.goals,
           round: situation.round,
           settlement: situation.settlement || false,
@@ -266,23 +288,17 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
           readySteps: situation.ready.map((step) => ({ id: step.id, text: step.text })),
           traces: situation.traces,
           budget: situation.budget,
+          // The reviewer's single revision request, if the plan was sent back.
+          ...(notes ? { revisionRequested: notes } : {}),
         }),
       }],
       temperature: 0.2,
       ...(loop.model ? { model: loop.model } : {}),
     })
     const parsed = extractJson(reply || '')
-    if (!parsed) return []
+    if (!parsed) return null
 
-    if (Array.isArray(parsed.plan) && parsed.plan.length) {
-      try {
-        plan.setAll(parsed.plan.map((entry: any) => ({ text: String(entry.text || ''), needs: entry.needs })))
-      } catch {
-        // A malformed plan must not kill the round; the intents still run.
-      }
-    }
-
-    return (Array.isArray(parsed.intents) ? parsed.intents : [])
+    const intents = (Array.isArray(parsed.intents) ? parsed.intents : [])
       .map((entry: any) => ({
         text: String(entry?.text || '').trim(),
         assets: Array.isArray(entry?.assets) ? entry.assets.map(String) : undefined,
@@ -291,6 +307,64 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
       }))
       .filter((intent: IntentSpec) => intent.text)
       .slice(0, 4)
+
+    // Applied here rather than at the call site so a revised plan replaces the
+    // rejected one in the same place — the transcript shows the plan that
+    // actually runs, and the verdict attached to it.
+    if (Array.isArray(parsed.plan) && parsed.plan.length) {
+      try {
+        plan.setAll(parsed.plan.map((entry: any) => ({ text: String(entry.text || ''), needs: entry.needs })))
+      } catch {
+        // A malformed plan must not kill the round; the intents still run.
+      }
+    }
+    return { intents, planSteps: parsed.plan }
+  }
+
+  return async (situation) => {
+    const first = await ask(situation)
+    if (!first) return []
+
+    // Review what the planner proposed, with the same situation the planner saw.
+    // A reviewer that cannot run hands back `accept`, so this never blocks a
+    // round — it only sends a plan back.
+    const review = await reviewPlan(runtime, loop, {
+      plan: plan.toJSON(),
+      intentTexts: first.intents.map((intent: IntentSpec) => intent.text),
+      situation: {
+        goals: situation.overview.goals,
+        coverage: situation.overview.coverage,
+        recent: situation.overview.recent,
+        hints: situation.overview.hints,
+        traces: situation.traces,
+      },
+    })
+
+    let intents = first.intents
+    let revised = false
+    if (review.verdict === 'revise' && review.revision) {
+      // Exactly one revision attempt: a reviewer that keeps saying "revise" would
+      // otherwise cost a model call per round with no bound.
+      const second = await ask(situation, review.revision)
+      if (second) {
+        intents = second.intents
+        revised = true
+      }
+    }
+    if (review.verdict === 'reject') {
+      // The round produces nothing. The plan stays as the reviewer last saw it so
+      // the next round's planner starts from the same context.
+      intents = []
+    }
+
+    loop.onReview?.({
+      round: situation.round,
+      plan: plan.toJSON().map((step) => ({ id: step.id, text: step.text, needs: step.needs })),
+      intents: intents.map((intent: IntentSpec) => intent.text),
+      result: review,
+      revised,
+    })
+    return intents
   }
 }
 
