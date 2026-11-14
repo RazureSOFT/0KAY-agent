@@ -223,7 +223,7 @@ test('a report will not promote a finding without evidence', () => {
 test('the runtime tools are registered and work together end to end', async () => {
   resetRuntime();
   const registry = createDefaultRegistry();
-  const names = ['traffic_log', 'evidence', 'intercept_rule', 'notify', 'llm_pool', 'side_question', 'asset_enrich', 'assessment_report'];
+  const names = ['traffic_log', 'traffic_proxy', 'evidence', 'intercept_rule', 'notify', 'llm_pool', 'side_question', 'asset_enrich', 'assessment_report'];
   for (const name of names) {
     assert.ok(registry.get(name), `${name} is not in the default registry`);
   }

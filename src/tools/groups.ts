@@ -28,7 +28,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
     label: 'agent',
     hint: 'delegation, background work, session cosmetics (titles, toasts), artefacts, MCP',
     tools: ['task', 'subagent', 'background_task', 'TaskList', 'TaskOutput', 'TaskStop', 'Monitor', 'sleep', 'ShellSession',
-            'report_artifacts', 'session', 'acp_status', 'mcp'],
+            'report_artifacts', 'session', 'acp_status', 'mcp', 'mcp_serve'],
   },
   web: {
     label: 'web',
@@ -48,7 +48,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   assessmentRuntime: {
     label: 'assessment runtime',
     hint: 'traffic and evidence ledgers, interception rules, notices, model failover, side questions, asset enrichment and evidence-gated reports — live during a long assessment',
-    tools: ['traffic_log', 'evidence', 'intercept_rule', 'notify', 'llm_pool', 'side_question', 'asset_enrich', 'assessment_report'],
+    tools: ['traffic_log', 'traffic_proxy', 'evidence', 'intercept_rule', 'notify', 'llm_pool', 'side_question', 'asset_enrich', 'assessment_report'],
   },
   reconOps: {
     label: 'recon ops',

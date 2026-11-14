@@ -44,6 +44,7 @@ import { CrawlTool } from './crawl.js';
 import { ScreenshotToCodeTool } from './screenshot_to_code.js';
 import { ReverseEngineerTool } from './reverse_engineer.js';
 import { BinaryAnalysisTool } from './binary_analysis.js';
+import { McpServeTool } from './mcp_server.js';
 import { PentestTool } from './pentest.js';
 import { DiagramTool } from './diagram.js';
 import { ArchitectureTool } from './architecture.js';
@@ -1313,6 +1314,8 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new EvolveBeginTool(), new EvolveCommitTool(), new EvolveUpstreamTool(), new EvolveFinishTool(),
     new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new CodeSearchTool(), new AcpStatusTool(),
   ]) registry.register(tool);
+  // Needs the registry itself to expose, so it is registered after the loop.
+  registry.register(new McpServeTool(registry));
   return registry;
 }
 

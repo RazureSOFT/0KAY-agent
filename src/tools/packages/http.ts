@@ -1,6 +1,7 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure, egressOrDirect } from '../helpers.js'
+import { interceptFor, recordExchange } from './runtime.js'
 import { coreHttpBase } from '../../connection.js'
 import { compactOutput } from '../compact.js'
 
@@ -60,15 +61,36 @@ export class HttpRequestTool extends Tool {
       return failure(`refused: ${parsed.host} is this machine's Core API, which agents may not call directly`)
     }
 
+    const method = args.method ? String(args.method).toUpperCase() : 'GET'
+    const requestHeaders = args.headers && typeof args.headers === 'object'
+      ? args.headers as Record<string, string>
+      : undefined
+    const requestBody = args.body != null ? String(args.body) : undefined
+
+    // Rules decide before the request leaves: a rule that only answers a query
+    // is a suggestion. An unmatched request keeps the normal approval flow.
+    const decision = interceptFor(context, { method, url, headers: requestHeaders, body: requestBody })
+    if (decision.verdict === 'block') {
+      recordExchange(context, {
+        method, url, requestHeaders, requestBody,
+        status: 0, responseBody: `blocked by interception rule ${decision.ruleId}`,
+        tags: ['blocked'],
+      })
+      return failure(`blocked by interception rule ${decision.ruleId}: ${decision.note}`)
+    }
+    const outbound = decision.request
+      ? { method: decision.request.method, url: decision.request.url, headers: decision.request.headers, body: decision.request.body }
+      : { method, url, headers: requestHeaders, body: requestBody }
+
     const started = Date.now()
     try {
       // egressOrDirect, not fetch: the same SSRF guard every other outbound call
       // uses. A raw fetch here let a model reach 169.254.169.254 and the LAN
       // without netguard ever seeing the request.
-      const response = await egressOrDirect(url, {
-        method: args.method ? String(args.method).toUpperCase() : 'GET',
-        headers: args.headers && typeof args.headers === 'object' ? args.headers : undefined,
-        body: args.body != null ? String(args.body) : undefined,
+      const response = await egressOrDirect(outbound.url, {
+        method: outbound.method,
+        headers: outbound.headers,
+        body: outbound.body,
         redirect: args.followRedirects === true ? 'follow' : 'manual',
         signal: AbortSignal.timeout(Number(args.timeoutMs) || 30_000),
       }, Number(args.timeoutMs) || 30_000)
@@ -77,6 +99,12 @@ export class HttpRequestTool extends Tool {
       const headers: Record<string, string> = {}
       response.headers.forEach((value, key) => { headers[key] = value })
       const compacted = compactOutput(raw, { maxChars: Number(args.maxBodyChars) || 20_000 })
+      recordExchange(context, {
+        method: outbound.method, url: outbound.url,
+        requestHeaders: outbound.headers, requestBody: outbound.body,
+        status: response.status, responseHeaders: headers, responseBody: compacted.text,
+        durationMs: Date.now() - started, tags: ['http_request'],
+      })
 
       return success({
         url,
@@ -94,6 +122,12 @@ export class HttpRequestTool extends Tool {
       })
     } catch (error: any) {
       const reason = error?.name === 'TimeoutError' ? 'timed out' : error?.message || String(error)
+      recordExchange(context, {
+        method: outbound.method, url: outbound.url,
+        requestHeaders: outbound.headers, requestBody: outbound.body,
+        status: 0, responseBody: reason,
+        durationMs: Date.now() - started, tags: ['http_request', 'error'],
+      })
       return failure(`${args.method || 'GET'} ${url} failed: ${reason}`)
     }
   }

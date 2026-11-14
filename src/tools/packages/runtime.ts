@@ -9,14 +9,16 @@
 import * as path from 'node:path';
 import { Tool } from '../types.js';
 import type { ToolContext, ToolResult, LlmCaller } from '../types.js';
-import { success, failure } from '../helpers.js';
+import { success, failure, egressOrDirect } from '../helpers.js';
 import { ensureDataDir } from '../deps.js';
 import { TrafficStore, EvidenceStore } from '../../analysis/runtime/records.js';
+import type { TrafficExchange } from '../../analysis/runtime/records.js';
+import { RecordingProxy } from '../../analysis/runtime/proxy.js';
 import { RuleSet, Notifier } from '../../analysis/runtime/policy.js';
 import { LlmPool, SideQuestionBus } from '../../analysis/runtime/llm.js';
 import { enrichAsset, buildReport } from '../../analysis/runtime/report.js';
 import type { Observation, ReportFinding } from '../../analysis/runtime/report.js';
-import type { InterceptAction, RuleMatch } from '../../analysis/runtime/policy.js';
+import type { InterceptAction, RuleMatch, Notice } from '../../analysis/runtime/policy.js';
 
 interface RuntimeState {
   traffic: TrafficStore;
@@ -28,6 +30,7 @@ interface RuntimeState {
   enriched: Map<string, ReturnType<typeof enrichAsset>>;
   trafficFile?: string;
   providersBound: boolean;
+  proxy?: RecordingProxy;
 }
 
 const states = new Map<string, RuntimeState>();
@@ -58,6 +61,51 @@ function getState(context: ToolContext): RuntimeState {
     states.set(key, state);
   }
   return state;
+}
+
+export interface OutboundRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * Apply this session's interception rules to an outbound request. Exported so
+ * the HTTP tool goes through the same rules the model sees: a rule that only
+ * answers a query is a suggestion, not a rule.
+ */
+export function interceptFor(context: ToolContext, request: OutboundRequest) {
+  return getState(context).rules.evaluate({
+    method: String(request.method || 'GET'),
+    url: String(request.url || ''),
+    headers: request.headers,
+    body: request.body,
+  });
+}
+
+type NotifyPost = (url: string, body: string) => Promise<{ ok: boolean; status: number }>;
+
+let notifyPost: NotifyPost = async (url, body) => {
+  const response = await egressOrDirect(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  }, 15_000);
+  return { ok: response.ok, status: response.status };
+};
+
+/** Replace the webhook transport (tests use this; production goes through egress). */
+export function setNotifyTransport(fn: NotifyPost | null): void {
+  notifyPost = fn || (async (url, body) => {
+    const response = await egressOrDirect(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body }, 15_000);
+    return { ok: response.ok, status: response.status };
+  });
+}
+
+/** Append one exchange to the session ledger (and its file mirror, if any). */
+export function recordExchange(context: ToolContext, input: Parameters<TrafficStore['record']>[0]): TrafficExchange {
+  return getState(context).traffic.record(input);
 }
 
 async function withTrafficMirror(context: ToolContext): Promise<RuntimeState> {
@@ -232,7 +280,8 @@ export class NotifyTool extends Tool {
     return { type: 'object', required: ['action'], properties: {
       action: { type: 'string', enum: ['send', 'list', 'stats'] },
       level: { type: 'string', enum: ['info', 'warn', 'error'] }, title: { type: 'string' },
-      body: { type: 'string' }, channel: { type: 'string' },
+      body: { type: 'string' }, channel: { type: 'string', enum: ['log', 'webhook', 'file'], description: 'log records locally only; webhook POSTs JSON to url; file appends to the data dir.' },
+      url: { type: 'string', description: 'webhook: destination URL (goes through the egress proxy).' },
     }};
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
@@ -241,7 +290,22 @@ export class NotifyTool extends Tool {
       switch (args.action) {
         case 'send': {
           if (!args.title) return failure('send needs a title');
-          const notice = await state.notices.send({ level: args.level, title: args.title, body: args.body, channel: args.channel });
+          const channel = String(args.channel || 'log');
+          let deliver: ((notice: Notice) => void | Promise<void>) | undefined;
+          if (channel === 'webhook') {
+            if (!args.url) return failure('the webhook channel needs a url');
+            deliver = async (notice) => {
+              const response = await notifyPost(String(args.url), JSON.stringify(notice));
+              if (!response.ok) throw new Error(`webhook returned ${response.status}`);
+            };
+          } else if (channel === 'file') {
+            deliver = async (notice) => {
+              const dir = await ensureDataDir('notices');
+              const { appendFile } = await import('node:fs/promises');
+              await appendFile(path.join(dir, 'notices.jsonl'), `${JSON.stringify(notice)}\n`, 'utf8');
+            };
+          }
+          const notice = await state.notices.send({ level: args.level, title: args.title, body: args.body, channel }, deliver);
           return success(notice);
         }
         case 'list': return success(state.notices.list(args.level));
@@ -265,6 +329,7 @@ export class LlmPoolTool extends Tool {
     return { type: 'object', required: ['action'], properties: {
       action: { type: 'string', enum: ['call', 'status', 'records', 'reset'] },
       prompt: { type: 'string' }, id: { type: 'string' }, limit: { type: 'integer' },
+      capture: { type: 'boolean', description: 'Also record the prompt and response text (bounded, off by default).' },
     }};
   }
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
@@ -274,7 +339,7 @@ export class LlmPoolTool extends Tool {
       switch (args.action) {
         case 'call': {
           if (!args.prompt) return failure('call needs a prompt');
-          return success(await state.pool.complete(String(args.prompt)));
+          return success(await state.pool.complete(String(args.prompt), args.capture === true));
         }
         case 'status': return success(state.pool.status());
         case 'records': return success(state.pool.records(args.limit));
@@ -401,8 +466,53 @@ export class AssessmentReportTool extends Tool {
   }
 }
 
+export class TrafficProxyTool extends Tool {
+  get name(): string { return 'traffic_proxy'; }
+  get dangerous(): boolean { return true; }
+  get description(): string {
+    return [
+      'A loopback recording proxy: point a client at it and its exchanges land in the traffic ledger, with an evidence snapshot for each.',
+      'action=start binds 127.0.0.1 (random port unless given); action=status reports the port and counters; action=stop closes it and its tunnels.',
+      'Plain HTTP is recorded in full. HTTPS arrives as a CONNECT tunnel: the tunnel is recorded as one entry, and the entry says the encrypted contents were not inspected.',
+    ].join(' ');
+  }
+  get parameters(): Record<string, any> {
+    return { type: 'object', required: ['action'], properties: {
+      action: { type: 'string', enum: ['start', 'stop', 'status'] },
+      port: { type: 'integer', minimum: 1, maximum: 65535 },
+    }};
+  }
+  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
+    try {
+      const state = await withTrafficMirror(context);
+      switch (args.action) {
+        case 'start': {
+          if (state.proxy) return success({ ...state.proxy.status(), note: 'already running' });
+          const proxy = new RecordingProxy({
+            store: state.traffic,
+            evidence: state.evidence,
+            port: args.port != null ? Number(args.port) : 0,
+          });
+          const address = await proxy.start();
+          state.proxy = proxy;
+          return success({ ...proxy.status(), ...address, note: 'configure this as the HTTP proxy of the client you want to record' });
+        }
+        case 'status': return success(state.proxy ? state.proxy.status() : { running: false });
+        case 'stop': {
+          if (!state.proxy) return success({ running: false, note: 'nothing was running' });
+          await state.proxy.stop();
+          state.proxy = undefined;
+          return success({ running: false });
+        }
+        default: return failure(`unknown action: ${args.action}`);
+      }
+    } catch (error) { return failure(error); }
+  }
+}
+
 export const RUNTIME_TOOLS = [
   new TrafficLogTool(),
+  new TrafficProxyTool(),
   new EvidenceTool(),
   new InterceptRuleTool(),
   new NotifyTool(),

@@ -40,16 +40,33 @@ behaviour testable on its own.
 
 `records.ts` keeps an append-only traffic ledger (secret headers redacted,
 bodies bounded) and write-once evidence snapshots with a SHA-256 hash that
-`verify()` recomputes. `policy.ts` holds interception rules — blocks are checked
-before allows, an unmatched request falls back to an approval, and an unusable
-model verdict never becomes an allow — plus notices that record deduplication,
-rate limits and delivery failures. `llm.ts` implements failover with a cooldown
-and a per-call record, and side questions whose answers stay out of the main
-context until explicitly read. `report.ts` enriches assets only from
+`verify()` recomputes. `proxy.ts` is a loopback recording proxy: plain HTTP is
+forwarded and recorded in full, HTTPS arrives as a CONNECT tunnel that is
+recorded as one entry saying its contents were not inspected. `policy.ts` holds
+interception rules — blocks are checked before allows, an unmatched request
+falls back to an approval, and an unusable model verdict never becomes an allow
+— plus notices that record deduplication, rate limits and delivery failures.
+`llm.ts` implements failover with a cooldown and a per-call record (payload
+capture is opt-in and bounded), and side questions whose answers stay out of the
+main context until explicitly read. `report.ts` enriches assets only from
 observations (unknown fields are listed, not guessed) and assembles the report.
 
+The rules are wired into the outbound path: `http_request` evaluates them before
+sending, refuses on a block, applies a rewrite, and records every exchange in
+the ledger. A rule that only answers a query would be a suggestion.
+
 Each of these has a tool in `src/tools/packages/runtime.ts`, registered in the
-default registry.
+default registry. Notices deliver through a webhook (via the egress proxy), a
+file, or a local log; a failed or suppressed delivery is recorded on the notice
+instead of being reported as sent.
+
+## Exposing tools over MCP (`src/tools/mcp_server.ts`)
+
+`mcp_serve` starts a loopback MCP server over the same registry: `initialize`,
+`tools/list`, `tools/call`, `ping`. It binds 127.0.0.1, generates a bearer token
+on start, and hides tools marked dangerous unless the caller opts in. An
+unauthenticated tool endpoint would be a remote-execution surface with a
+friendly name.
 
 ## Self-contained binary analysis (`x86/`)
 

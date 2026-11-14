@@ -25,6 +25,10 @@ export interface CallRecord {
   promptChars: number;
   responseChars: number;
   error?: string;
+  /** Present only when the caller asked to capture payloads. */
+  prompt?: string;
+  response?: string;
+  capturedTruncated?: boolean;
 }
 
 export interface Completion {
@@ -52,6 +56,7 @@ export class LlmPool {
       failureThreshold?: number;
       cooldownMs?: number;
       maxRecords?: number;
+      captureLimit?: number;
     } = {},
   ) {}
 
@@ -74,7 +79,7 @@ export class LlmPool {
     return false;
   }
 
-  async complete(prompt: string): Promise<Completion> {
+  async complete(prompt: string, capture = false): Promise<Completion> {
     const now = this.now();
     const threshold = Math.max(1, this.options.failureThreshold ?? 3);
     const cooldown = Math.max(1, this.options.cooldownMs ?? 30_000);
@@ -95,7 +100,7 @@ export class LlmPool {
         this.record({
           providerId: runtime.entry.id, ok: true, durationMs: this.now() - started,
           promptChars: prompt.length, responseChars: String(text).length,
-        });
+        }, capture ? { prompt, response: String(text) } : undefined);
         return { text: String(text), providerId: runtime.entry.id, attempts: tried.length };
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
@@ -107,7 +112,7 @@ export class LlmPool {
         this.record({
           providerId: runtime.entry.id, ok: false, durationMs: this.now() - started,
           promptChars: prompt.length, responseChars: 0, error: lastError,
-        });
+        }, capture ? { prompt, response: '' } : undefined);
       }
     }
     throw new Error(tried.length
@@ -115,8 +120,16 @@ export class LlmPool {
       : `no provider available: ${lastError}`);
   }
 
-  private record(row: Omit<CallRecord, 'id' | 'at'>): void {
-    this.log.push({ id: `call_${++this.seq}`, at: this.now(), ...row });
+  private record(row: Omit<CallRecord, 'id' | 'at' | 'prompt' | 'response' | 'capturedTruncated'>, capture?: { prompt: string; response: string }): void {
+    const limit = Math.max(64, this.options.captureLimit ?? 4000);
+    const payload = capture
+      ? {
+        prompt: capture.prompt.slice(0, limit),
+        response: capture.response.slice(0, limit),
+        capturedTruncated: capture.prompt.length > limit || capture.response.length > limit,
+      }
+      : {};
+    this.log.push({ id: `call_${++this.seq}`, at: this.now(), ...row, ...payload });
     const max = Math.max(1, this.options.maxRecords ?? 1000);
     if (this.log.length > max) this.log.splice(0, this.log.length - max);
   }
