@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { PlanTool, planFor, clearPlan } from './plan.js'
+import { PlanTool, planFor, clearPlan, diagramFor } from './plan.js'
 import type { ToolContext } from './types.js'
 
 // The plan tool is the handoff between "we agreed on a plan" and "now execute
@@ -144,4 +144,58 @@ test('the user intent is what the plan is judged against', async () => {
   await tool.execute({ markdown: FULL_PLAN }, reviewingContext('r6', llm, 70, 'turn the modal into a page'))
   assert.match(seen, /turn the modal into a page/)
   assert.match(seen, /Add provider kinds/)
+})
+
+test('a structured plan is validated, rendered and gets a diagram', async () => {
+  const ctx = context('structured')
+  clearPlan('structured')
+  const result = await tool.execute({
+    plan: {
+      goal: 'Add provider kinds',
+      assumptions: ['the store is the only writer'],
+      non_goals: ['changing the wire format'],
+      steps: [
+        { title: 'add Kind', files: ['core/internal/providers/store.go'], verify: 'go test ./internal/providers/', risk: 'low' },
+        { title: 'filter by kind', files: ['core/internal/gateway/providers.go'], verify: 'curl /api/providers?kind=tts', risk: 'med' },
+      ],
+      data_model: 'ProviderConfig gains kind',
+      api_changes: ['GET /api/providers?kind='],
+      migration: 'fill kind=llm on load',
+      rollback: 'revert the commit',
+      tests: ['go test ./internal/providers/'],
+      open_questions: ['should embeddings be its own kind?'],
+    },
+  }, ctx)
+  assert.equal(result.success, true, result.error)
+  const record = planFor('structured')
+  assert.ok(record)
+  assert.equal(record.steps, 2)
+  assert.match(record.markdown, /## Steps/)
+  assert.match(record.markdown, /## Open questions/)
+  assert.match(record.diagram || '', /^flowchart TD/)
+  assert.deepEqual(record.openQuestions, ['should embeddings be its own kind?'])
+  assert.deepEqual(record.missing, [], 'every block is present')
+  clearPlan('structured')
+})
+
+test('an incomplete structured plan lists every problem at once', async () => {
+  const result = await tool.execute({ plan: { goal: '', steps: [{ title: '' }] } }, context('incomplete'))
+  assert.equal(result.success, false)
+  assert.match(result.error || '', /goal is required/)
+  assert.match(result.error || '', /step 1 needs a title/)
+  assert.match(result.error || '', /step 1 needs a verify command/)
+})
+
+test('the diagram chains the steps in order', () => {
+  const doc = {
+    goal: 'g', assumptions: [], non_goals: [],
+    steps: [
+      { id: 's1', title: 'first', files: [], verify: 'v', risk: 'low' as const },
+      { id: 's2', title: 'second', files: [], verify: 'v', risk: 'high' as const },
+    ],
+    tests: [], open_questions: [],
+  }
+  const diagram = diagramFor(doc)
+  assert.match(diagram, /s1 --> s2/)
+  assert.match(diagram, /s2\["2\. second"\]/)
 })

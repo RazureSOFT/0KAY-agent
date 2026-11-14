@@ -13,6 +13,30 @@ import { PLAN_SUFFIX } from '../sandbox/policy.js';
 import { planVerdict, reviewPlan, type PlanReview } from '../agent/plan_review.js';
 import { reviewOptions } from '../agent/plan_review_options.js';
 
+export type PlanRisk = 'low' | 'med' | 'high';
+
+export interface PlanStep {
+  id: string;
+  title: string;
+  files: string[];
+  verify: string;
+  risk: PlanRisk;
+}
+
+/** The structured shape the planner submits alongside (or instead of) Markdown. */
+export interface PlanDoc {
+  goal: string;
+  assumptions: string[];
+  non_goals: string[];
+  steps: PlanStep[];
+  data_model?: string;
+  api_changes?: string[];
+  migration?: string;
+  rollback?: string;
+  tests: string[];
+  open_questions: string[];
+}
+
 export interface PlanRecord {
   title: string;
   markdown: string;
@@ -20,6 +44,10 @@ export interface PlanRecord {
   /** Sections a thorough plan usually has and this one does not. Advisory only. */
   missing: string[];
   demoHtml?: string;
+  structured?: PlanDoc;
+  /** Mermaid source, so the plan has a picture and not only prose. */
+  diagram?: string;
+  openQuestions?: string[];
   createdAt: number;
 }
 
@@ -73,23 +101,64 @@ export class PlanTool extends Tool {
           type: 'string',
           description: 'Optional self-contained HTML demo of the intended result (layout, flow, UI). Rendered in a sandboxed preview next to the plan.',
         },
+        plan: {
+          type: 'object',
+          description: 'Structured plan: {goal, assumptions[], non_goals[], steps:[{id,title,files[],verify,risk}], data_model?, api_changes[]?, migration?, rollback?, tests[], open_questions[]}. When given it is validated, and rendered into the Markdown if markdown is omitted.',
+          properties: {
+            goal: { type: 'string' },
+            assumptions: { type: 'array', items: { type: 'string' } },
+            non_goals: { type: 'array', items: { type: 'string' } },
+            steps: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['title', 'verify'],
+                properties: {
+                  id: { type: 'string' },
+                  title: { type: 'string' },
+                  files: { type: 'array', items: { type: 'string' } },
+                  verify: { type: 'string' },
+                  risk: { type: 'string', enum: ['low', 'med', 'high'] },
+                },
+              },
+            },
+            data_model: { type: 'string' },
+            api_changes: { type: 'array', items: { type: 'string' } },
+            migration: { type: 'string' },
+            rollback: { type: 'string' },
+            tests: { type: 'array', items: { type: 'string' } },
+            open_questions: { type: 'array', items: { type: 'string' } },
+          },
+        },
       },
       required: ['markdown'],
     };
   }
 
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    const markdown = String(args.markdown || '').trim();
+    const parsed = parsePlanDoc(args.plan);
+    if (parsed.problems.length) {
+      return failure(`the structured plan is incomplete:\n- ${parsed.problems.join('\n- ')}`);
+    }
+    const doc = parsed.doc;
+    let markdown = String(args.markdown || '').trim();
+    if (!markdown && doc) markdown = renderPlanDoc(doc);
     if (markdown.length < 80) {
       return failure('the plan is too short to be actionable — write the problem, the steps with file paths, and how to verify');
     }
-    const missing = SECTIONS.filter((section) => !section.test.test(markdown)).map((section) => section.id);
+    const missing = doc
+      ? missingSections(doc)
+      : SECTIONS.filter((section) => !section.test.test(markdown)).map((section) => section.id);
+    const diagram = doc ? diagramFor(doc) : '';
     const record: PlanRecord = {
-      title: String(args.title || firstHeading(markdown) || 'Plan').slice(0, 160),
+      title: String(args.title || doc?.goal || firstHeading(markdown) || 'Plan').slice(0, 160),
       markdown,
-      steps: countSteps(markdown),
+      steps: doc ? doc.steps.length : countSteps(markdown),
       missing,
       ...(args.demo_html ? { demoHtml: String(args.demo_html) } : {}),
+      ...(doc ? { structured: doc } : {}),
+      ...(diagram ? { diagram } : {}),
+      ...(doc && doc.open_questions.length ? { openQuestions: doc.open_questions } : {}),
       createdAt: Date.now(),
     };
 
@@ -124,7 +193,7 @@ export class PlanTool extends Tool {
         progress: 100,
         phase: 'done',
         note: `plan ready: ${record.title}`,
-        plan: JSON.stringify({ title: record.title, markdown, steps: record.steps, demo_html: record.demoHtml || '' }),
+        plan: JSON.stringify({ title: record.title, markdown, steps: record.steps, demo_html: record.demoHtml || '', structured: record.structured || null, diagram: record.diagram || '', open_questions: record.openQuestions || [] }),
       })
       .catch(() => undefined);
 
@@ -146,6 +215,97 @@ export class PlanTool extends Tool {
  * existed. A review that could not run comes back degraded and passes; see
  * plan_review.ts.
  */
+
+const RISKS: PlanRisk[] = ['low', 'med', 'high'];
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((entry) => String(entry).trim()).filter(Boolean) : [];
+}
+
+/**
+ * Validate the structured plan. Problems come back together, not one at a
+ * time: a planner that has to resubmit five times to discover five missing
+ * fields is being punished for the tool's error reporting.
+ */
+export function parsePlanDoc(raw: unknown): { doc: PlanDoc | null; problems: string[] } {
+  if (!raw || typeof raw !== 'object') return { doc: null, problems: [] };
+  const source = raw as Record<string, any>;
+  const problems: string[] = [];
+  const goal = String(source.goal || '').trim();
+  if (!goal) problems.push('goal is required');
+  const rawSteps = Array.isArray(source.steps) ? source.steps : [];
+  if (!rawSteps.length) problems.push('at least one step is required');
+  const steps: PlanStep[] = rawSteps.map((entry: any, index: number) => {
+    const title = String(entry?.title || '').trim();
+    const verify = String(entry?.verify || '').trim();
+    if (!title) problems.push(`step ${index + 1} needs a title`);
+    if (!verify) problems.push(`step ${index + 1} needs a verify command (a test, a command, or a file to inspect)`);
+    const risk = String(entry?.risk || 'med').toLowerCase() as PlanRisk;
+    return {
+      id: String(entry?.id || `s${index + 1}`),
+      title: title || `step ${index + 1}`,
+      files: stringList(entry?.files),
+      verify,
+      risk: RISKS.includes(risk) ? risk : 'med',
+    };
+  });
+  const doc: PlanDoc = {
+    goal,
+    assumptions: stringList(source.assumptions),
+    non_goals: stringList(source.non_goals),
+    steps,
+    ...(source.data_model ? { data_model: String(source.data_model) } : {}),
+    ...(stringList(source.api_changes).length ? { api_changes: stringList(source.api_changes) } : {}),
+    ...(source.migration ? { migration: String(source.migration) } : {}),
+    ...(source.rollback ? { rollback: String(source.rollback) } : {}),
+    tests: stringList(source.tests),
+    open_questions: stringList(source.open_questions),
+  };
+  return { doc: problems.length ? null : doc, problems };
+}
+
+export function renderPlanDoc(doc: PlanDoc): string {
+  const lines = [`# ${doc.goal}`];
+  if (doc.assumptions.length) lines.push('', '## Assumptions', ...doc.assumptions.map((item) => `- ${item}`));
+  if (doc.non_goals.length) lines.push('', '## Non-goals', ...doc.non_goals.map((item) => `- ${item}`));
+  lines.push('', '## Steps');
+  doc.steps.forEach((step, index) => {
+    lines.push(`${index + 1}. **${step.title}** - files: ${step.files.join(', ') || '(none)'}; verify: ${step.verify}; risk: ${step.risk}`);
+  });
+  if (doc.data_model) lines.push('', '## Data model', '', doc.data_model);
+  if (doc.api_changes?.length) lines.push('', '## API changes', ...doc.api_changes.map((item) => `- ${item}`));
+  if (doc.migration) lines.push('', '## Migration', '', doc.migration);
+  if (doc.rollback) lines.push('', '## Rollback', '', doc.rollback);
+  if (doc.tests.length) lines.push('', '## Tests', ...doc.tests.map((item) => `- ${item}`));
+  if (doc.open_questions.length) lines.push('', '## Open questions', ...doc.open_questions.map((item) => `- ${item}`));
+  return lines.join('\n');
+}
+
+/** The eight blocks the review asks for, judged on the structured plan. */
+export function missingSections(doc: PlanDoc): string[] {
+  const missing: string[] = [];
+  if (!doc.assumptions.length) missing.push('assumptions');
+  if (!doc.non_goals.length) missing.push('non_goals');
+  if (!doc.steps.every((step) => step.files.length)) missing.push('files');
+  if (!doc.data_model) missing.push('data_model');
+  if (!doc.api_changes?.length) missing.push('api_changes');
+  if (!doc.migration) missing.push('migration');
+  if (!doc.rollback) missing.push('rollback');
+  if (!doc.tests.length) missing.push('tests');
+  return missing;
+}
+
+export function diagramFor(doc: PlanDoc): string {
+  if (!doc.steps.length) return '';
+  const lines = ['flowchart TD'];
+  doc.steps.forEach((step, index) => {
+    const label = `${index + 1}. ${step.title}`.replace(/["\n]/g, ' ').slice(0, 80);
+    lines.push(`  s${index + 1}["${label}"]`);
+    if (index > 0) lines.push(`  s${index} --> s${index + 1}`);
+  });
+  return lines.join('\n');
+}
+
 async function reviewPlanIfConfigured(
   record: PlanRecord,
   context: ToolContext,
@@ -182,6 +342,8 @@ async function savePlan(cwd: string, record: PlanRecord): Promise<string> {
     const file = path.join(dir, `${slug}${PLAN_SUFFIX}`);
     const header = `<!-- 0kay plan · ${new Date(record.createdAt).toISOString()} · ${record.steps} steps -->\n\n`;
     await fs.writeFile(file, header + record.markdown + '\n', 'utf8');
+    if (record.diagram) await fs.writeFile(path.join(dir, `${slug}.diagram.mmd`), record.diagram, 'utf8');
+    if (record.demoHtml) await fs.writeFile(path.join(dir, `${slug}.demo.html`), record.demoHtml, 'utf8');
     return file;
   } catch {
     // A plan that could not be written is still a plan; the card and the
