@@ -4,6 +4,9 @@ import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import { egressOrDirect } from './helpers.js';
+import { readable } from './readable.js';
+import { looksLikeAppShell, missingBrowserMessage } from './browser_fallback.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -201,7 +204,7 @@ export class BrowserController {
 
   private async launch(): Promise<void> {
     const executable = await this.findExecutable();
-    if (!executable) throw new Error('no Chrome/Chromium/Edge found; set OKAY_BROWSER_PATH to the browser executable');
+    if (!executable) throw new Error(missingBrowserMessage('start'));
     this.headless = true;
     this.profileDir = await fs.mkdtemp(path.join(os.tmpdir(), '0kay-browser-'));
     const args = [
@@ -403,8 +406,8 @@ export class BrowserController {
       case 'newtab': return this.newTab(args);
       case 'activate': return this.activateTab(args);
       case 'closetab': return this.closeTab(args);
-      case 'text': return { url: await this.currentUrl(), text: String(await this.evaluate('document.body ? document.body.innerText : ""')) };
-      case 'html': return { url: await this.currentUrl(), html: String(await this.evaluate('document.documentElement ? document.documentElement.outerHTML : ""')) };
+      case 'text': return this.readText(args);
+      case 'html': return this.readHtml(args);
       case 'click': return this.click(args);
       case 'type': return this.type(args);
       case 'press': return this.press(args);
@@ -425,6 +428,10 @@ export class BrowserController {
 
   private async goto(url: string, timeoutMs: number): Promise<any> {
     if (!/^https?:\/\//i.test(url)) throw new Error('url must be an http(s) URL');
+    // No engine: read it over HTTP instead of refusing. "What does this page
+    // say" is answerable without a browser for most pages, and refusing was
+    // making a model give up on something it could have done.
+    if (!(await this.findExecutable())) return this.fetchFallback(url, timeoutMs);
     const cdp = await this.ensureConnection();
     await cdp.send('Page.navigate', { url }, timeoutMs).catch(() => {});
     const deadline = Date.now() + timeoutMs;
@@ -435,6 +442,88 @@ export class BrowserController {
     }
     await this.settle(300);
     return { url: await this.currentUrl(), title: String(await this.evaluate('document.title').catch(() => '')) };
+  }
+
+  /** The last URL read over HTTP, for text/html when there is no engine. */
+  private lastFetch: { url: string; finalUrl: string } | null = null;
+
+  /**
+   * Read a URL without a browser.
+   *
+   * Goes through egressOrDirect, not fetch, so this path is subject to the same
+   * SSRF guard as every other outbound call — a fallback that bypassed the guard
+   * would be a way to reach the metadata endpoint that the browser path cannot.
+   */
+  private async fetchFallback(url: string, timeoutMs: number): Promise<any> {
+    const response = await egressOrDirect(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(Math.max(1000, timeoutMs)),
+    }, timeoutMs);
+    const body = await response.text().catch(() => '');
+    const contentType = response.headers.get('content-type') || '';
+    const extracted = readable(body, contentType);
+    // Remember where we are, so a following `text`/`html` knows what to read.
+    this.lastFetch = { url, finalUrl: response.url || url };
+    this.touch({ url: response.url || url, title: extracted.title || '' });
+    const shell = looksLikeAppShell(body, extracted.content);
+    return {
+      fetched: true,
+      url,
+      finalUrl: response.url || url,
+      status: response.status,
+      contentType,
+      title: extracted.title || '',
+      text: extracted.content,
+      ...(shell
+        ? { note: 'the HTML carries almost no text and looks like an app shell; this page fills itself in with JavaScript, so a browser is needed to read its real content' }
+        : {}),
+    };
+  }
+
+  /** Run a browser action, or refuse clearly when the action needs an engine. */
+  private requireEngine(command: string): void {
+    throw new Error(missingBrowserMessage(command));
+  }
+
+  /** Read the current page's text — over HTTP when there is no engine. */
+  private async readText(args: Record<string, any>): Promise<any> {
+    if (!(await this.findExecutable())) {
+      // With a URL but no engine, this is a fetch. Without one there is nothing
+      // to read, and saying so beats an obscure DevTools failure.
+      const url = String(args.url || this.lastFetch?.finalUrl || '');
+      if (!url) this.requireEngine('text');
+      const page = await this.fetchFallback(url, Number(args.timeout) || 30000);
+      return { url: page.finalUrl, text: page.text, fetched: true, ...(page.note ? { note: page.note } : {}) };
+    }
+    return { url: await this.currentUrl(), text: String(await this.evaluate('document.body ? document.body.innerText : ""')) };
+  }
+
+  /** Read the current page's HTML — a fetch when there is no engine. */
+  private async readHtml(args: Record<string, any>): Promise<any> {
+    if (!(await this.findExecutable())) {
+      const url = String(args.url || this.lastFetch?.finalUrl || '');
+      if (!url) this.requireEngine('html');
+      const response = await egressOrDirect(url, {
+        method: 'GET',
+        headers: { Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(Number(args.timeout) || 30000),
+      }, Number(args.timeout) || 30000);
+      const body = await response.text().catch(() => '');
+      this.lastFetch = { url, finalUrl: response.url || url };
+      return {
+        url: response.url || url,
+        html: body,
+        fetched: true,
+        note: 'this is the raw HTML as served; a browser would run the page\'s JavaScript before it was read',
+      };
+    }
+    return { url: await this.currentUrl(), html: String(await this.evaluate('document.documentElement ? document.documentElement.outerHTML : ""')) };
   }
 
   private async screenshot(args: Record<string, any>): Promise<any> {
