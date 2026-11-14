@@ -43,6 +43,7 @@ import { PluginHost, toRegistryTool } from '../plugins/host.js';
 import { agentEvents } from './events.js';
 import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
 import { planReviewOptions } from './plan_review_options.js';
+import { applyRoleBrief, childOptions, resolveRole, roleAllowsTool, roleForAgentType } from './roles.js';
 import { FactMemory } from './facts.js';
 import { PermissionLedger } from './permission.js';
 import { prepareTurn, libraryFor } from './library.js';
@@ -1037,6 +1038,18 @@ export class Agent {
       };
       if (depth === 0) {
         try { await ensureAgentWorkspace(cwd) } catch { }
+      }
+      // A role is what this task is for. The brief goes on the first user
+      // message rather than the system prompt so it reads as part of the job
+      // rather than as standing policy, and so the system-prompt token budget
+      // stays about the tool surface.
+      const role = resolveRole(options.agent_role) || roleForAgentType(type);
+      if (role) {
+        context.history[0] = { role: 'user', content: applyRoleBrief(prompt, role) };
+        // A read-only role must be read-only in the sandbox too, or it would be
+        // handed a writable sandbox and refused at the tool gate instead, which
+        // reads as a bug rather than as the role's contract.
+        if (role.readOnly) context.options.read_only_tools = '1';
       }
       context.ledger = new ContextLedger(() => context.history);
       const supervisor = new DeliverySupervisor();
@@ -2049,6 +2062,17 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     if (context.options.read_only_tools === '1' && !EXPLORE_READ_ONLY_TOOLS.has(toolCall.name)) {
       return { success: false, data: null, error: `${toolCall.name} is disabled: explorer sub-agents run strictly read-only` };
     }
+    // The role's tool contract. A planner that writes is a worker that skipped
+    // the plan; a tester that edits source is verifying its own fix. Both were
+    // allowed before this check, because a role used to be a prompt-only notion.
+    const role = resolveRole(context.options.agent_role);
+    if (!roleAllowsTool(role, toolCall.name)) {
+      return {
+        success: false,
+        data: null,
+        error: `${toolCall.name} is disabled: the ${role?.name || 'current'} role may not call it${role ? `. ${role.summary}` : ''}`,
+      };
+    }
     // A deferred tool is still callable by name; loading its group here is what
     // makes progressive disclosure safe rather than a guessing game.
     const toolGroup = groupOf(toolCall.name);
@@ -2098,7 +2122,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
         : async (subPrompt, subType) => {
             const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
             return this.recorder.run('subagent', subPrompt, context.taskId, context.sessionId,
-              () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, context.options),
+              () => this.executeTaskInternal(subTaskId, subPrompt, subType || agentType, depth + 1, context.sessionId, childOptions(context.options)),
               subTaskId);
           },
       // The policy every write and shell call is checked against. Defaults to
@@ -2118,7 +2142,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
             spawn: (spec: any) => this.subagents.spawn(spec, () => {
               const subTaskId = `${context.taskId}:sub:${randomUUID()}`;
               return this.recorder.run('subagent', spec.prompt, context.taskId, context.sessionId,
-                () => this.executeTaskInternal(subTaskId, spec.prompt, spec.agentType || agentType, depth + 1, context.sessionId, context.options),
+                () => this.executeTaskInternal(subTaskId, spec.prompt, spec.agentType || agentType, depth + 1, context.sessionId, childOptions(context.options)),
                 subTaskId);
             }),
             list: () => this.subagents.list(),
