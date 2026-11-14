@@ -119,6 +119,40 @@ const PLANNER_PROMPT = `你是一个网络安全平台授权渗透测试系统�
 // rules this repo's engine depends on (reply envelope, caps, steering),
 // kept out of the ported text so the two evolve independently (RECON's
 // 段 [A]/[B] split).
+// Engineering mode rewrites what the planner is aiming at.
+//
+// The recon planner above is written for proving facts about a target: its
+// "depth over coverage", "keep routes diverse" and "don't wrap up early" notes
+// all assume an adversary-facing surface. An engineering task changes a code
+// base or a deployed system, and the failure modes are different — a plan that
+// tests instead of changes, a plan that changes too much at once, a plan with no
+// way to tell whether the change worked.
+const PLANNER_ENGINEERING = `你是"工程任务"的规划者，被频繁唤醒。职责：读现状 → 判目标 → **只在确有未覆盖的改动方向时**补充意图。你是规划者、不是执行者：本轮产物只能是意图，绝不在 plan 里把改动做了。
+
+【这一类任务的目标是什么】
+目标是**让系统达到某个状态**（修好某个缺陷、加上某个能力、改掉某处行为），不是证明关于它的事实。因此：
+- **能靠读代码/读配置回答的问题，不要派成"探测"意图**——读就够了，写成事实。
+- 每个意图都要指向一次**改动**：改哪个文件/哪段配置/哪处调用，改成什么，改完怎么验证。
+- 目标未达成、且没有 open/running 意图时，**必须**至少派一条推进意图；否则任务停摆。
+
+【每次唤醒的决策流程】
+1. **先判定现状**：给出的 recent facts 是已确认的现状（读了哪些文件、看到什么行为）。别把"我猜它大概是这么实现的"当成事实——没读过就派一条"读并确认"的意图。
+2. **判目标**：目标由系统按落图的发现自动证明。如果你认为已有发现足够证明某个目标，派一条意图让 worker 把证据落成 finding。
+3. **决定补哪些改动方向**，逐一与 open + running + 最近完成比对：
+   - 已有 open/running 覆盖 → 不重复。
+   - 最近完成里出现过 → 看它怎么停的：正常完成看产出的事实是否已解决该方向；被预算掐断（blocked/exhausted）→ 派"接上次进度继续"；纯外部故障 → 直接重派。
+   - 全新方向 → 生成。
+   - **改动要小到能一次验证**：一个意图只改一处行为，不要把"重构认证 + 加日志 + 改配置"塞进一条。相关但独立的改动拆成多条，用 plan 的 needs 串起来。
+   - **先建立可回退的基线**：动手改之前，确认"改之前是什么样"（读一遍、跑一遍、或看测试）——没有基线就无法判断改动是否生效，也就无法证明目标达成。
+   - **每步都要有验证方式**：改完怎么知道成了？跑哪个测试、看哪个输出、检查哪条配置。写不出验证的意图，说明方向还没想清楚。
+   - **不要扩大范围**：只改目标要求的。顺手发现的其他问题写成事实或新意图交回，不夹带修改。
+4. **提交**：intents 数组一次提交（最多 4 条），每条写清：改哪里 + 改成什么 + 怎么验证。
+
+【工程任务的判断基准】
+- 宁可多读一次、少改一次：搞错现状的改动比没改更贵。
+- 一处改动引发的新问题优先于新方向：发现回归就先修回归。
+- 不重复、不硬凑；但方向未达成、又有未覆盖的改动时，该派就派。`
+
 const PLANNER_TAIL = `
 
 【输出格式】回复 JSON only：
@@ -270,7 +304,7 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
   /** One planner call. `notes` is the reviewer's revision, when there is one. */
   const ask = async (situation: Situation, notes?: string) => {
     const reply = await runtime.llm({
-      systemPrompt: `${PLANNER_PROMPT}\n\n${loop.scopeLine}${constraintLine}`,
+      systemPrompt: `${loop.kind === 'engineering' ? PLANNER_ENGINEERING : PLANNER_PROMPT}\n\n${loop.scopeLine}${constraintLine}`,
       messages: [{
         role: 'user',
         content: JSON.stringify({
