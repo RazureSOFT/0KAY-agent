@@ -447,6 +447,20 @@ async function registerWithCore(proto: any): Promise<string | null> {
             help: '最小 1。提议之间有 6 小时冷却，不会反复弹。',
           },
           {
+            key: 'github_oauth_client_id',
+            type: 'text',
+            label: 'GitHub OAuth Client ID',
+            defaultValue: '',
+            help: 'GitHub App 页面上的 Client ID，公开值。',
+          },
+          {
+            key: 'github_oauth_client_secret',
+            type: 'text',
+            label: 'GitHub OAuth Client Secret',
+            defaultValue: '',
+            help: '点 GitHub App 页面上的 Generate a client secret 得到；只显示一次。',
+          },
+          {
             key: 'github_oauth_scope',
             type: 'text',
             label: 'GitHub 授权 scope',
