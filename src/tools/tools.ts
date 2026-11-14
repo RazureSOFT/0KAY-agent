@@ -44,6 +44,7 @@ import { ScreenshotToCodeTool } from './screenshot_to_code.js';
 import { ReverseEngineerTool } from './reverse_engineer.js';
 import { PentestTool } from './pentest.js';
 import { DiagramTool } from './diagram.js';
+import { ArchitectureTool } from './architecture.js';
 import { SetupDepsTool } from './setup_deps.js';
 import { GitHubSearchTool } from './github_search.js';
 import { BackgroundTaskTool } from './background_task.js';
@@ -1301,7 +1302,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new SubAgentTool(), new ToolsTool(), new ReconGraphTool(), new ValidateFindingTool(), new GhidraAnalyzeTool(), new HttpRequestTool(), new VulnKbTool(), new OsintTool(), new DeepScanTool(), new ExploitRuntimeTool(), new AssessmentsTool(), new SessionTool(), ...RECON_OPS_TOOLS,
     new WebFetchTool(), new WebSearchTool(), new PaperSearchTool(), new ApiDocSearchTool(), new TodoWriteTool(), new ProgressTool(), new IntentTool(), new FactTool(), new PlanTool(), new SkillTool(skills), new TaskTool(), new McpTool(), new ComputerUseTool(),
     new BrowserTool(), new DocumentTool(), new SlidesTool(), new ResearchTool(),
-    new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new SetupDepsTool(),
+    new ScrapeTool(), new CrawlTool(), new ScreenshotToCodeTool(), new ReverseEngineerTool(), new PentestTool(), new DiagramTool(), new ArchitectureTool(), new SetupDepsTool(),
     new GitHubSearchTool(), new BackgroundTaskTool(), new ReportArtifactsTool(),
     new TaskListTool(), new TaskOutputTool(), new TaskStopTool(), new SleepTool(), new MonitorTool(),
     new ShellSessionTool(),

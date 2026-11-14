@@ -42,8 +42,8 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   },
   analysis: {
     label: 'analysis',
-    hint: 'static binary analysis (incl. Ghidra), web assessment, PoC validation, recon graphs, background assessment tasks, diagrams',
-    tools: ['reverse_engineer', 'pentest', 'diagram', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'assessments', 'exploit_runtime'],
+    hint: 'static binary analysis (incl. Ghidra), web assessment, PoC validation, recon graphs, background assessment tasks, diagrams, workspace architecture maps',
+    tools: ['reverse_engineer', 'pentest', 'diagram', 'architecture', 'screenshot_to_code', 'recon_graph', 'validate_finding', 'ghidra_analyze', 'http_request', 'vuln_kb', 'osint', 'deep_scan', 'assessments', 'exploit_runtime'],
   },
   reconOps: {
     label: 'recon ops',
