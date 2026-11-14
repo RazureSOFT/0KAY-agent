@@ -58,7 +58,7 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
   context: {
     label: 'context',
     hint: 'compressing and searching this conversation',
-    tools: ['compress', 'decompress', 'search_context'],
+    tools: ['compress', 'decompress', 'search_context', 'code_search'],
   },
   evolve: {
     label: 'evolve',

@@ -46,6 +46,7 @@ import { PentestTool } from './pentest.js';
 import { DiagramTool } from './diagram.js';
 import { ArchitectureTool } from './architecture.js';
 import { ForgeTool } from './forge.js';
+import { CodeSearchTool } from './code_search.js';
 import { SetupDepsTool } from './setup_deps.js';
 import { GitHubSearchTool } from './github_search.js';
 import { BackgroundTaskTool } from './background_task.js';
@@ -1308,7 +1309,7 @@ export function createDefaultRegistry(skills: SkillRegistry = getSkillRegistry()
     new TaskListTool(), new TaskOutputTool(), new TaskStopTool(), new SleepTool(), new MonitorTool(),
     new ShellSessionTool(),
     new EvolveBeginTool(), new EvolveCommitTool(), new EvolveUpstreamTool(), new EvolveFinishTool(),
-    new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new AcpStatusTool(),
+    new CompressContextTool(), new DecompressContextTool(), new SearchContextTool(), new CodeSearchTool(), new AcpStatusTool(),
   ]) registry.register(tool);
   return registry;
 }
