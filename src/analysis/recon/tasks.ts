@@ -292,10 +292,20 @@ export class AssessmentManager {
     if (!this.dir) return
     try {
       await writeFileAtomic(path.join(this.dir, `${state.id}.json`), JSON.stringify(state))
-    } catch {
-      // Persistence is best-effort; the run continues in memory.
+    } catch (error: any) {
+      // Persistence stays best-effort — the run continues in memory — but a
+      // silent failure is worse than a noisy one: a task that never reaches disk
+      // disappears on the next restart, and this catch used to be the only place
+      // that knew why. Say it once per run, not once per event.
+      if (!this.persistWarned.has(state.id)) {
+        this.persistWarned.add(state.id)
+        console.warn(`[assessments] cannot persist ${state.id} to ${this.dir}: ${error?.message || error}`)
+      }
     }
   }
+
+  /** Which tasks have already reported a persistence failure. */
+  private readonly persistWarned = new Set<string>()
 
   async create(spec: AssessmentSpec, sessionId: string, runtime: LoopRuntime): Promise<AssessmentState> {
     await this.ensureLoaded()

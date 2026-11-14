@@ -298,3 +298,21 @@ test('a finished run harvests its findings into durable rows', async () => {
   manager['harvestFindings']((await manager.get(state.id)).state, graph)
   assert.equal(manager.findings.forTask(state.id).length, 1, 'harvest is idempotent')
 })
+
+test('list spans sessions when asked, so the tasks tab cannot lose a task', async () => {
+  const graph = new ReconGraph()
+  const manager = managerFor(graph)
+  const runtime = fakeRuntime({ planner: [], worker: '{"facts":[]}' })
+
+  // Two tasks in two different conversations. Scoped listing sees one; the tasks
+  // tab needs both, because it is not a per-conversation view.
+  const first = await manager.create({ objective: 'first', targets: ['a.example'] }, 'session-a', runtime)
+  const second = await manager.create({ objective: 'second', targets: ['b.example'] }, 'session-b', runtime)
+
+  const scoped = await manager.list('session-a')
+  assert.deepEqual(scoped.map((row) => row.id), [first.id])
+
+  const all = await manager.list()
+  assert.equal(all.length, 2)
+  assert.deepEqual(new Set(all.map((row) => row.id)), new Set([first.id, second.id]))
+})

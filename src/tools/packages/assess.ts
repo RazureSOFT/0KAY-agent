@@ -36,6 +36,7 @@ export class AssessmentsTool extends Tool {
         timeoutMs: { type: 'integer', minimum: 10000, maximum: 3600000 },
         id: { type: 'string', description: 'get/control/hint/report/findings: the task id.' },
         finding_id: { type: 'string', description: 'retests/retest: the durable finding row id (from findings).' },
+        all: { type: 'boolean', description: 'list: every session\'s tasks, not just this one. The tasks tab uses it so a task does not disappear when the conversation changes.' },
         operation: { type: 'string', enum: ['pause', 'resume', 'cancel', 'delete'], description: 'control: what to do.' },
         text: { type: 'string', description: 'hint: steering for the planner.' },
         path: { type: 'string', description: 'report: output file, default assessment-<id>.md in the working directory.' },
@@ -78,7 +79,9 @@ export class AssessmentsTool extends Tool {
           })
         }
         case 'list':
-          return success({ tasks: await manager.list(sessionId) })
+          // `all` widens the read to every session. The tasks tab asks for it;
+          // a caller that wants one session's tasks keeps the default.
+          return success({ tasks: await manager.list(args.all === true ? undefined : sessionId) })
         case 'get':
           return success(await manager.get(String(args.id || '')))
         case 'control': {
