@@ -80,6 +80,33 @@ const ALWAYS_SAFE_TOOLS = new Set([
   'set_goals', 'set_constraints', 'search_all_worker_traces', 'get_worker_trace',
 ]);
 
+/**
+ * Tools whose approval depends on the arguments, not the name.
+ *
+ * The rule below is "a tool is exempt only when it cannot act on the world", and
+ * for most tools the name settles that. A few have both a read mode and a write
+ * mode, and judging those by name alone gets it wrong in one direction or the
+ * other: making the whole tool safe would let its write mode through, and gating
+ * the whole tool means the read mode waits for an approval nobody is there to
+ * give — which is exactly what a direct call from a UI panel does, since the
+ * panel is the thing that would have asked.
+ *
+ * Each entry names the argument that decides and the values that mean "nothing
+ * is touched". Anything else stays gated.
+ */
+const ARGUMENT_EQUIVALENT_READS: Record<string, { field: string; readOnly: string[] }> = {
+  // Derive and report: no file is written, so there is nothing to approve.
+  // `draw` and `save` write, and stay gated.
+  architecture: { field: 'action', readOnly: ['scan', 'diff'] },
+};
+
+function readOnlyInvocation(tool: string, args: Record<string, any>): boolean {
+  const rule = ARGUMENT_EQUIVALENT_READS[tool];
+  if (!rule) return false;
+  const value = String(args?.[rule.field] ?? '').trim().toLowerCase();
+  return rule.readOnly.includes(value);
+}
+
 function envCount(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
   if (!Number.isFinite(parsed) || parsed < min) return fallback;
@@ -2716,7 +2743,7 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
     // hole — `computeruse` and `browser` drive the screen and the network, and
     // an MCP server named "mail" is still an arbitrary server chosen by whoever
     // configured it. Name-based privilege is not privilege; ask the user.
-    if (!this.autoApproved(tool) && !ALWAYS_SAFE_TOOLS.has(tool)) {
+    if (!this.autoApproved(tool) && !ALWAYS_SAFE_TOOLS.has(tool) && !readOnlyInvocation(tool, parsed)) {
       try {await this.approvals.request(directId,'direct',tool,parsed,process.cwd())}
       catch(error:any) {return {success:false,result:'',error:error.message}}
     }

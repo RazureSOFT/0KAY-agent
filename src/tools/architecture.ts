@@ -68,6 +68,11 @@ export class ArchitectureTool extends Tool {
             action,
             root,
             architecture: describeArchitecture(arch),
+            // The panel renders from these rather than re-parsing the prose
+            // summary: a summary is for reading, and reversing it is guesswork.
+            mermaid: architectureToMermaid(arch, path.basename(root)),
+            nodes: arch.modules.map((module) => ({ id: module.id, label: module.label, files: module.files, lines: module.lines, languages: module.languages, orphan: module.orphan })),
+            links: arch.edges.map((edge) => ({ from: edge.from, to: edge.to, weight: edge.weight })),
             modules: arch.modules.length,
             totalModules: arch.total,
             sourceFiles: arch.sourceFiles,
@@ -83,6 +88,9 @@ export class ArchitectureTool extends Tool {
           action,
           root,
           architecture: describeArchitecture(arch),
+          mermaid: architectureToMermaid(arch, path.basename(root)),
+          nodes: arch.modules.map((module) => ({ id: module.id, label: module.label, files: module.files, lines: module.lines, languages: module.languages, orphan: module.orphan })),
+          links: arch.edges.map((edge) => ({ from: edge.from, to: edge.to, weight: edge.weight })),
           modules: arch.modules.length,
           totalModules: arch.total,
           sourceFiles: arch.sourceFiles,
