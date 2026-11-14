@@ -43,6 +43,7 @@ import { PluginHost, toRegistryTool } from '../plugins/host.js';
 import { agentEvents } from './events.js';
 import { QualityGate, resolveGateMode, type GateMode } from './gate.js';
 import { planReviewOptions } from './plan_review_options.js';
+import { ForgeTool } from '../tools/forge.js';
 import { applyRoleBrief, childOptions, resolveRole, roleAllowsTool, roleForAgentType } from './roles.js';
 import { FactMemory } from './facts.js';
 import { PermissionLedger } from './permission.js';
@@ -221,6 +222,8 @@ export interface AgentSettings {
   self_evolve_enabled?: boolean;
   self_evolve_repo?: string;
   github_token?: string;
+  /** Token for GitLab (including self-hosted). */
+  gitlab_token?: string;
   evolve_branch_prefix?: string;
   vision_model?: string;
   context_window?: number;
@@ -419,6 +422,7 @@ export class Agent {
       self_evolve_enabled: false,
       self_evolve_repo: '',
       github_token: '',
+      gitlab_token: '',
       evolve_branch_prefix: 'self/',
       vision_model: '',
       context_window: 0,
@@ -498,8 +502,12 @@ export class Agent {
     }
     if (typeof partial.self_evolve_repo === 'string') this.settings.self_evolve_repo = partial.self_evolve_repo;
     if (typeof partial.github_token === 'string') this.settings.github_token = partial.github_token.trim();
+    if (typeof partial.gitlab_token === 'string') this.settings.gitlab_token = partial.gitlab_token.trim();
     if (typeof partial.evolve_branch_prefix === 'string') this.settings.evolve_branch_prefix = partial.evolve_branch_prefix.trim();
     setEvolveGitHubToken(this.settings.github_token || '');
+    // The forge tool is built before settings exist, so it is told where to read
+    // them from rather than given the values.
+    ForgeTool.setTokenReader((forge) => (forge === 'gitlab' ? this.settings.gitlab_token : this.settings.github_token) || '');
     setEvolveBranchPrefix(this.settings.evolve_branch_prefix || 'self/');
     if (typeof partial.enable_web_tools === 'boolean') this.settings.enable_web_tools = partial.enable_web_tools;
     if (typeof partial.enable_computer_use === 'boolean') this.settings.enable_computer_use = partial.enable_computer_use;

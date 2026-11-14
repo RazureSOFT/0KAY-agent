@@ -428,7 +428,14 @@ async function registerWithCore(proto: any): Promise<string | null> {
             type: 'text',
             label: 'GitHub Token',
             defaultValue: '',
-            help: '开 PR 用（需要 repo 权限）。填了就通过 GH_TOKEN 传给 gh，留空则用你本机已登录的 gh 账号',
+            help: '开 PR 用（需要 repo 权限）。填了就通过 GH_TOKEN 传给 gh，留空则用你本机已登录的 gh 账号。forge 工具读 issue / PR 也用这个',
+          },
+          {
+            key: 'gitlab_token',
+            type: 'text',
+            label: 'GitLab Token',
+            defaultValue: '',
+            help: '读 GitLab（含自建实例）的 issue / MR，以及新建它们。私有仓库需要它；公开仓库可以留空。用 PRIVATE-TOKEN 发送，不会出现在 URL 里',
           },
           {
             key: 'evolve_branch_prefix',
@@ -580,6 +587,7 @@ async function pollAgentSettings(): Promise<void> {
       enable_terminal: values.enable_terminal === true,
       vision_model: typeof values.vision_model === 'string' ? values.vision_model : '',
       github_token: typeof values.github_token === 'string' ? values.github_token : '',
+      gitlab_token: typeof values.gitlab_token === 'string' ? values.gitlab_token : '',
       evolve_branch_prefix: typeof values.evolve_branch_prefix === 'string' ? values.evolve_branch_prefix : 'self/',
       context_window: Number(values.context_window || 0),
       compaction_model: typeof values.compaction_model === 'string' ? values.compaction_model : '',
