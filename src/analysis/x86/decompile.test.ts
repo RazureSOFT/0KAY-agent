@@ -22,7 +22,7 @@ test('an if/else becomes structured C, not a goto', () => {
   );
   const result = decompileFunction(code, BASE, BASE, { name: 'pick', end: BASE + code.length, convention: 'sysv' });
   assert.equal(result.name, 'pick');
-  assert.match(result.c, /if \(rdi == 0\)/);
+  assert.match(result.c, /if \(arg0 == 0\)/);
   assert.match(result.c, /return/);
   assert.doesNotMatch(result.c, /goto /);
   assert.equal(result.gotos, 0);
@@ -77,7 +77,7 @@ test('a store through a computed address keeps its parentheses', () => {
   // mov [rsp+8], rax; ret
   const code = bytes(0x48, 0x89, 0x44, 0x24, 0x08, 0xc3);
   const result = decompileFunction(code, BASE, BASE, { name: 'store', end: BASE + code.length, convention: 'sysv' });
-  assert.match(result.c, /stack_8 = rax;/, result.c);
+  assert.match(result.c, /stack_8 = arg0;/, result.c);
 });
 
 test('undecodable bytes stay visible instead of being dropped', () => {

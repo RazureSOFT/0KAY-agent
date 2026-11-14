@@ -10,7 +10,7 @@
  */
 import { disassembleFunction } from './function.js';
 import { buildCfg } from './cfg.js';
-import { analyzeFrame, type Convention, type Frame } from './frame.js';
+import { analyzeFrame, inferRegisterParams, type Convention, type Frame } from './frame.js';
 import { lift, type Expr, type Stmt } from './ir.js';
 import { structure, type CtrlStmt } from './structure.js';
 import { typeForSize, typeOfExpr, refineParam, type CType } from './types.js';
@@ -58,8 +58,21 @@ export function decompileFunction(
   const structured = structure(lifted, entry);
   const body = optimize(structured.body);
 
-  const info = collect(body, frame);
+  // Go does not spill its register arguments, so when the frame has no saved
+  // arguments the inputs are recovered from the first reads instead.
+  const frameParams = [...frame.slots.values()].some((slot) => /^arg\d+$/.test(slot.name));
+  const inferred = frameParams ? [] : inferRegisterParams(fn.instructions, frame);
+  const renamed = new Map(inferred.map((param) => [param.register, param.name]));
+  const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed)) : body;
+
+  const info = collect(finalBody, frame);
   const params = parameterList(frame, info);
+  for (const param of inferred) {
+    if (params.some((existing) => existing.name === param.name)) continue;
+    const entry = info.vars.get(param.name);
+    params.push({ name: param.name, type: entry?.type === 'void *' ? 'void *' : 'long' });
+  }
+  params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
   const locals = [...info.vars.values()]
     .filter((local) => !params.some((param) => param.name === local.name))
     .map((local) => ({ name: local.name, type: local.type }));
@@ -70,11 +83,12 @@ export function decompileFunction(
     ? Math.round((fn.unknown / fn.instructions.length) * 1000) / 10
     : 0;
   lines.push(`/* ${fn.name} @ 0x${entry.toString(16)} — ${fn.instructions.length} instructions, ${blocks.length} blocks, ${structured.loops} loop(s), ${structured.gotos} goto(s)${unknownPct ? `, ${unknownPct}% undecoded` : ''} */`);
+  if (inferred.length) lines.push('/* parameters inferred from register reads (register ABI); the signature is approximate */');
   lines.push(`${signature}`);
   lines.push('{');
   for (const local of locals) lines.push(`    ${local.type} ${local.name};`);
   if (locals.length) lines.push('');
-  for (const stmt of body) lines.push(...printStmt(stmt, 1));
+  for (const stmt of finalBody) lines.push(...printStmt(stmt, 1));
   lines.push('}');
 
   return {
@@ -229,6 +243,48 @@ function returnType(info: Collected): CType | 'void' {
   return info.returnsValue ? 'long' : 'void';
 }
 
+
+/** Turn an inferred parameter register into a named variable throughout the body. */
+function renameExpr(expr: Expr, mapping: Map<string, string>): Expr {
+  switch (expr.t) {
+    case 'reg':
+      return mapping.has(expr.name) ? { t: 'var', name: mapping.get(expr.name) as string, size: expr.size } : expr;
+    case 'load':
+      return { ...expr, addr: renameExpr(expr.addr, mapping) };
+    case 'bin':
+      return { ...expr, left: renameExpr(expr.left, mapping), right: renameExpr(expr.right, mapping) };
+    case 'un':
+      return { ...expr, value: renameExpr(expr.value, mapping) };
+    case 'cast':
+      return { ...expr, value: renameExpr(expr.value, mapping) };
+    case 'select':
+      return { ...expr, cond: renameExpr(expr.cond, mapping), a: renameExpr(expr.a, mapping), b: renameExpr(expr.b, mapping) };
+    case 'call':
+      return { ...expr, args: expr.args.map((arg) => renameExpr(arg, mapping)) };
+    default:
+      return expr;
+  }
+}
+
+function renameStmt(stmt: CtrlStmt, mapping: Map<string, string>): CtrlStmt {
+  switch (stmt.t) {
+    case 'assign':
+      return { t: 'assign', target: renameExpr(stmt.target, mapping), value: renameExpr(stmt.value, mapping) };
+    case 'expr':
+      return { t: 'expr', expr: renameExpr(stmt.expr, mapping) };
+    case 'return':
+      return stmt.value ? { t: 'return', value: renameExpr(stmt.value, mapping) } : stmt;
+    case 'if':
+      return { t: 'if', cond: renameExpr(stmt.cond, mapping), then: stmt.then.map((inner) => renameStmt(inner, mapping)), ...(stmt.else ? { else: stmt.else.map((inner) => renameStmt(inner, mapping)) } : {}) };
+    case 'while':
+      return { t: 'while', cond: stmt.cond ? renameExpr(stmt.cond, mapping) : null, body: stmt.body.map((inner) => renameStmt(inner, mapping)) };
+    case 'do':
+      return { t: 'do', body: stmt.body.map((inner) => renameStmt(inner, mapping)), cond: renameExpr(stmt.cond, mapping) };
+    default:
+      return stmt;
+  }
+}
+
 function optimize(stmts: CtrlStmt[]): CtrlStmt[] {
   const out: CtrlStmt[] = [];
   for (const stmt of stmts) {
@@ -242,7 +298,9 @@ function optimize(stmts: CtrlStmt[]): CtrlStmt[] {
         out[out.length - 1] = { t: 'return', value: previous.value };
         continue;
       }
-      out.push({ t: 'return' });
+      // rax was not written in this block; keep the value rather than turning a
+      // real return into `return;` (the callee may have set it in another path).
+      out.push(stmt);
       continue;
     }
     if (stmt.t === 'if') {

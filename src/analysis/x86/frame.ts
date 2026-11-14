@@ -157,3 +157,77 @@ function frameName(offset: number, frame: Frame, base: 'rbp' | 'rsp' = 'rbp'): s
 export function isVolatile(register: string): boolean {
   return VOLATILE.has(register);
 }
+
+/**
+ * Go passes arguments in registers (AX, BX, CX, DI, SI, R8-R11) and does not
+ * spill them to the stack, so the prologue gives no argument list. What it does
+ * give is a first read: a register read before anything writes it is an input.
+ * Scanning stops at the first call, because after that every register is a
+ * scratch value rather than an argument.
+ */
+const GO_INT_ARGS = ['rax', 'rbx', 'rcx', 'rdi', 'rsi', 'r8', 'r9', 'r10', 'r11'];
+
+function baseName(name: string): string {
+  const lower = name.toLowerCase();
+  const table: Record<string, string> = {
+    eax: 'rax', ebx: 'rbx', ecx: 'rcx', edx: 'rdx', esi: 'rsi', edi: 'rdi', ebp: 'rbp', esp: 'rsp',
+    ax: 'rax', bx: 'rbx', cx: 'rcx', dx: 'rdx', si: 'rsi', di: 'rdi', bp: 'rbp', sp: 'rsp',
+    al: 'rax', bl: 'rbx', cl: 'rcx', dl: 'rdx', sil: 'rsi', dil: 'rdi', bpl: 'rbp', spl: 'rsp',
+    ah: 'rax', bh: 'rbx', ch: 'rcx', dh: 'rdx',
+  };
+  if (table[lower]) return table[lower];
+  if (/^r\d+d$/.test(lower) || /^r\d+w$/.test(lower) || /^r\d+b$/.test(lower)) return lower.slice(0, -1);
+  return lower;
+}
+
+const WRITES_FIRST: Record<string, true> = {
+  mov: true, movabs: true, lea: true, movzx: true, movsx: true, movsxd: true,
+  add: true, sub: true, and: true, or: true, xor: true, adc: true, sbb: true,
+  shl: true, sal: true, shr: true, sar: true, imul: true, mul: true,
+  inc: true, dec: true, neg: true, not: true, bswap: true, pop: true,
+};
+
+function writtenRegister(instruction: Instruction): string | null {
+  const mnemonic = instruction.mnemonic.toLowerCase();
+  if (/^set[a-z]{1,2}$/.test(mnemonic) || mnemonic.startsWith('cmov')) return null;
+  if (!WRITES_FIRST[mnemonic]) return null;
+  const first = instruction.operands[0];
+  return first?.kind === 'reg' && first.reg ? baseName(first.reg) : null;
+}
+
+export interface InferredParam {
+  name: string;
+  register: string;
+  index: number;
+}
+
+export function inferRegisterParams(instructions: Instruction[], frame: Frame): InferredParam[] {
+  if (frame.savedArgs.size > 0) return []; // the prologue already named them
+  const defined = new Set(['rsp', 'rbp']);
+  const inputs: string[] = [];
+  for (const instruction of instructions.slice(0, 48)) {
+    const mnemonic = instruction.mnemonic.toLowerCase();
+    if (instruction.flow === 'call' || mnemonic === 'call') break;
+    if (mnemonic === 'ret' || mnemonic === 'retn' || mnemonic === 'jmp') break;
+    // Reads before the instruction's own write: a register read here was live
+    // on entry. The destination is skipped, or `mov eax, 0` would look like a
+    // use of eax and every function would grow a phantom first argument.
+    const written = writtenRegister(instruction);
+    for (let index = 0; index < instruction.operands.length; index++) {
+      if (index === 0 && written) continue;
+      const operand = instruction.operands[index];
+      if (operand.kind !== 'reg' || !operand.reg) continue;
+      const name = baseName(operand.reg);
+      if (name === 'seg') continue;
+      if (!defined.has(name) && !inputs.includes(name)) inputs.push(name);
+    }
+    if (written) defined.add(written);
+  }
+  // Order by the Go argument register order, then by first appearance for
+  // anything outside it.
+  const ordered = inputs
+    .map((register) => ({ register, rank: GO_INT_ARGS.indexOf(register) }))
+    .sort((a, b) => (a.rank < 0 ? 99 : a.rank) - (b.rank < 0 ? 99 : b.rank))
+    .map((entry) => entry.register);
+  return ordered.map((register, index) => ({ name: `arg${index}`, register, index }));
+}

@@ -136,6 +136,11 @@ export function operandExpr(operand: Operand | undefined, instruction: Instructi
   }
 }
 
+
+function isNamedReg(operand: Operand | undefined, name: string): boolean {
+  return operand?.kind === 'reg' && registerBase(operand.reg || '') === name;
+}
+
 interface PendingCondition {
   op: 'cmp' | 'test';
   left: Expr;
@@ -212,6 +217,13 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if (m === 'nop' || m === 'endbr64' || m === 'leave' || m === 'push' || m === 'pop'
         || m === 'stc' || m === 'clc' || m === 'cmc' || m === 'cld' || m === 'std'
         || m === 'sahf' || m === 'lahf' || m === 'pause') continue;
+      // Prologue and epilogue when a frame pointer is in use: the slots are
+      // addressed through rbp, so adjusting rsp says nothing the reader needs.
+      if (frame.hasFramePointer) {
+        if (m === 'mov' && isNamedReg(a, 'rbp') && isNamedReg(b, 'rsp')) continue;
+        if (m === 'mov' && isNamedReg(a, 'rsp') && isNamedReg(b, 'rbp')) continue;
+        if ((m === 'sub' || m === 'add') && isNamedReg(a, 'rsp') && b?.kind === 'imm') continue;
+      }
       if (m === 'jrcxz' || m === 'jecxz' || m === 'jcxz') {
         term = 'jcc';
         cond = { t: 'bin', op: '==', left: { t: 'reg', name: 'rcx', size: 64 }, right: constExpr(0, 64), size: 1 };
