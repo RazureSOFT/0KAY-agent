@@ -198,6 +198,12 @@ export interface LoopRuntime {
 
 export interface LoopContext {
   objective: string
+  /**
+   * Engineering tasks aim at changing something (a code base, a deployed
+   * service) rather than at proving facts about it. The machinery is identical;
+   * the prompt framing is not.
+   */
+  kind?: 'recon' | 'engineering'
   /** Rendered "never leave it" scope line shared by every prompt. */
   scopeLine: string
   constraints: string[]

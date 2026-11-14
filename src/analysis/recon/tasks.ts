@@ -29,6 +29,8 @@ import { writeFileAtomic } from '../../tools/atomic_write.js'
 export type AssessmentStatus = 'running' | 'paused' | 'done' | 'cancelled' | 'failed'
 
 export interface AssessmentSpec {
+  /** Defaults to recon. */
+  kind?: AssessmentKind
   objective: string
   targets: string[]
   /** Refuse to prove goals until this percent of the scope is tested. */
@@ -76,9 +78,22 @@ function estimateTokens(text: string): number {
   return cjk + Math.round((text.length - cjk) / 4)
 }
 
+/**
+ * What kind of assessment this is.
+ *
+ * `recon` is the original behaviour: planner/worker rounds against a target set.
+ * `engineering` runs the same loop but with a goal oriented at changing a code
+ * base or a deployed system — the prompt and the tool bias differ, the machinery
+ * does not. Absent means `recon`, which is what every task created before this
+ * field existed is.
+ */
+export type AssessmentKind = 'recon' | 'engineering'
+
 export interface AssessmentState {
   id: string
   sessionId: string
+  /** Defaults to `recon` when absent. */
+  kind?: AssessmentKind
   objective: string
   targets: string[]
   coverageArg?: number
@@ -231,6 +246,7 @@ export class AssessmentManager {
       throw new Error(`too many running assessments (${MAX_RUNNING_TOTAL} across all sessions)`)
     }
 
+    const kind: AssessmentKind = spec.kind === 'engineering' ? 'engineering' : 'recon'
     const graph = await this.graphFor(sessionId)
     const priorScope = graph.scope().map((row) => row.value)
     const scopeValues = [...new Set([...priorScope, ...targets])]
@@ -238,6 +254,7 @@ export class AssessmentManager {
 
     const loop: LoopContext = {
       objective,
+      kind,
       scopeLine: `Scope (never leave it): ${scopeValues.join(', ')}`,
       constraints: [],
       fallbackAssets: targets,
@@ -264,6 +281,7 @@ export class AssessmentManager {
     const state: AssessmentState = {
       id: `as_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`,
       sessionId,
+      kind,
       objective,
       targets,
       coverageArg: spec.coverage != null ? Number(spec.coverage) : undefined,

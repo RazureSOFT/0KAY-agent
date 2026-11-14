@@ -24,6 +24,7 @@ export class AssessmentsTool extends Tool {
       required: ['action'],
       properties: {
         action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report'] },
+        kind: { type: 'string', enum: ['recon', 'engineering'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering aims at changing a code base or a deployed system.' },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
         objective: { type: 'string', description: 'create: the objective, in one sentence.' },
         targets: { type: 'array', items: { type: 'string' }, description: 'create: in-scope assets — also the coverage denominator.' },
@@ -57,6 +58,7 @@ export class AssessmentsTool extends Tool {
       switch (args.action) {
         case 'create': {
           const state = await manager.create({
+            ...(args.kind === 'engineering' ? { kind: 'engineering' as const } : {}),
             objective: String(args.objective || ''),
             targets: Array.isArray(args.targets) ? args.targets.map(String).filter(Boolean) : [],
             ...(args.coverage != null ? { coverage: Number(args.coverage) } : {}),
