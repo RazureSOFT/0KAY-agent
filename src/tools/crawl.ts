@@ -61,11 +61,11 @@ export class CrawlTool extends Tool {
   get name(): string { return 'crawl'; }
   get description(): string {
     return [
-      'Crawl a site from one or more start URLs (full Scrapy + Firecrawl crawl/map).',
+      'Crawl a site from one or more start URLs: follow internal links, list the URL map, and report what changed.',
       'Traversal follows <a> links and/or sitemap.xml, staying on allowedDomains, up to maxPages/maxDepth, bfs (default) or dfs.',
       'Extraction per page: markdown/text/html/links/metadata; add schema to run an item extractor over every page.',
       'robots.txt (with Crawl-delay) is respected unless ignoreRobots; autothrottle adapts delay to latency; dedup persists across runs.',
-      'render:"js" uses a headless browser for SPA routes; proxies:[] rotates. mapOnly lists URLs (Firecrawl /map); changeTracking flags changed pages.',
+      'render:"js" uses a headless browser for SPA routes; proxies:[] rotates. mapOnly lists URLs without fetching them; changeTracking flags changed pages.',
     ].join('\n');
   }
   get parameters(): Record<string, any> {

@@ -378,7 +378,7 @@ export class ReverseEngineerTool extends Tool {
   get name(): string { return 'reverse_engineer'; }
   get description(): string {
     return [
-      'Statically analyze a binary/bundle and report structure with evidence (full REA static surface).',
+      'Statically analyze a binary/bundle and report structure with evidence (the full static surface: containers, containers-of-containers, and metadata formats).',
       'Parses ELF (headers/sections/symbols/needed/mitigations), PE/.NET (imports/exports/sections/CLR), Mach-O, WASM, ASAR/ZIP/APK/JAR, SQLite, PCAP, JavaScript/Electron.',
       'Reports Go build info, Rust crates, .NET references/types, mitigations, per-section entropy, strings with offsets, and extracted IOCs.',
       'provider:auto runs ghidra/jadx/objdump decompilation when installed (run setup_deps to check). path may be a file or a directory (inventory).',

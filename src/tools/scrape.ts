@@ -185,7 +185,7 @@ export class ScrapeTool extends Tool {
   get name(): string { return 'scrape'; }
   get description(): string {
     return [
-      'Scrape one or more URLs into LLM-ready output (full Scrapling + Firecrawl).',
+      'Scrape one or more URLs into LLM-ready output: JS rendering, TLS impersonation for anti-bot pages, and structured extraction.',
       'render: auto (default, js when a browser is available) | static | js | stealth (curl impersonation).',
       'formats: markdown (default), text, html, links, metadata, screenshot, json, summary, changeTracking.',
       'actions: [{type:"wait|click|scroll|write|press|goto|screenshot", selector?, text?, key?, ms?, direction?, fullPage?, path?}] run before extraction.',

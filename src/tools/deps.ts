@@ -33,7 +33,7 @@ export const CLI_CAPABILITIES: CliCapability[] = [
     install: { packages: [
       { manager: 'npm', args: ['install', '-g', 'playwright'] },
     ], manual: 'after installing, run: playwright install chromium  (or: npx playwright install --with-deps chromium)' } },
-  { name: 'curl-impersonate', commands: ['curl_chrome116', 'curl-impersonate-chrome', 'curl_ff117'], versionArg: ['--version'], purpose: 'TLS/JA3 impersonation for anti-bot fetches (Scrapling stealth)',
+  { name: 'curl-impersonate', commands: ['curl_chrome116', 'curl-impersonate-chrome', 'curl_ff117'], versionArg: ['--version'], purpose: 'TLS/JA3 impersonation for anti-bot fetches',
     install: { packages: [
       { manager: 'pip', args: ['install', 'curl_cffi'] },
       { manager: 'brew', args: ['install', 'curl-impersonate'] },

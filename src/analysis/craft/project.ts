@@ -1,6 +1,6 @@
 // A craft project on disk.
 //
-// Craft Anything is a four-stage loop — Study, Build, Check, Ready — and the
+// A craft task is a four-stage loop — Study, Build, Check, Ready — and the
 // thing that makes it a loop rather than a prompt is the project directory: the
 // study is captured once and reused for every round, each check is a durable
 // artifact with a score and a mismatch list, change requests land in an inbox,

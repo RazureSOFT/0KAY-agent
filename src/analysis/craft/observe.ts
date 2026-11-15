@@ -70,7 +70,7 @@ export interface InteractiveState {
 }
 
 /**
- * A named page state. Craft Anything checks "menus opened" as well as the
+ * A named page state. A craft check reads "menus opened" as well as the
  * resting page, so a rebuild that never wires the menu up is still caught.
  */
 export interface InteractionSnapshot {
