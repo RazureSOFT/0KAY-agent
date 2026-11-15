@@ -25,7 +25,7 @@ export class AssessmentsTool extends Tool {
       required: ['action'],
       properties: {
         action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report', 'findings', 'retests', 'retest'] },
-        kind: { type: 'string', enum: ['recon', 'engineering'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering aims at changing a code base or a deployed system.' },
+        kind: { type: 'string', enum: ['recon', 'engineering', 'craft'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering changes a code base or a deployed system; craft studies something observable, rebuilds it, then compares and refines until they match.' },
         permission_mode: { type: 'string', enum: ['normal', 'full_access'], description: 'create: what this task\'s workers may do without asking. full_access skips approval for dangerous tools; the mode sticks to the task, so a resume does not inherit the caller\'s current setting.' },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
         objective: { type: 'string', description: 'create: the objective, in one sentence.' },
@@ -38,7 +38,7 @@ export class AssessmentsTool extends Tool {
         id: { type: 'string', description: 'get/control/hint/report/findings: the task id.' },
         finding_id: { type: 'string', description: 'retests/retest: the durable finding row id (from findings).' },
         all: { type: 'boolean', description: 'list: every session\'s tasks, not just this one. The tasks tab uses it so a task does not disappear when the conversation changes.' },
-        operation: { type: 'string', enum: ['pause', 'resume', 'cancel', 'delete'], description: 'control: what to do.' },
+        operation: { type: 'string', enum: ['pause', 'resume', 'restart', 'cancel', 'delete'], description: 'control: what to do. restart starts a finished/cancelled/failed task again with the same objective and scope.' },
         text: { type: 'string', description: 'hint: steering for the planner.' },
         path: { type: 'string', description: 'report: output file, default assessment-<id>.md in the working directory.' },
         model: { type: 'string', description: 'create: model override for this task planner/worker calls.' },
@@ -73,6 +73,7 @@ export class AssessmentsTool extends Tool {
         case 'create': {
           const state = await manager.create({
             ...(args.kind === 'engineering' ? { kind: 'engineering' as const } : {}),
+            ...(args.kind === 'craft' ? { kind: 'craft' as const } : {}),
             ...(args.permission_mode === 'full_access' ? { permissionMode: 'full_access' as const } : {}),
             objective: String(args.objective || ''),
             targets: Array.isArray(args.targets) ? args.targets.map(String).filter(Boolean) : [],

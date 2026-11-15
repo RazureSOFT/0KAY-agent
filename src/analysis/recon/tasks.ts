@@ -124,7 +124,16 @@ function estimateTokens(text: string): number {
  * does not. Absent means `recon`, which is what every task created before this
  * field existed is.
  */
-export type AssessmentKind = 'recon' | 'engineering'
+/**
+ * What kind of assessment this is.
+ *
+ * - `recon` proves facts about targets (ports, services, vulnerabilities).
+ * - `engineering` changes a code base or a deployed system.
+ * - `craft` studies something observable and rebuilds it, then compares the two
+ *   and refines until they match. The loop is the same; what a goal *means*
+ *   differs, and so does what counts as evidence.
+ */
+export type AssessmentKind = 'recon' | 'engineering' | 'craft'
 
 export interface AssessmentState {
   id: string
@@ -333,7 +342,8 @@ export class AssessmentManager {
       throw new Error(`too many running assessments (${MAX_RUNNING_TOTAL} across all sessions)`)
     }
 
-    const kind: AssessmentKind = spec.kind === 'engineering' ? 'engineering' : 'recon'
+    const kind: AssessmentKind =
+      spec.kind === 'engineering' ? 'engineering' : spec.kind === 'craft' ? 'craft' : 'recon'
     const permissionMode: 'normal' | 'full_access' = spec.permissionMode === 'full_access' ? 'full_access' : 'normal'
     const graph = await this.graphFor(sessionId)
     const priorScope = graph.scope().map((row) => row.value)
@@ -542,7 +552,7 @@ export class AssessmentManager {
       })
   }
 
-  /** pause / resume / cancel / delete. Anything else is refused. */
+  /** pause / resume / restart / cancel / delete. Anything else is refused. */
   async control(id: string, action: string): Promise<AssessmentState> {
     await this.ensureLoaded()
     const state = this.states.get(id)
@@ -552,6 +562,23 @@ export class AssessmentManager {
       if (!run) throw new Error('assessment is not running')
       this.pauseRequested.add(id)
       run.controller.abort()
+    } else if (action === 'restart') {
+      // A finished, cancelled or failed task could only be replaced by creating a
+      // new one and retyping everything. Restarting keeps the objective, scope,
+      // constraints and permission mode, and starts the loop again.
+      if (state.status === 'running') throw new Error('assessment is already running')
+      const graph = await this.graphFor(state.sessionId)
+      this.startActivity(state, graph, this.runtimeFor(state), {
+        objective: state.objective,
+        kind: state.kind || 'recon',
+        scopeLine: `Scope (never leave it): ${state.scope.join(', ')}`,
+        constraints: state.constraints,
+        fallbackAssets: state.targets,
+        graph,
+        ...(state.model ? { model: state.model } : {}),
+        permissionMode: state.permissionMode || 'normal',
+      })
+      await this.persist(state)
     } else if (action === 'resume') {
       if (state.status !== 'paused') throw new Error(`cannot resume a ${state.status} assessment`)
       const graph = await this.graphFor(state.sessionId)

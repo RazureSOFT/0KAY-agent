@@ -35,7 +35,7 @@ function situation(): Situation {
  * so collecting them in order and taking the first would pick whichever happened
  * to be first. The reviewer is separated by its own marker.
  */
-async function plannerPromptFor(kind?: 'recon' | 'engineering'): Promise<string> {
+async function plannerPromptFor(kind?: 'recon' | 'engineering' | 'craft'): Promise<string> {
   const plannerPrompts: string[] = []
   const runtime = {
     llm: async (request: any) => {
@@ -73,4 +73,15 @@ test('a recon task keeps the penetration-test planner prompt', async () => {
 test('an absent kind means recon, so stored tasks keep their behaviour', async () => {
   const prompt = await plannerPromptFor()
   assert.match(prompt, /授权渗透测试系统/)
+})
+
+test('a craft task gets the study/build/check/ready planner prompt', async () => {
+  const prompt = await plannerPromptFor('craft')
+  assert.match(prompt, /复刻任务/)
+  for (const step of ['观察', '构建', '比对', '就绪']) {
+    assert.ok(prompt.includes(step), `craft prompt is missing the ${step} step`)
+  }
+  // The claim that makes the mode worth having: a rebuild is checked, not guessed.
+  assert.ok(prompt.includes('比对结果决定下一步'), 'craft prompt lost the "the diff decides the next move" rule')
+  assert.doesNotMatch(prompt, /授权渗透测试系统/, 'the recon prompt leaked into craft mode')
 })

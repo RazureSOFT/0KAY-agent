@@ -162,6 +162,34 @@ const PLANNER_TAIL = `
 - 尊重 hints：它们是循环外的操舵。
 - 绝不越过给定 scope。`
 
+// Craft mode: study something observable, rebuild it, compare, refine.
+//
+// The loop is the same planner/worker machinery; what changes is what a goal
+// means. A recon planner asks "what is true about this target". A craft planner
+// asks "what does the original do, and how far is my rebuild from it" — and the
+// evidence is a comparison, not a fact about the original.
+const PLANNER_CRAFT = `你是"复刻任务"的规划者，被频繁唤醒。职责：读现状 → 判目标 → **只在确有未覆盖的复刻方向时**补充意图。你是规划者、不是执行者：本轮产物只能是意图。
+
+【这类任务的循环是四步，不要跳过任何一步】
+1. **观察（study）**：从**可观察的表面**记录原样——页面在各宽度下的样子、可见文字、量到的布局/配色/字体/间距、菜单展开后的状态、交互后的反应。不读源码、不读文件、不反编译（除非任务明确允许"深看"模式）。
+2. **构建（build）**：用任务指定的语言/框架产出新项目。没有指定就选一个合理的默认，并在意图里写明选了什么、为什么。
+3. **比对（check）**：把结果和原样逐项对照，**产出明确的差异清单**——不是"看起来差不多"，是"这一处配色不同、这一处间距差 4px、这一处交互没有反应"。网站按多个宽度检查。
+4. **就绪（ready）**：差异清零或只剩可接受的项，给出打开/预览的方式。
+
+【判断基准】
+- **观察不足时不要构建**：没量到的布局只能靠猜，猜出来的复刻无法比对。宁可先派一条"量这一块"的意图。
+- **一次只改一处可比对的差异**：一条意图修一个差异项，改完就能重新比对。把"配色 + 布局 + 字体"塞进一条，比对时分不清是谁生效。
+- **比对结果决定下一步**：上一轮比对出的差异清单是下一轮意图的唯一来源，优先于"我觉得还应该加点什么"。
+- **不要复制你无权复制的东西**：标志、照片、成段文字，没有确认授权就不要照搬；用占位符代替并在事实里写明。
+- **深看模式（deep）**：只有任务明确开启时才允许读源码/文件/反编译产物。默认是干净室——只看表面。
+
+【输出格式】回复 JSON only：
+{"plan":[{"text":"...","needs":[]}],"intents":[{"text":"...","assets":["..."],"derivedFrom":["..."],"priority":5}]}
+- "plan" 是 study → build → check → ready 的有序步骤链，每轮原样重申；"needs" 列前置 step id。
+- "intents" 是本轮要做的方向（最多 4 条），每条写清：做哪一步（观察/构建/比对/就绪）、具体到哪一处、做完怎么验证。
+- 尊重 hints：它们是循环外的操舵。
+- 绝不越过给定 scope。`
+
 // Ported in spirit from RECON's settleWrapUpPrompt (worker-facing there; here
 // the settlement round is planner-dispatched).
 const PLANNER_SETTLE_TAIL = `
@@ -245,7 +273,7 @@ export interface LoopContext {
    * service) rather than at proving facts about it. The machinery is identical;
    * the prompt framing is not.
    */
-  kind?: 'recon' | 'engineering'
+  kind?: 'recon' | 'engineering' | 'craft'
   /** Rendered "never leave it" scope line shared by every prompt. */
   scopeLine: string
   constraints: string[]
@@ -312,13 +340,27 @@ export async function plantGoals(
 }
 
 /** The planner: situation in, up to three intents out, plan refreshed in passing. */
+/**
+ * Which planner a kind runs.
+ *
+ * Kept as one function so a new kind cannot be added without deciding its prompt:
+ * the previous arrangement (`kind ? A : B`) silently sent every unknown kind to
+ * the recon planner, which is how engineering mode spent a release running a
+ * penetration-test planner with a different label.
+ */
+function plannerPromptFor(kind: LoopContext['kind']): string {
+  if (kind === 'engineering') return PLANNER_ENGINEERING
+  if (kind === 'craft') return PLANNER_CRAFT
+  return PLANNER_PROMPT
+}
+
 export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext): Planner {
   const constraintLine = loop.constraints.length ? `\nConstraints: ${loop.constraints.join(' | ')}` : ''
 
   /** One planner call. `notes` is the reviewer's revision, when there is one. */
   const ask = async (situation: Situation, notes?: string) => {
     const reply = await runtime.llm({
-      systemPrompt: `${loop.kind === 'engineering' ? PLANNER_ENGINEERING : PLANNER_PROMPT}\n\n${loop.scopeLine}${constraintLine}`,
+      systemPrompt: `${plannerPromptFor(loop.kind)}\n\n${loop.scopeLine}${constraintLine}`,
       messages: [{
         role: 'user',
         content: JSON.stringify({
