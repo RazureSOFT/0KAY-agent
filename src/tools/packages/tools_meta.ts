@@ -37,7 +37,18 @@ export class ToolsTool extends Tool {
     const groups = context.toolGroups
     if (!groups) return failure('tool groups are unavailable in this context')
     try {
-      if (args.action === 'list') return success({ groups: groups.list() })
+      if (args.action === 'list') {
+        const rows = groups.list()
+        const unloaded = rows.filter((row: any) => row.loaded === false).map((row: any) => row.name ?? row.label ?? row.id)
+        return success({
+          groups: rows,
+          // "The tool exists but you cannot see it" is the most confusing state in
+          // this system, and the list used to leave the next step implicit. Name it.
+          ...(unloaded.length
+            ? { hint: `not loaded: ${unloaded.join(', ')} — call tools(action:\"load\", group:\"<name>\") to make their tools available` }
+            : {}),
+        })
+      }
       const group = String(args.group || '').trim()
       if (!group) throw new Error('group is required')
       if (args.action === 'load') {

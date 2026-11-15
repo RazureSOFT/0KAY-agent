@@ -36,7 +36,9 @@ test('list shows every group and which are loaded', async () => {
   const groups = result.data.groups
   assert.ok(groups.length >= 7)
   const analysis = groups.find((group: any) => group.group === 'analysis')
-  assert.equal(analysis.loaded, false)
+  // Loaded from the start: the reverse-engineering tools are the headline
+  // capability, and an opt-in group nobody loads is a capability nobody finds.
+  assert.equal(analysis.loaded, true)
   assert.ok(analysis.tools.includes('pentest'))
   const core = groups.find((group: any) => group.group === 'core')
   assert.equal(core.loaded, true)

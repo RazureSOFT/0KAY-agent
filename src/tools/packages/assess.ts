@@ -2,6 +2,7 @@ import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
 import { RetestTool } from './retest.js'
+import { observeAll, compareAll, localUrlFor, type Observation } from '../../analysis/craft/observe.js'
 
 // RECON's task system as one tool: background assessment tasks that run the
 // RECON loop on the session graph, outliving the call that started them. The
@@ -24,7 +25,7 @@ export class AssessmentsTool extends Tool {
       type: 'object',
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report', 'findings', 'retests', 'retest'] },
+        action: { type: 'string', enum: ['create', 'list', 'get', 'control', 'hint', 'say', 'trace', 'report', 'findings', 'retests', 'retest', 'observe', 'compare'] },
         kind: { type: 'string', enum: ['recon', 'engineering', 'craft'], description: 'create: what kind of assessment. recon proves facts about targets (default); engineering changes a code base or a deployed system; craft studies something observable, rebuilds it, then compares and refines until they match.' },
         permission_mode: { type: 'string', enum: ['normal', 'full_access'], description: 'create: what this task\'s workers may do without asking. full_access skips approval for dangerous tools; the mode sticks to the task, so a resume does not inherit the caller\'s current setting.' },
         intent_id: { type: 'string', description: 'trace: the worker intent node id.' },
@@ -37,6 +38,11 @@ export class AssessmentsTool extends Tool {
         timeoutMs: { type: 'integer', minimum: 10000, maximum: 3600000 },
         id: { type: 'string', description: 'get/control/hint/report/findings: the task id.' },
         finding_id: { type: 'string', description: 'retests/retest: the durable finding row id (from findings).' },
+        url: { type: 'string', description: 'observe: the surface to read — a URL, or a local build path with the `local` flag.' },
+        local: { type: 'boolean', description: 'observe/compare: treat `url` as a directory on disk instead of a URL.' },
+        original_url: { type: 'string', description: 'compare: the original surface, when it is not `url`.' },
+        rebuilt_url: { type: 'string', description: 'compare: the rebuild to measure against `original_url`.' },
+        screenshot_dir: { type: 'string', description: 'observe: write a full-page screenshot per width here.' },
         all: { type: 'boolean', description: 'list: every session\'s tasks, not just this one. The tasks tab uses it so a task does not disappear when the conversation changes.' },
         operation: { type: 'string', enum: ['pause', 'resume', 'restart', 'cancel', 'delete'], description: 'control: what to do. restart starts a finished/cancelled/failed task again with the same objective and scope.' },
         text: { type: 'string', description: 'hint: steering for the planner.' },
@@ -137,6 +143,48 @@ export class AssessmentsTool extends Tool {
           if (!findingId) return failure('finding_id is required for retest')
           const retester = new RetestTool()
           return retester.execute({ action: 'start', finding_id: findingId, notes: args.notes }, context)
+        }
+        // Craft: read the surface, then measure the rebuild against it. The two
+        // actions exist as a pair on purpose — a comparison without an
+        // observation is a guess with a number attached.
+        case 'observe': {
+          const target = String(args.url || '').trim()
+          if (!target) return failure('url is required for observe')
+          const url = args.local === true ? localUrlFor(target) : target
+          const observations = await observeAll(url, {
+            ...(args.screenshot_dir ? { screenshotDir: String(args.screenshot_dir) } : {}),
+          })
+          const failed = observations.filter((row) => row.error)
+          return success({
+            url,
+            widths: observations.map((row) => row.width),
+            observations,
+            ...(failed.length ? { errors: failed.map((row) => ({ width: row.width, error: row.error })) } : {}),
+            note: failed.length
+              ? 'some widths could not be rendered — fix that before comparing, or the comparison will report a whole page as missing'
+              : 'the surface was read at every comparison width',
+          })
+        }
+        case 'compare': {
+          const original = String(args.original_url || args.url || '').trim()
+          const rebuilt = String(args.rebuilt_url || '').trim()
+          if (!original || !rebuilt) return failure('original_url and rebuilt_url are both required for compare')
+          const asLocal = args.local === true
+          const before = await observeAll(asLocal ? localUrlFor(original) : original, {});
+          const after = await observeAll(asLocal ? localUrlFor(rebuilt) : rebuilt, {});
+          const broken = [...before, ...after].filter((row) => row.error)
+          if (broken.length) {
+            return failure(`could not render ${broken.length} of the ${before.length + after.length} observations: ${broken[0].error}`)
+          }
+          const result = compareAll(before, after)
+          return success({
+            original,
+            rebuilt,
+            similarity: result.similarity,
+            comparisons: result.comparisons,
+            // The count is what a person acts on; the score only sorts rounds.
+            differenceCount: result.comparisons.reduce((total, row) => total + row.differences.length, 0),
+          })
         }
         case 'report': {
           const result = await manager.report(String(args.id || ''), args.path ? String(args.path) : undefined, context.cwd || process.cwd(), args.preview === true)

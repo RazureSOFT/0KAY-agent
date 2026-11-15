@@ -31,13 +31,17 @@ test('a tool named in a group actually exists', () => {
   assert.deepEqual(phantom, ['question'], `named but not registered: ${phantom.join(', ')}`)
 })
 
-test('core and agent ride along; the rest do not', () => {
+test('core, agent and analysis ride along; the rest do not', () => {
   assert.equal(isAlwaysLoaded('read'), true)
   assert.equal(isAlwaysLoaded('bash'), true)
   assert.equal(isAlwaysLoaded('subagent'), true)
-  assert.equal(isAlwaysLoaded('pentest'), false)
+  // The reverse-engineering tools are the headline capability. Behind an opt-in
+  // load they existed, were described, and were never found.
+  assert.equal(isAlwaysLoaded('pentest'), true)
+  assert.equal(isAlwaysLoaded('ghidra_analyze'), true)
+  assert.equal(isAlwaysLoaded('binary_analyze'), true)
   assert.equal(isAlwaysLoaded('evolve_begin'), false)
-  assert.deepEqual(ALWAYS_LOADED, ['core', 'agent'])
+  assert.deepEqual(ALWAYS_LOADED, ['core', 'agent', 'analysis'])
 })
 
 test('an ungrouped tool stays visible rather than disappearing', () => {

@@ -78,7 +78,15 @@ export const TOOL_GROUPS: Record<string, ToolGroup> = {
 }
 
 /** Groups that ride along on every request. */
-export const ALWAYS_LOADED = ['core', 'agent']
+/**
+ * Groups every task starts with.
+ *
+ * `analysis` is here because the reverse-engineering tools are this system's
+ * headline capability: leaving them behind an opt-in load meant the tools
+ * existed, the model was told about the group, and nobody could find them. The
+ * cost is prompt length, and it is the right trade.
+ */
+export const ALWAYS_LOADED = ['core', 'agent', 'analysis']
 
 const BY_TOOL = new Map<string, string>()
 for (const [group, definition] of Object.entries(TOOL_GROUPS)) {
