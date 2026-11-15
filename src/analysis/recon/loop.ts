@@ -183,6 +183,13 @@ const PLANNER_CRAFT = `你是"复刻任务"的规划者，被频繁唤醒。职�
 - **不要复制你无权复制的东西**：标志、照片、成段文字，没有确认授权就不要照搬；用占位符代替并在事实里写明。
 - **深看模式（deep）**：只有任务明确开启时才允许读源码/文件/反编译产物。默认是干净室——只看表面。
 
+【项目状态在每轮的 craft 字段里】它是磁盘上项目的实时读数：stage、round、checklist、latest（overall / element / pixel / differences）、differences（可动手的差异清单）、inbox（未处理的变更请求）、limitations。**以它为准，不要凭记忆写意图**：
+- stage=study → 先派"用 craft study 采一次原样"的意图；没采到宽度就别构建。
+- stage=build → 派"在 app/ 里改一处差异"的意图；一条意图只改清单里的一项。
+- stage=check → 派"craft check 重新比对并读差异清单"的意图。
+- stage=ready → 不再开新方向，收尾。
+inbox 里的请求优先级高于差异清单。latest.differences 为 0 且 overall ≥ threshold 才允许收尾。
+
 【输出格式】回复 JSON only：
 {"plan":[{"text":"...","needs":[]}],"intents":[{"text":"...","assets":["..."],"derivedFrom":["..."],"priority":5}]}
 - "plan" 是 study → build → check → ready 的有序步骤链，每轮原样重申；"needs" 列前置 step id。
@@ -297,6 +304,12 @@ export interface LoopContext {
    * show every plan alongside its score and whether it was sent back.
    */
   onReview?: (round: ReviewOutcome) => void
+  /**
+   * craft only: a live read of the project on disk, taken once per planner
+   * round and once per worker. The last check's mismatch list is the frontier —
+   * the planner must not invent the next build step from memory.
+   */
+  craft?: () => Promise<Record<string, unknown> | null>
 }
 
 /** One planner round as the UI needs to see it: the plan, the verdict, the note. */
@@ -359,6 +372,7 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
 
   /** One planner call. `notes` is the reviewer's revision, when there is one. */
   const ask = async (situation: Situation, notes?: string) => {
+    const craft = loop.craft ? await loop.craft().catch(() => null) : null
     const reply = await runtime.llm({
       systemPrompt: `${plannerPromptFor(loop.kind)}\n\n${loop.scopeLine}${constraintLine}`,
       messages: [{
@@ -378,6 +392,10 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
           readySteps: situation.ready.map((step) => ({ id: step.id, text: step.text })),
           traces: situation.traces,
           budget: situation.budget,
+          // The live craft project: stage, checklist, last score and the exact
+          // mismatch list. Read fresh each round; a stale list means a worker
+          // "fixes" a difference that was already fixed.
+          ...(craft ? { craft } : {}),
           // The reviewer's single revision request, if the plan was sent back.
           ...(notes ? { revisionRequested: notes } : {}),
         }),
@@ -458,6 +476,33 @@ export function makePlanner(runtime: LoopRuntime, plan: Plan, loop: LoopContext)
   }
 }
 
+/**
+ * The craft worker's frame. It is deliberately concrete: the project root, the
+ * score, the mismatch list and the exact tool calls. "Recreate the page" as a
+ * bare instruction is what produces a rebuild nobody can measure.
+ */
+function craftWorkerFrame(craft: Record<string, any>): string {
+  const differences = Array.isArray(craft.differences) ? craft.differences : []
+  const inbox = Array.isArray(craft.inbox) ? craft.inbox : []
+  const id = craft.taskId || '<task id>'
+  return [
+    '',
+    '【复刻项目：唯一事实来源，不要凭印象猜】',
+    `task id=${id} stage=${craft.stage} round=${craft.round} threshold=${craft.threshold} root=${craft.root}`,
+    `latest: overall=${craft.latest?.overall ?? 'n/a'}% element=${craft.latest?.element ?? 'n/a'}% pixel=${craft.latest?.pixel ?? 'n/a'}% differences=${craft.latest?.differences ?? 0}`,
+    `checklist: ${JSON.stringify(craft.checklist || [])}`,
+    `open change requests: ${JSON.stringify(inbox.map((row: any) => ({ id: row.id, text: row.text })))}`,
+    `differences: ${JSON.stringify(differences.slice(0, 12))}`,
+    '【可用动作（assessments 工具）】',
+    `- action:"craft", operation:"study", id:"${id}", url:<原样 URL> —— 只在 study 阶段采一次原样`,
+    `- action:"craft", operation:"build", id:"${id}", note:"...", applied_ids:[已处理的请求 id] —— 记录一次构建`,
+    `- action:"craft", operation:"check", id:"${id}" —— 按 390/768/1280 三宽度比对，写 checks/ 与差异清单`,
+    `- action:"craft", operation:"differences"|"project"|"artifacts"|"request"|"ready", id:"${id}"`,
+    `复刻文件写在 app/index.html（${craft.paths?.entry || '<project>/app/index.html'}）；clean room 模式下不要读原站源码。`,
+    '每轮只改差异清单里的一项，改完必须 check；把每一步的真实工具调用逐条回传。',
+  ].join('\n')
+}
+
 /** The worker: a real tool-carrying sub-agent when the host provides one, a JSON completion otherwise. */
 export function makeWorker(runtime: LoopRuntime, loop: LoopContext): Worker {
   const constraintLine = loop.constraints.length ? `\nConstraints: ${loop.constraints.join(' | ')}` : ''
@@ -481,6 +526,7 @@ export function makeWorker(runtime: LoopRuntime, loop: LoopContext): Worker {
     }
   }
   return async (intent: IntentSpec): Promise<WorkerResult> => {
+    const craft = loop.craft ? await loop.craft().catch(() => null) : null
     // What this direction already produced (a re-queued intent after a pause or
     // a crash): the worker continues from there instead of repeating it.
     let priorLine = ''
@@ -502,6 +548,7 @@ export function makeWorker(runtime: LoopRuntime, loop: LoopContext): Worker {
       `Assets: ${(intent.assets || loop.fallbackAssets).join(', ')}`,
       priorLine,
       ...(intent.overview ? [workerOverviewFrame(intent.overview)] : []),
+      ...(craft ? [craftWorkerFrame(craft as Record<string, any>)] : []),
     ].filter((line) => line !== undefined).join('\n')
     // The worker runs under the task's permission mode, not the caller's.
     // `subagentWith` is how that mode is applied without rebuilding the runner:

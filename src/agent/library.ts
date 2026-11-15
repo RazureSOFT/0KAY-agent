@@ -60,6 +60,26 @@ const WORK = [
   /\b[\w.-]+\.(ts|tsx|js|jsx|vue|go|py|rs|java|json|md|css|ya?ml|toml|sh|ps1|sql|html)\b/i,
 ];
 
+/**
+ * Requests whose whole deliverable is the reply itself: counting, arithmetic,
+ * a short piece of writing, a one-line translation, "answer in one word".
+ * Nothing is written to disk and no command is run, so a completion gate has
+ * nothing to verify — an intent ledger for "count to 30" is pure overhead and
+ * shows the reader a progress card over a one-line answer.
+ *
+ * Deliberately phrase-based, not a verb list: "写一个文件" starts with the same
+ * verb as "写一首诗" but must stay a task. Callers additionally require a short
+ * message with no path, so "翻译 src/main.ts" never lands here.
+ */
+const TEXT_ONLY = new RegExp([
+  '(数到|数一下|数数|报数)',
+  'count\\s+(from|to)\\s+\\d+',
+  '\\d+\\s*[+\\-×*/÷]\\s*\\d+',
+  '(写一首|写首诗|写一句|来一首|讲个笑话|讲个故事|编个故事|说一句话)',
+  '(只回复|只回答|用一句话|一个词|one word|in one word|reply in one word)',
+].join('|'), 'i');
+const SHORT_TRANSLATION = /^翻译\s+\S{1,40}$/;
+
 /** Sentences that take back an earlier instruction. */
 const CORRECTION = /(不是|我是说|我说的是|我是让你|别这样|不要再|记住|以后都|你应该|不要用|改用|i\s+meant|not\s+what\s+i|i\s+said|don'?t|instead|next\s+time|remember)/i;
 
@@ -79,6 +99,9 @@ export function classifyTurn(message: string): { kind: TurnKind; reason: string 
   // 120-character greeting is not a greeting.
   const long = text.length >= 120;
   if (hasPath) return { kind: 'task', reason: 'mentions a file or path' };
+  if (text.length < 120 && (TEXT_ONLY.test(text) || SHORT_TRANSLATION.test(text))) {
+    return { kind: 'chat', reason: 'text-only reply, no artefact to gate' };
+  }
   if (hasWork && text.length >= 4) return { kind: 'task', reason: 'contains an action request' };
   if (long) return { kind: 'task', reason: 'long message, treated as a request' };
   if (SOCIAL.some((pattern) => pattern.test(text))) return { kind: 'chat', reason: 'social turn' };

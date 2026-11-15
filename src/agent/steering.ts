@@ -8,13 +8,18 @@
 // where the previous instruction's result is known and the next one is not yet
 // chosen.
 //
-// The queue lives in memory, keyed by task. An interjection for a task that has
-// already finished is dropped with a reason the UI can show, rather than being
-// silently applied to the next task in the session.
+// The queue lives in memory, keyed by task, and is closed when the task ends.
+// Closing matters twice: a finished task must not keep accepting text that will
+// never be read, and the map must not grow for every task the process ever ran.
+// Anything still queued at that moment is returned to the caller so the UI can
+// say what was dropped instead of pretending it was delivered.
 
+import { randomUUID } from 'crypto';
 import type { AgentEventBus } from './events.js';
 
 export interface Interjection {
+  /** Stable handle: the UI removes one entry by id, never by position. */
+  id: string;
   taskId: string;
   sessionId: string;
   text: string;
@@ -32,20 +37,47 @@ export class SteeringQueue {
     this.events = events;
   }
 
-  /** Returns false when the task is not running here, which lets the caller 409. */
-  push(taskId: string, sessionId: string, text: string): { ok: boolean; queued: number; reason?: string } {
+  /**
+   * Returns false when the task is not running here, which lets the caller 409.
+   *
+   * `id` is echoed back on success so the browser can render the entry it just
+   * created and later delete exactly that one.
+   */
+  push(taskId: string, sessionId: string, text: string): { ok: boolean; queued: number; id?: string; reason?: string } {
     const clean = String(text || '').replace(/\u0000/g, '').trim().slice(0, MAX_TEXT);
     if (!clean) return { ok: false, queued: 0, reason: 'empty message' };
     const queue = this.queues.get(taskId);
     if (!queue) return { ok: false, queued: 0, reason: 'task is not running on this executor' };
     if (queue.length >= MAX_PER_TASK) return { ok: false, queued: queue.length, reason: 'too many queued instructions for this task' };
-    queue.push({ taskId, sessionId, text: clean, createdAt: Date.now() });
-    return { ok: true, queued: queue.length };
+    const entry: Interjection = { id: `steer_${randomUUID()}`, taskId, sessionId, text: clean, createdAt: Date.now() };
+    queue.push(entry);
+    return { ok: true, queued: queue.length, id: entry.id };
   }
 
   /** Registers a running task so interjections have somewhere to land. */
   open(taskId: string): void {
     this.queues.set(taskId, []);
+  }
+
+  /** Everything still waiting, oldest first. Empty for a task that is not open. */
+  list(taskId: string): Interjection[] {
+    return [...(this.queues.get(taskId) ?? [])];
+  }
+
+  /**
+   * Drop one queued instruction.
+   *
+   * Undoing has to be possible before the drain: the whole point of the queue is
+   * that the user typed faster than the agent moved, and a mis-sent line must be
+   * retractable while it is still waiting.
+   */
+  remove(taskId: string, id: string): boolean {
+    const queue = this.queues.get(taskId);
+    if (!queue || !id) return false;
+    const index = queue.findIndex((entry) => entry.id === id);
+    if (index < 0) return false;
+    queue.splice(index, 1);
+    return true;
   }
 
   close(taskId: string): Interjection[] {

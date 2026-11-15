@@ -13,6 +13,8 @@ import { FindingStore } from './findings.js'
 import type { LoopRuntime, LoopContext, ReviewOutcome } from './loop.js'
 import { renderAssessmentReport } from './report.js'
 import { writeFileAtomic } from '../../tools/atomic_write.js'
+import { CraftProject } from '../craft/project.js'
+import type { CraftMode } from '../craft/observe.js'
 
 // The task system: RECON's long-lived assessment tasks, adapted to this agent.
 //
@@ -54,6 +56,10 @@ export interface AssessmentSpec {
   model?: string
   /** Event-text language: 'zh' (default) or 'en'. */
   locale?: string
+  /** craft only: clean_room (default, visible evidence) or deep (source allowed). */
+  craftMode?: CraftMode
+  /** craft only: "how alike" required before Ready, 0-100. */
+  craftThreshold?: number
 }
 
 export interface AssessmentActivityEntry {
@@ -140,6 +146,12 @@ export interface AssessmentState {
   sessionId: string
   /** Defaults to `recon` when absent. */
   kind?: AssessmentKind
+  /**
+   * craft only: the on-disk project (craft.json, capture/, app/, checks/,
+   * investigation.cany/, inbox/). Absent on every task created before craft
+   * gained a project, and on non-craft tasks.
+   */
+  craftRoot?: string
   /** Absent means `normal`, which is what every task created before this field was. */
   permissionMode?: 'normal' | 'full_access'
   objective: string
@@ -245,10 +257,17 @@ export class AssessmentManager {
    */
   readonly findings = new FindingStore()
 
+  /** The ledger directory, absolute. Undefined means memory-only. */
+  private readonly dir?: string
+
   constructor(
     private readonly graphFor: (sessionId: string) => Promise<ReconGraph>,
-    private readonly dir?: string,
+    dir?: string,
   ) {
+    // Resolved once, here. A relative ledger directory would otherwise resolve
+    // against whatever cwd each later call happens to have — and the task that
+    // owns a craft project would come back to a different folder.
+    this.dir = dir ? path.resolve(dir) : undefined
     // Without the directory, every persist silently no-ops and tasks die with
     // the process — the ledger is the whole point of dir.
     if (this.dir) {
@@ -345,6 +364,27 @@ export class AssessmentManager {
     const kind: AssessmentKind =
       spec.kind === 'engineering' ? 'engineering' : spec.kind === 'craft' ? 'craft' : 'recon'
     const permissionMode: 'normal' | 'full_access' = spec.permissionMode === 'full_access' ? 'full_access' : 'normal'
+    const taskId = `as_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`
+    // A craft project lives beside the assessment ledger, keyed by task id, so
+    // a resumed task finds the same capture/, checks/ and app/ it left behind.
+    const craftBase = this.dir
+      ? path.dirname(this.dir)
+      : path.resolve(process.env.AGENT_DATA_DIR || './data/agent')
+    const craftRoot = kind === 'craft' ? path.join(craftBase, 'craft', taskId) : undefined
+    if (craftRoot) {
+      try {
+        await CraftProject.open(craftRoot, {
+          objective,
+          target: targets[0],
+          ...(spec.craftMode ? { mode: spec.craftMode } : {}),
+          ...(spec.craftThreshold != null ? { threshold: Number(spec.craftThreshold) } : {}),
+        })
+      } catch (error) {
+        // A project that cannot be created is worth surfacing, but it should not
+        // stop the assessment from being recorded.
+        console.warn(`[assessments] cannot create craft project ${craftRoot}: ${(error as Error)?.message || error}`)
+      }
+    }
     const graph = await this.graphFor(sessionId)
     const priorScope = graph.scope().map((row) => row.value)
     const scopeValues = [...new Set([...priorScope, ...targets])]
@@ -394,9 +434,10 @@ export class AssessmentManager {
     loop.constraints = constraints
 
     const state: AssessmentState = {
-      id: `as_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`,
+      id: taskId,
       sessionId,
       kind,
+      ...(craftRoot ? { craftRoot } : {}),
       permissionMode,
       objective,
       targets,
@@ -422,6 +463,9 @@ export class AssessmentManager {
       planSteps: [],
       traceSteps: [],
     }
+    // The planner re-reads the project every round: the last check's mismatch
+    // list, not the planner's memory, is what decides the next build step.
+    if (craftRoot) loop.craft = () => this.craftSummary(state)
     this.states.set(state.id, state)
     await this.persist(state)
     this.startActivity(state, graph, runtime, loop)
@@ -634,6 +678,14 @@ export class AssessmentManager {
       if (this.runs.has(id)) throw new Error('stop the assessment before deleting it')
       this.states.delete(id)
       if (this.dir) await fs.promises.rm(path.join(this.dir, `${id}.json`), { force: true }).catch(() => {})
+      // A craft project is a folder of captures and checks the task owned. Left
+      // behind it becomes an orphan nobody can open from the panel again, so it
+      // is removed with the task — and only when it really is this task's own
+      // project folder, never something the caller pointed at.
+      const craftRoot = state.craftRoot
+      if (craftRoot && path.basename(path.dirname(craftRoot)) === 'craft' && path.basename(craftRoot) === id) {
+        await fs.promises.rm(craftRoot, { recursive: true, force: true }).catch(() => undefined)
+      }
     } else {
       throw new Error(`unknown control action: ${action}`)
     }
@@ -780,7 +832,29 @@ export class AssessmentManager {
     return (state.traceSteps || []).filter((step) => step.intentId === intent)
   }
 
-  async get(id: string): Promise<{ state: AssessmentState; live?: AssessmentLive }> {
+  /**
+   * Compact live read of the craft project for the planner and the task page.
+   * A project that cannot be opened returns an error row rather than hiding the
+   * rest of the task.
+   */
+  private async craftSummary(state: AssessmentState): Promise<Record<string, any> | null> {
+    if (state.kind !== 'craft' || !state.craftRoot) return null
+    try {
+      const project = await CraftProject.open(state.craftRoot)
+      const differences = await project.differences()
+      return {
+        taskId: state.id,
+        ...(await project.summary()),
+        differences: differences.slice(0, 16),
+        differenceTotal: differences.length,
+        guide: 'assessments(action:"craft", operation:"study"|"build"|"check"|"request"|"ready"|"project"|"differences"|"artifacts", id:<task id>, ...)',
+      }
+    } catch (error) {
+      return { root: state.craftRoot, stage: 'study', error: (error as Error)?.message || String(error) }
+    }
+  }
+
+  async get(id: string): Promise<{ state: AssessmentState; live?: AssessmentLive; craft?: Record<string, any> | null }> {
     await this.ensureLoaded()
     const state = this.states.get(id)
     if (!state) throw new Error(`unknown assessment: ${id}`)
@@ -811,7 +885,8 @@ export class AssessmentManager {
     } catch {
       // A graph that cannot be read right now does not hide the task's ledger.
     }
-    return { state, live }
+    const craft = await this.craftSummary(state)
+    return { state, live, ...(craft ? { craft } : {}) }
   }
 
   /**

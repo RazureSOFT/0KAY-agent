@@ -82,7 +82,7 @@ export interface ExplorationNode {
   createdAt: string
 }
 
-export type ScopeKind = 'domain' | 'ip' | 'cidr' | 'company'
+export type ScopeKind = 'domain' | 'ip' | 'cidr' | 'company' | 'surface'
 
 export interface ScopeEntry {
   kind: ScopeKind
@@ -108,6 +108,18 @@ export interface Coverage {
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
 
+/**
+ * Anything observable that is not reachable by host: a local build, a screenshot
+ * target, a file URL. A craft task's target is exactly this, and refusing to
+ * classify it made the whole assessment fail at creation with "cannot classify
+ * asset" — a build page is a legitimate thing to study.
+ */
+const LOCAL_SURFACE = /^(file:\/\/|[a-z]:[\\/]|\.{0,2}[\\/])/i
+
+function localSurfaceKey(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+$/, '') || value.trim()
+}
+
 function now(): string {
   return new Date().toISOString()
 }
@@ -118,6 +130,11 @@ function now(): string {
  */
 export function classify(raw: string): { kind: AssetKind; key: string; parentKey?: string; parentKind?: AssetKind } {
   const value = raw.trim()
+  // A local surface (a build directory, a file:// page) is an app, not a host.
+  // Checked before the URL rule: `file://` parses as a scheme plus an empty or
+  // drive-letter host, and treating that as a service produced nonsense keys.
+  if (LOCAL_SURFACE.test(value)) return { kind: 'app', key: localSurfaceKey(value) }
+
   const url = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]+)(\/[^?#]*)?/i.exec(value)
   if (url) {
     const host = url[2].toLowerCase()
@@ -166,6 +183,8 @@ function assetHost(asset: Asset): string | undefined {
   if (asset.kind === 'ip') return asset.key
   if (asset.kind === 'service') return asset.key.replace(/:\d+$/, '')
   if (asset.kind === 'endpoint') return classify(asset.key).key.match(/^https?:\/\/([^/]+)/)?.[1]
+  // An `app` has no host by definition; its own key is its identity in scope.
+  if (asset.kind === 'app') return undefined
   return undefined
 }
 
@@ -332,6 +351,13 @@ export class ReconGraph {
         host = value.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].replace(/:\d+$/, '')
       }
       if (!host) continue
+      if (LOCAL_SURFACE.test(value)) {
+        // A local surface is its own scope row: it has no host to match against,
+        // so reducing it to "domain: <drive letter>" would put nothing in scope
+        // and a craft task would report 0% coverage forever.
+        entries.push({ kind: 'surface', value: localSurfaceKey(value) })
+        continue
+      }
       entries.push({ kind: IPV4.test(host) ? 'ip' : 'domain', value: host })
     }
     return entries
@@ -542,6 +568,10 @@ export class ReconGraph {
       if (row.kind === 'ip') return host === row.value
       if (row.kind === 'cidr') return host ? ipv4InCidr(host, row.value) : false
       if (row.kind === 'company') return (asset.company || '').toLowerCase() === row.value.toLowerCase()
+      // A local surface matches by identity: a path is either the one being
+      // studied or it is not, and "ends with the same path" would let
+      // `app/index.html` fall inside the scope of `build/app/index.html`.
+      if (row.kind === 'surface') return asset.kind === 'app' && asset.key === row.value
       if (!host) return false
       return host === row.value || host.endsWith(`.${row.value}`)
     })

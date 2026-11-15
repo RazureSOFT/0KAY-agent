@@ -28,6 +28,21 @@ test('a long message is treated as a request', () => {
   assert.equal(classifyTurn('x'.repeat(150)).kind, 'task');
 });
 
+test('a reply that produces no artefact stays a chat turn', () => {
+  for (const message of [
+    '从 1 数到 30', '数一下数字', 'count from 1 to 30 slowly', '1+1 等于几',
+    '写一首关于猫的小诗', '讲个笑话', '只回复一个词：收到', '翻译 hello',
+  ]) {
+    assert.equal(classifyTurn(message).kind, 'chat', message);
+  }
+});
+
+test('the same verbs on a real artefact stay tasks', () => {
+  for (const message of ['写一个文件', '写一个登录页面', '帮我把 1 写到 a.txt', '跑一下 npm test']) {
+    assert.equal(classifyTurn(message).kind, 'task', message);
+  }
+});
+
 test('only explicit corrections become rules', () => {
   assert.ok(extractRule('不是这个意思，我是说不要用 localStorage'));
   assert.ok(extractRule('I meant the gateway, not the proxy'));

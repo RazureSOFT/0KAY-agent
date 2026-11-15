@@ -15,7 +15,7 @@ export class IntentTool extends Tool {
   get name(): string { return 'intent'; }
 
   get description(): string {
-    return 'Record or update the list of things the user asked for (the intent ledger). Call it once you understand the request, and again whenever the list or a status changes. The completion rate is derived from these entries; a 100% claim is rejected while any entry is open.';
+    return 'Record or update the list of things the user asked for (the intent ledger), on tasks that have a completion gate. Call it once you understand the request, and again whenever the list or a status changes. The completion rate is derived from these entries; a 100% claim is rejected while any entry is open. Do not use it for a plain chat reply — a short answer that produces no artefact has no gate to satisfy.';
   }
 
   get parameters(): Record<string, any> {
@@ -45,6 +45,13 @@ export class IntentTool extends Tool {
 
   async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
     try {
+      // The tool is hidden on ungated turns, but a model can still name it and
+      // the registry will load it on demand. Do not let that write a ledger for
+      // a chat reply: the browser would render an intent strip over a one-line
+      // answer, which is the whole thing the gate-off decision was avoiding.
+      if (context.gate && !context.gate.enabled) {
+        return success({ skipped: true, reason: 'this turn has no completion gate; reply directly' });
+      }
       if (!Array.isArray(args.intents)) throw new Error('intents must be an array');
       if (!context.gate) throw new Error('the intent ledger is not available in this context');
       const result = context.gate.updateIntents(args.intents, typeof args.approach === 'string' ? args.approach : '', 'agent', {

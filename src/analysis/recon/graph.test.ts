@@ -45,6 +45,35 @@ test('nonsense is refused', () => {
   assert.throws(() => classify('not an asset at all'), /cannot classify/)
 })
 
+// A craft task studies something observable, and the most common thing to study
+// is a local build. Refusing to classify it made task creation fail outright
+// with "cannot classify asset", which read like a bug in the task system.
+test('a local surface is an app, not a host', () => {
+  const fileUrl = classify('file:///D:/work/page/index.html')
+  assert.equal(fileUrl.kind, 'app')
+  assert.equal(fileUrl.parentKey, undefined, 'an app has no host parent')
+
+  assert.equal(classify('D:/work/page/index.html').kind, 'app')
+  assert.equal(classify('D:/work/page/index.html').key, 'D:/work/page/index.html')
+  assert.equal(classify('./app/index.html').kind, 'app')
+})
+
+test('a local surface keeps remote URLs as hosts', () => {
+  assert.equal(classify('https://example.com/page').kind, 'endpoint')
+  assert.equal(classify('example.com').kind, 'root_domain')
+})
+
+test('a local surface is its own scope row and matches by identity', () => {
+  const graph = new ReconGraph()
+  graph.setScope(['file:///D:/work/page/index.html'])
+  assert.deepEqual(graph.scope(), [{ kind: 'surface', value: 'file:///D:/work/page/index.html' }])
+  const inside = graph.addAsset('file:///D:/work/page/index.html')
+  assert.equal(graph.inScope(inside), true)
+  assert.equal(graph.coverage().scope.denominator, 1, 'the studied page is the denominator')
+  const other = graph.addAsset('file:///D:/work/other/index.html')
+  assert.equal(graph.inScope(other), false, 'a different page is not the same scope')
+})
+
 test('adding a child adds the parents it needs', () => {
   const graph = new ReconGraph()
   const endpoint = graph.addAsset('https://api.example.com/users')

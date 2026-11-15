@@ -364,6 +364,14 @@ export class Agent {
   private pluginToolNames = new Set<string>();
   private lastPluginToolRefresh = 0;
   /**
+   * Tasks with no completion gate. The gate is a per-turn decision (a chat
+   * reply has nothing for a reviewer to check), while the tool registry is
+   * shared by every task in the process. Recording it here lets toolVisible
+   * hide the ledger tools for exactly these turns without unregistering them
+   * for a sibling task that does need the gate.
+   */
+  private ungatedTasks = new Set<string>();
+  /**
    * Extensions that change how this agent behaves, as opposed to tools it can
    * call. Loaded from disk, so installing one is a directory copy rather than a
    * rebuild, and disabling one takes effect on the next task.
@@ -1070,7 +1078,11 @@ export class Agent {
     // its children finish, so waiting for a slot would deadlock as soon as the
     // limit is reached (and a parallel explore fan-out would serialise itself
     // to nothing). Children share their parent's slot instead.
-    return this.taskManager.executeTask(taskId, async () => {
+    // The interjection queue is task-scoped memory. Closing it in `finally` is
+    // what keeps a finished task from accepting text nobody will read, and what
+    // keeps the map from growing for every task this process ever ran.
+    try {
+    return await this.taskManager.executeTask(taskId, async () => {
       let workdir = options.workdir;
       const workspaceSelector = options.workspace || options.project;
       if (!workdir && workspaceSelector) workdir = await this.resolveWorkspacePath(String(workspaceSelector));
@@ -1196,6 +1208,8 @@ export class Agent {
         events: agentEvents,
       });
       context.gate = gate;
+      if (gateModeSetting === 'off') this.ungatedTasks.add(taskId);
+      else this.ungatedTasks.delete(taskId);
       context.facts = new FactMemory();
       context.permissions = new PermissionLedger(cwd, { allowAgentSelfWrite: selfWrites });
       steering.open(taskId);
@@ -1569,6 +1583,21 @@ _(Answer truncated by the model's output limit in ${truncatedTurns} place(s). Ra
       }
       return result;
     }, depth > 0);
+    } finally {
+      this.ungatedTasks.delete(taskId);
+      const dropped = steering.close(taskId);
+      if (dropped.length) {
+        // Say what was not delivered, on the task stream, so the browser can
+        // show it rather than leave the queued chip sitting there forever.
+        agentEvents.emit({
+          type: 'task.finished',
+          taskId,
+          sessionId: String(options.session_id || ''),
+          at: Date.now(),
+          data: { passed: false, droppedSteering: dropped.map((entry) => entry.text) },
+        });
+      }
+    }
   }
 
   private async exploreSolutions(context: AgentContext, taskId: string, prompt: string, baseType: string, mode: MultiAgentMode): Promise<Array<{ angle: string; result: string }>> {
@@ -1678,9 +1707,15 @@ _(Answer truncated by the model's output limit in ${truncatedTurns} place(s). Ra
     // A plugin can hide a tool it replaces, or one this deployment must not use.
     const hidden = this.extensions?.hiddenTools();
     const notHidden = hidden && hidden.size ? (name: string) => !hidden.has(name) : () => true;
-    if (this.settings.tool_disclosure === 'all') return notHidden;
+    // A turn without a completion gate has no intent ledger. Hiding the tool
+    // matters more than disabling it: its description tells the model to call
+    // it "once you understand the request", so merely no-op'ing the call would
+    // still spend a round trip and leave an `intent` step on a "count to 30".
+    const gateOff = this.ungatedTasks.has(taskId);
+    const gateAllows = gateOff ? (name: string) => name !== 'intent' : () => true;
+    if (this.settings.tool_disclosure === 'all') return (name: string) => notHidden(name) && gateAllows(name);
     const groups = this.loadedGroups(taskId);
-    return (name: string) => notHidden(name) && (isAlwaysLoaded(name) || groups.has(groupOf(name) || ''));
+    return (name: string) => notHidden(name) && gateAllows(name) && (isAlwaysLoaded(name) || groups.has(groupOf(name) || ''));
   }
 
   /**
@@ -2080,6 +2115,9 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
 
   /** Push the intent state onto the same task row the UI already polls. */
   private async recordIntentState(context: AgentContext, gate: QualityGate, verdict?: Record<string, any>): Promise<void> {
+    // An empty ledger written to the turn row is enough for the browser to
+    // show an intent strip. Never persist one for a turn with no gate.
+    if (!gate.enabled) return;
     const state = gate.ledger.serialize();
     await this.recorder.record({
       task_id: context.taskId,
@@ -2505,10 +2543,25 @@ Deliverables: when the turn produced or modified files, call report_artifacts on
       const text = String(parsed.text || '');
       if (!taskId) return { success: false, result: '', error: 'task_id required' };
       const queued = steering.push(taskId, String(parsed.session_id || ''), text);
-      return { success: queued.ok, result: JSON.stringify({ queued: queued.queued, reason: queued.reason || '' }), error: queued.ok ? '' : (queued.reason || 'not queued') };
+      // The full queue comes back so the browser can render the list it is
+      // looking at rather than guessing what the server now holds.
+      return { success: queued.ok, result: JSON.stringify({ queued: queued.queued, id: queued.id || '', reason: queued.reason || '', pending: steering.list(taskId) }), error: queued.ok ? '' : (queued.reason || 'not queued') };
     }
     if (tool === 'task_steer_status') {
-      return { success: true, result: JSON.stringify({ active: steering.activeTasks, pending: steering.pending(String(parsed.task_id || '')) }), error: '' };
+      const taskId = String(parsed.task_id || '');
+      // `pending` is the list, in the same shape task_steer and task_steer_cancel
+      // return, so the browser does not have to know which call produced it.
+      // `queued` carries the count; `list` stays as an alias for older callers.
+      const list = steering.list(taskId);
+      return { success: true, result: JSON.stringify({ active: steering.activeTasks, pending: list, queued: list.length, list }), error: '' };
+    }
+    if (tool === 'task_steer_cancel') {
+      // Undo one queued instruction, before the drain picks it up.
+      const taskId = String(parsed.task_id || '');
+      const id = String(parsed.id || '');
+      if (!taskId || !id) return { success: false, result: '', error: 'task_id and id required' };
+      const removed = steering.remove(taskId, id);
+      return { success: removed, result: JSON.stringify({ removed, queued: steering.pending(taskId), pending: steering.list(taskId) }), error: removed ? '' : 'instruction already delivered or unknown' };
     }
     if (tool === 'workspace_admin' || tool === 'projects_admin') {
       try {
