@@ -181,71 +181,10 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
   };
 
   const memory = (mod: number, rmLow: number, size: number): Operand | null => {
-    const lowBits = rmLow & 7;
-
-    if (mod === 3) {
-      return { kind: 'reg', reg: regName(lowBits + (rexB ? 8 : 0), size, hasRex), size };
-    }
-
-    let text = '';
-    let hasBase = false;
-    let base: string | undefined;
-    let indexReg: string | undefined;
-    let scale: number | undefined;
-    let disp = 0;
-
-    if (lowBits === 4) {
-      const sib = read();
-      scale = 1 << (sib >> 6);
-      const indexField = (sib >> 3) & 7;
-      const baseField = sib & 7;
-      const hasIndex = indexField !== 4;
-      if (baseField === 5 && mod === 0) {
-        // No base register: the displacement is the whole address.
-        disp = read32(bytes, index);
-        index += 4;
-        text = `0x${disp.toString(16)}`;
-      } else {
-        base = REG64[baseField + (rexB ? 8 : 0)];
-        text = base;
-        hasBase = true;
-      }
-      if (hasIndex) {
-        indexReg = REG64[indexField + (rexX ? 8 : 0)];
-        const term = scale === 1 ? indexReg : `${indexReg}*${scale}`;
-        text = hasBase ? `${text}+${term}` : term;
-      }
-    } else if (lowBits === 5 && mod === 0) {
-      // RIP-relative in 64-bit mode: the displacement is the whole operand.
-      const d = readInt32(bytes, index);
-      const value = read32(bytes, index);
-      index += 4;
-      return {
-        kind: 'mem', mem: `rip${d < 0 ? '-' : '+'}0x${value.toString(16)}`, size,
-        value: d, rip: true, disp: d,
-      };
-    } else {
-      base = REG64[lowBits + (rexB ? 8 : 0)];
-      text = base;
-      hasBase = true;
-    }
-
-    if (mod === 1) {
-      const d = (bytes[index++] << 24) >> 24;
-      disp += d;
-      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
-    } else if (mod === 2) {
-      const d = readInt32(bytes, index);
-      index += 4;
-      disp += d;
-      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
-    }
-    return {
-      kind: 'mem', mem: text.startsWith('+') ? text.slice(1) : text, size,
-      ...(base ? { base } : {}),
-      ...(indexReg ? { index: indexReg, scale } : {}),
-      ...(disp ? { disp } : {}),
-    };
+    const cursor = { index, rexB, rexX, hasRex };
+    const operand = decodeMemoryOperand(bytes, mod, rmLow, size, cursor);
+    index = cursor.index;
+    return operand;
   };
 
   const imm = (size: number): Operand => {
@@ -543,6 +482,90 @@ const TWO_BYTE_FLOW: Record<number, { name: string; flow?: Flow }> = {
  * far enough to step over it correctly -- a caller that needs the semantics of
  * a vector instruction is asking a different question than this answers.
  */
+
+/**
+ * Decode a ModRM memory operand: base, index, scale and displacement.
+ *
+ * Extracted from the one-byte path so the two-byte path can use it too. That
+ * path had rolled its own partial version which stopped at `{ kind: 'mem' }`
+ * and never read the addressing bytes, so every `movzx`/`cmov`/`setcc` memory
+ * access decoded as `[mem]` with no base and no index — and the decompiler then
+ * printed `mem:[undefined+undefined]` where the original said `[rax+rcx]`.
+ */
+function decodeMemoryOperand(
+  bytes: Uint8Array,
+  mod: number,
+  rmLow: number,
+  size: number,
+  cursor: { index: number; rexB: boolean; rexX: boolean; hasRex: boolean },
+): Operand | null {
+    const lowBits = rmLow & 7;
+
+    if (mod === 3) {
+      return { kind: 'reg', reg: regName(lowBits + (cursor.rexB ? 8 : 0), size, cursor.hasRex), size };
+    }
+
+    let text = '';
+    let hasBase = false;
+    let base: string | undefined;
+    let indexReg: string | undefined;
+    let scale: number | undefined;
+    let disp = 0;
+
+    if (lowBits === 4) {
+      const sib = bytes[cursor.index++] ?? 0;
+      scale = 1 << (sib >> 6);
+      const indexField = (sib >> 3) & 7;
+      const baseField = sib & 7;
+      const hasIndex = indexField !== 4;
+      if (baseField === 5 && mod === 0) {
+        // No base register: the displacement is the whole address.
+        disp = read32(bytes, cursor.index);
+        cursor.index += 4;
+        text = `0x${disp.toString(16)}`;
+      } else {
+        base = REG64[baseField + (cursor.rexB ? 8 : 0)];
+        text = base;
+        hasBase = true;
+      }
+      if (hasIndex) {
+        indexReg = REG64[indexField + (cursor.rexX ? 8 : 0)];
+        const term = scale === 1 ? indexReg : `${indexReg}*${scale}`;
+        text = hasBase ? `${text}+${term}` : term;
+      }
+    } else if (lowBits === 5 && mod === 0) {
+      // RIP-relative in 64-bit mode: the displacement is the whole operand.
+      const d = readInt32(bytes, cursor.index);
+      const value = read32(bytes, cursor.index);
+      cursor.index += 4;
+      return {
+        kind: 'mem', mem: `rip${d < 0 ? '-' : '+'}0x${value.toString(16)}`, size,
+        value: d, rip: true, disp: d,
+      };
+    } else {
+      base = REG64[lowBits + (cursor.rexB ? 8 : 0)];
+      text = base;
+      hasBase = true;
+    }
+
+    if (mod === 1) {
+      const d = (bytes[cursor.index++] << 24) >> 24;
+      disp += d;
+      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
+    } else if (mod === 2) {
+      const d = readInt32(bytes, cursor.index);
+      cursor.index += 4;
+      disp += d;
+      text += `${d < 0 ? '-' : '+'}0x${Math.abs(d).toString(16)}`;
+    }
+    return {
+      kind: 'mem', mem: text.startsWith('+') ? text.slice(1) : text, size,
+      ...(base ? { base } : {}),
+      ...(indexReg ? { index: indexReg, scale } : {}),
+      ...(disp ? { disp } : {}),
+    };
+  }
+
 function decodeTwoByte(
   bytes: Uint8Array, start: number, indexRef: number, address: number,
   prefixText: string, state: { rexR: boolean; rexB: boolean; rexX: boolean; rexW: boolean; operandSize: number; hasRex: boolean },
@@ -615,10 +638,15 @@ function decodeTwoByte(
       ? { kind: 'reg', reg: XMM[rmField], size: 128 }
       : { kind: 'reg', reg: regName(rmField, second === 0xb6 || second === 0xb7 || second === 0xbe || second === 0xbf ? 8 : state.operandSize, state.hasRex), size: state.operandSize };
   } else {
-    if ((modrmByte & 7) === 4) index++;
-    const dispBytes = mod === 1 ? 1 : mod === 2 ? 4 : ((modrmByte & 7) === 5 ? 4 : 0);
-    index += dispBytes;
-    operand = { kind: 'mem', mem: '[mem]', size: state.operandSize };
+    // The full addressing parse, not a byte-counting stub. The stub advanced the
+    // cursor by the right number of bytes but kept none of them, so every
+    // memory operand in this block decoded as `[mem]` — no base, no index, no
+    // displacement — and the decompiler downstream printed `[undefined+undefined]`
+    // where the binary plainly said `[rax+rcx]`.
+    const cursor = { index, rexB: state.rexB, rexX: state.rexX, hasRex: state.hasRex };
+    const memSize = second === 0xb6 || second === 0xb7 || second === 0xbe || second === 0xbf ? 8 : state.operandSize;
+    operand = decodeMemoryOperand(bytes, mod, modrmByte & 7, memSize, cursor);
+    index = cursor.index;
   }
 
   if (second >= 0x90 && second <= 0x9f && operand) {

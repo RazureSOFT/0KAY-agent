@@ -79,11 +79,40 @@ function substitute(expr: Expr, env: Map<string, Expr>): Expr {
 /** Fold constants and copies inside one statement list. */
 export function propagate(stmts: Stmt[]): Stmt[] {
   const env = new Map<string, Expr>();
+  /**
+   * Names that must not be shadowed.
+   *
+   * `mov rcx, rbx` then `sar rbx, 63` used to print `rbx = arg0 >> 63`: the
+   * environment still held `rbx -> arg0` from the first read, so the
+   * instruction that *redefines* rbx read the value rbx had before. The result
+   * was arithmetic on the wrong operand — `arg0 >> 63` instead of `rbx >> 63` —
+   * which is the kind of error that silently changes what the code means.
+   *
+   * A parameter (or any named slot) keeps its name. A register that shadows one
+   * gets a numbered name instead, so the two lives are visibly different.
+   */
+  const pinned = new Set<string>();
+  for (const stmt of stmts) {
+    if (stmt.t !== 'assign') continue;
+    const target = stmt.target;
+    const name = target.t === 'var' || target.t === 'reg' ? target.name : '';
+    if (name && /^(arg\d+$|v_|stack_|rbx|r12|r13|r14|r15)$/.test(name)) pinned.add(name);
+  }
+  const versions = new Map<string, number>();
   const out: Stmt[] = [];
   for (const stmt of stmts) {
     if (stmt.t === 'assign') {
       const value = substitute(stmt.value, env);
-      const target = stmt.target;
+      let target = stmt.target;
+      // A pinned name being redefined becomes a fresh variable, not an
+      // overwrite of the value that arrived in it.
+      const targetName = target.t === 'var' || target.t === 'reg' ? target.name : '';
+      if (targetName && pinned.has(targetName)) {
+        const next = (versions.get(targetName) || 1) + 1;
+        versions.set(targetName, next);
+        target = { ...target, name: `${targetName}_${next}` } as Expr;
+        env.delete(targetName);
+      }
       if (target.t === 'reg' || target.t === 'var') {
         if (value.t === 'const' || value.t === 'reg' || value.t === 'var') env.set(target.name, value);
         else env.delete(target.name);
@@ -126,8 +155,10 @@ export function removeDeadStores(stmts: Stmt[]): Stmt[] {
       if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') return true;
       const name = stmt.target.name;
       if (reads.has(name)) return true;
-      // Stack slots and arguments are observable by the caller; only a
-      // scratch register can be dropped safely.
+      // Stack slots, arguments and outgoing spills are observable by the caller;
+      // only a scratch register can be dropped safely. `stack_arg_` is the slot Go
+      // spills a result into — dropping that write would delete the only thing
+      // the function did.
       if (/^(arg\d+|v_|stack_)/.test(name)) return true;
       if (!isPure(stmt.value)) return true;
       return false;

@@ -112,10 +112,17 @@ export function analyzeFrame(instructions: Instruction[], convention: Convention
       const size = operand.size || 8;
       if (operand.base === 'rbp' && typeof operand.disp === 'number') {
         slotFor(operand.disp, size, 'rbp');
-      } else if (operand.base === 'rsp' && typeof operand.disp === 'number' && !frame.hasFramePointer) {
-        // Without a frame pointer the offset moves with every push; name it
-        // anyway and let the printed code carry the caveat.
-        slotFor(operand.disp, size, 'rsp');
+      } else if (operand.base === 'rsp' && typeof operand.disp === 'number') {
+        // rsp-relative addressing happens with a frame pointer too — Go emits
+        // `push rbp; mov rbp, rsp` and then addresses the frame off rsp anyway,
+        // because rsp is the register the stack guard already compared. Skipping
+        // these slots when a frame pointer exists left every such access printed
+        // as raw pointer arithmetic on an undefined rsp.
+        //
+        // The offset is a positive displacement into the frame (the frame was
+        // allocated by `sub rsp, N`), so it names the same kind of slot: within
+        // the allocation it is a local, beyond it is an incoming stack argument.
+        slotFor(rspSlotOffset(operand.disp, frame), size, 'rsp');
       }
     }
   }
@@ -126,31 +133,90 @@ export function analyzeFrame(instructions: Instruction[], convention: Convention
     if (ins.mnemonic !== 'mov') continue;
     const dst = ins.operands[0];
     const src = ins.operands[1];
-    if (dst?.kind !== 'mem' || dst.base !== 'rbp' || typeof dst.disp !== 'number') continue;
+    if (dst?.kind !== 'mem' || typeof dst.disp !== 'number') continue;
+    if (dst.base !== 'rbp' && dst.base !== 'rsp') continue;
     if (src?.kind !== 'reg' || !src.reg) continue;
     const index = frame.argRegisters.indexOf(src.reg);
     if (index < 0) continue;
-    const slot = slotFor(dst.disp, dst.size || 8);
+    const slot = slotFor(dst.base === 'rsp' ? rspSlotOffset(dst.disp, frame) : dst.disp, dst.size || 8);
     slot.name = `arg${index}`;
     slot.kind = 'param';
     frame.savedArgs.set(src.reg, slot.name);
   }
 
+  // A slot above the return address that is only ever written is a spill of the
+  // result, not an argument: Go stores rax there on the way out. Only a slot
+  // that is read before anything writes it can be an incoming parameter, and
+  // that distinction is what the old `argN` naming threw away.
+  promoteSpilledArgs(instructions, frame);
+
   return frame;
 }
 
+/** Rename result-spill slots to `argN` only when the body reads them first. */
+function promoteSpilledArgs(instructions: Instruction[], frame: Frame): void {
+  const pending = [...frame.slots.values()].filter((slot) => /^stack_arg_\d+$/.test(slot.name));
+  if (!pending.length) return;
+  for (const slot of pending) {
+    let written = false;
+    let read = false;
+    for (const ins of instructions) {
+      const operands = ins.operands;
+      for (let index = 0; index < operands.length; index += 1) {
+        const operand = operands[index];
+        if (!operand || operand.kind !== 'mem' || typeof operand.disp !== 'number') continue;
+        if (operand.base !== 'rbp' && operand.base !== 'rsp') continue;
+        const at = operand.base === 'rsp' ? rspSlotOffset(operand.disp, frame) : operand.disp;
+        if (at !== slot.offset) continue;
+        // Operand 0 of a write instruction is the destination.
+        if (index === 0 && !written) written = true;
+        else read = true;
+      }
+    }
+    if (read && !written) {
+      const index = (slot.offset - 0x10) / 8 + frame.argRegisters.length;
+      slot.name = `arg${index}`;
+      slot.kind = 'param';
+    }
+  }
+}
+
 function frameName(offset: number, frame: Frame, base: 'rbp' | 'rsp' = 'rbp'): string {
-  // rsp-relative offsets are not frame slots: without a frame pointer they
-  // move with every push, so they get a neutral name and no argument meaning.
-  if (base === 'rsp') return `stack_${offset}`;
+  // rsp-relative accesses arrive here already converted to frame-base offsets,
+  // so they name a slot like any other: negative is a local, positive beyond the
+  // return address is an incoming stack argument.
   if (offset < 0) return `v_${Math.abs(offset)}`;
   if (offset >= 0x10) {
     const index = (offset - 0x10) / 8 + frame.argRegisters.length;
-    return Number.isInteger(index) ? `arg${index}` : `stack_${offset}`;
+    // An unnamed slot in the argument area is only a parameter when it is read
+    // before anything stores to it. Go spills a register result into that same
+    // area, so blindly calling every slot `arg4` invents an argument the caller
+    // never passed — the write is what tells the two apart, and that is decided
+    // later, once the instructions have been walked.
+    return Number.isInteger(index) ? `stack_arg_${offset}` : `stack_${offset}`;
   }
   if (offset === 0) return 'saved_rbp';
   if (offset === 8) return 'return_address';
   return `stack_${offset}`;
+}
+
+/**
+ * Where an rsp-relative access lands, expressed the way the rest of the frame
+ * is addressed.
+ *
+ * With `push rbp; mov rbp, rsp; sub rsp, N`, a displacement of `d` off rsp is
+ * `-N + d` relative to the frame base: inside the allocation for `d < N`
+ * (a local), at or beyond `N` for an incoming stack argument. Returning the
+ * displacement unchanged would call every one of them `stack_256` and lose
+ * which ones are parameters.
+ *
+ * Exported because the IR builder has to apply exactly the same rule; two
+ * copies of this arithmetic is how the slot table and the printed code drift
+ * apart.
+ */
+export function rspSlotOffset(displacement: number, frame: Frame): number {
+  if (!frame.hasFramePointer || !frame.frameSize) return displacement;
+  return displacement - frame.frameSize;
 }
 
 /** Volatile registers are not preserved across a call; the printer uses this. */

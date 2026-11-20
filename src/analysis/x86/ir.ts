@@ -9,6 +9,7 @@
 import type { Instruction, Operand } from './decode.js';
 import type { BasicBlock } from './cfg.js';
 import type { Frame } from './frame.js';
+import { rspSlotOffset } from './frame.js';
 import type { SwitchInfo } from './switch.js';
 
 export type Expr =
@@ -127,8 +128,12 @@ export function operandExpr(operand: Operand | undefined, instruction: Instructi
         const slot = slotFor(operand.disp, size, frame);
         return asAddress ? { t: 'un', op: '&', value: slot, size: 64 } : slot;
       }
-      if (operand.base === 'rsp' && typeof operand.disp === 'number' && !frame.hasFramePointer) {
-        const slot = slotFor(operand.disp, size, frame);
+      // rsp-relative is a frame slot too, frame pointer or not. Go allocates with
+      // `sub rsp, N` and then addresses everything off rsp, so gating this on
+      // `!hasFramePointer` printed its entire frame as pointer arithmetic on a
+      // register that no instruction ever writes.
+      if (operand.base === 'rsp' && typeof operand.disp === 'number') {
+        const slot = slotFor(rspSlotOffset(operand.disp, frame), size, frame);
         return asAddress ? { t: 'un', op: '&', value: slot, size: 64 } : slot;
       }
       const address = addressExpr(operand, instruction);
@@ -171,17 +176,33 @@ function conditionFrom(mnemonic: string, pending: PendingCondition | null): Expr
   if (!pending) return { t: 'unknown', text: mnemonic, size: 1 };
   const { left, right } = pending;
   if (pending.op === 'test') {
-    // test a, b then je/jne is a zero check on the AND; other branches are rare.
-    const and: Expr = { t: 'bin', op: '&', left, right, size: left.size };
-    if (spec.op === '==') return { t: 'bin', op: '==', left: and, right: constExpr(0, left.size), size: 1 };
-    if (spec.op === '!=') return { t: 'bin', op: '!=', left: and, right: constExpr(0, left.size), size: 1 };
-    return { t: 'bin', op: spec.op, left: and, right: constExpr(0, left.size), size: 1 };
+    // `test a, a` is the compiler's own zero check — it exists precisely because
+    // it means "is this value zero", not "AND the value with itself". Printing
+    // the AND makes the reader think two different values were combined, and it
+    // prints the same name twice in one expression.
+    const selfTest = sameExpr(left, right);
+    const subject: Expr = selfTest ? left : { t: 'bin', op: '&', left, right, size: left.size };
+    if (spec.op === '==') return { t: 'bin', op: '==', left: subject, right: constExpr(0, left.size), size: 1 };
+    if (spec.op === '!=') return { t: 'bin', op: '!=', left: subject, right: constExpr(0, left.size), size: 1 };
+    return { t: 'bin', op: spec.op, left: subject, right: constExpr(0, left.size), size: 1 };
   }
   if (spec.zero) {
     return { t: 'bin', op: spec.op, left, right: constExpr(0, left.size), size: 1 };
   }
   const result: Expr = { t: 'bin', op: spec.op, left, right, size: 1 };
   return result;
+}
+
+/** Are these two operands literally the same value? `test reg, reg` and the like. */
+function sameExpr(a: Expr, b: Expr): boolean {
+  if (a.t !== b.t) return false;
+  switch (a.t) {
+    case 'reg': return a.name === (b as typeof a).name;
+    case 'var': return a.name === (b as typeof a).name;
+    case 'const': return a.v === (b as typeof a).v;
+    case 'load': return sameExpr(a.addr, (b as typeof a).addr);
+    default: return false;
+  }
 }
 
 const BINARY_VERBS: Record<string, string> = {

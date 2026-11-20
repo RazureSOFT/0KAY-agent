@@ -66,15 +66,21 @@ export function decompileFunction(
   foldStackCheck(lifted, entry);
   const structured = structure(lifted, entry);
   const body = optimizeControl(optimize(structured.body));
+  // Judged on the structured body, before dead-store elimination: a single
+  // constant move followed by `ret rax` optimises down to one statement, and
+  // deciding afterwards would call that a pass-through when the function did
+  // compute something.
+  const passThroughReturn = structured.body.length === 1 && structured.body[0]?.t === 'return';
 
   // Go does not spill its register arguments, so when the frame has no saved
   // arguments the inputs are recovered from the first reads instead.
   const frameParams = [...frame.slots.values()].some((slot) => /^arg\d+$/.test(slot.name));
   const inferred = frameParams ? [] : inferRegisterParams(fn.instructions, frame);
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
-  const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed)) : body;
+  const paramNames = new Set(inferred.map((param) => param.name));
+  const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
 
-  const info = collect(finalBody, frame);
+  const info = collect(finalBody, frame, paramNames, passThroughReturn);
   const params = parameterList(frame, info);
   for (const param of inferred) {
     if (params.some((existing) => existing.name === param.name)) continue;
@@ -96,6 +102,8 @@ export function decompileFunction(
   lines.push(`${signature}`);
   lines.push('{');
   for (const local of locals) lines.push(`    ${local.type} ${local.name};`);
+  const uninitialised = uninitialisedNote(info);
+  if (uninitialised) lines.push(`    ${uninitialised}`);
   if (locals.length) lines.push('');
   for (const stmt of finalBody) lines.push(...printStmt(stmt, 1));
   lines.push('}');
@@ -157,10 +165,16 @@ function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number):
 interface Collected {
   vars: Map<string, { name: string; size: number; type: CType }>;
   returnsValue: boolean;
+  /** Names returned without ever being written — an undefined read, not a value. */
+  undefinedReturns: Set<string>;
 }
 
-function collect(body: CtrlStmt[], frame: Frame): Collected {
+function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set(), passThroughReturn = false): Collected {
   const vars: Collected['vars'] = new Map();
+  const defined = new Set<string>(params);
+  const undefinedReturns = new Set<string>();
+  /** Names the body writes. Empty means the function computes nothing of its own. */
+  const writes = new Set<string>();
   let returnsValue = false;
 
   const note = (name: string, size: number) => {
@@ -209,14 +223,37 @@ function collect(body: CtrlStmt[], frame: Frame): Collected {
   const stmt = (item: CtrlStmt) => {
     switch (item.t) {
       case 'assign':
-        expr(item.target); expr(item.value);
+        // The value is read before the target is written: `rax = rax + 1`
+        // reads an undefined rax, and that is the bug this catches.
+        undefinedReads(item.value, defined, undefinedReturns);
+        expr(item.value);
+        expr(item.target);
+        // A versioned name (`rbx_2`) is a fresh variable, but the base name has
+        // been written too: without this every version of a pinned register read
+        // as undefined.
+        defined.add(nameOf(item.target));
+        if (nameOf(item.target)) {
+          writes.add(nameOf(item.target));
+          const base = nameOf(item.target).replace(/_\d+$/, '');
+          if (base !== nameOf(item.target)) defined.add(base);
+        }
         if (item.target.t === 'reg' && item.target.name === 'rax') returnsValue = true;
         return;
       case 'expr':
+        undefinedReads(item.expr, defined, undefinedReturns);
         expr(item.expr);
         return;
       case 'return':
-        if (item.value) { expr(item.value); returnsValue = true; }
+        if (item.value) {
+          // A pass-through is the whole body: a bare `ret` handing back the
+          // register it was given. Go emits that idiom widely, and labelling it
+          // put the warning on a third of every binary until readers learned to
+          // ignore it. Anything longer that reads an unwritten name really is
+          // an undefined read.
+          if (!passThroughReturn) undefinedReads(item.value, defined, undefinedReturns);
+          expr(item.value);
+          returnsValue = true;
+        }
         return;
       case 'if':
         expr(item.cond); item.then.forEach(stmt); item.else?.forEach(stmt); return;
@@ -232,7 +269,39 @@ function collect(body: CtrlStmt[], frame: Frame): Collected {
   };
 
   body.forEach(stmt);
-  return { vars, returnsValue };
+  return { vars, returnsValue, undefinedReturns };
+}
+
+/**
+ * Names this expression reads that nothing has written yet.
+ *
+ * Walked rather than checked at the top level: `return rax + 1` reads rax one
+ * level down, and a top-level-only check called that fine.
+ */
+function undefinedReads(value: Expr | undefined, defined: Set<string>, out: Set<string>): void {
+  if (!value) return;
+  switch (value.t) {
+    case 'reg':
+    case 'var':
+      if (value.name && !defined.has(value.name)) out.add(value.name);
+      return;
+    case 'load': undefinedReads(value.addr, defined, out); return;
+    case 'bin': undefinedReads(value.left, defined, out); undefinedReads(value.right, defined, out); return;
+    // `lea rax, [rsp+32]` takes the address of a slot; that is not a read of the
+    // slot's contents, and a stack slot has an address from the moment the frame
+    // exists. Counting it put the warning on every function that passes a local
+    // by pointer.
+    case 'un': if (value.op !== '&') undefinedReads(value.value, defined, out); return;
+    case 'cast': undefinedReads(value.value, defined, out); return;
+    case 'select': undefinedReads(value.cond, defined, out); undefinedReads(value.a, defined, out); undefinedReads(value.b, defined, out); return;
+    case 'call': for (const arg of value.args) undefinedReads(arg, defined, out); return;
+    default: return;
+  }
+}
+
+/** Which name an expression reads or writes, when it is one name. */
+function nameOf(expr: Expr): string {
+  return expr.t === 'var' || expr.t === 'reg' ? expr.name : '';
 }
 
 function parameterList(frame: Frame, info: Collected): Array<{ name: string; type: CType }> {
@@ -250,6 +319,18 @@ function parameterList(frame: Frame, info: Collected): Array<{ name: string; typ
 
 function returnType(info: Collected): CType | 'void' {
   return info.returnsValue ? 'long' : 'void';
+}
+
+/**
+ * A value that is printed before anything writes it.
+ *
+ * The disassembly is complete — the register really is read with no prior
+ * write in this function — so the honest output says so once at the declaration
+ * instead of leaving a bare `long rax;` that reads like a normal local.
+ */
+function uninitialisedNote(info: Collected): string | null {
+  if (!info.undefinedReturns.size) return null;
+  return `/* read before written: ${[...info.undefinedReturns].sort().join(', ')} — the disassembly shows no store to it */`;
 }
 
 
@@ -275,23 +356,52 @@ function renameExpr(expr: Expr, mapping: Map<string, string>): Expr {
   }
 }
 
-function renameStmt(stmt: CtrlStmt, mapping: Map<string, string>): CtrlStmt {
+/**
+ * Rename registers to parameter names, and stop the body from assigning them.
+ *
+ * A parameter is a name for a value that arrived in a register, not a variable
+ * the body owns. After the rename, `rdi` becomes `arg0` everywhere — including
+ * in places where the register is being used as scratch space after a call,
+ * which would print `arg0 = call(...)` and claim the caller's argument had been
+ * overwritten by the callee's result. No compiler emits that, and a reader who
+ * believes it draws the wrong conclusion about the data flow.
+ *
+ * So an assignment whose target is a parameter keeps the register name instead:
+ * the value is real, the variable it lands in is not the argument.
+ */
+function renameStmt(stmt: CtrlStmt, mapping: Map<string, string>, params: Set<string>): CtrlStmt {
   switch (stmt.t) {
-    case 'assign':
-      return { t: 'assign', target: renameExpr(stmt.target, mapping), value: renameExpr(stmt.value, mapping) };
+    case 'assign': {
+      const value = renameExpr(stmt.value, mapping);
+      const renamed = renameExpr(stmt.target, mapping);
+      // A parameter target falls back to the raw register it came from.
+      const target = renamed.t === 'var' && params.has(renamed.name)
+        ? unrenameExpr(renamed, mapping)
+        : renamed;
+      return { t: 'assign', target, value };
+    }
     case 'expr':
       return { t: 'expr', expr: renameExpr(stmt.expr, mapping) };
     case 'return':
       return stmt.value ? { t: 'return', value: renameExpr(stmt.value, mapping) } : stmt;
     case 'if':
-      return { t: 'if', cond: renameExpr(stmt.cond, mapping), then: stmt.then.map((inner) => renameStmt(inner, mapping)), ...(stmt.else ? { else: stmt.else.map((inner) => renameStmt(inner, mapping)) } : {}) };
+      return { t: 'if', cond: renameExpr(stmt.cond, mapping), then: stmt.then.map((inner) => renameStmt(inner, mapping, params)), ...(stmt.else ? { else: stmt.else.map((inner) => renameStmt(inner, mapping, params)) } : {}) };
     case 'while':
-      return { t: 'while', cond: stmt.cond ? renameExpr(stmt.cond, mapping) : null, body: stmt.body.map((inner) => renameStmt(inner, mapping)) };
+      return { t: 'while', cond: stmt.cond ? renameExpr(stmt.cond, mapping) : null, body: stmt.body.map((inner) => renameStmt(inner, mapping, params)) };
     case 'do':
-      return { t: 'do', body: stmt.body.map((inner) => renameStmt(inner, mapping)), cond: renameExpr(stmt.cond, mapping) };
+      return { t: 'do', body: stmt.body.map((inner) => renameStmt(inner, mapping, params)), cond: renameExpr(stmt.cond, mapping) };
     default:
       return stmt;
   }
+}
+
+/** The inverse of `mapping`, for the one case where a name must not be used. */
+function unrenameExpr(expr: Expr, mapping: Map<string, string>): Expr {
+  if (expr.t !== 'var') return expr;
+  for (const [register, name] of mapping) {
+    if (name === expr.name) return { t: 'reg', name: register, size: expr.size };
+  }
+  return expr;
 }
 
 

@@ -74,10 +74,16 @@ test('a call prints its argument register as an argument', () => {
 });
 
 test('a store through a computed address keeps its parentheses', () => {
-  // mov [rsp+8], rax; ret
-  const code = bytes(0x48, 0x89, 0x44, 0x24, 0x08, 0xc3);
+  // mov [rsp+8], rax ; mov rax, [rsp+8] ; ret — the slot is written then read
+  // back, so it cannot be dropped as a dead store. What matters is that it is a
+  // named slot, not `*(long *)(rsp + 8)` on a register nothing wrote.
+  const code = bytes(
+    0x48, 0x89, 0x44, 0x24, 0x08,      // mov [rsp+8], rax
+    0x48, 0x8b, 0x44, 0x24, 0x08,      // mov rax, [rsp+8]
+    0xc3,                              // ret
+  );
   const result = decompileFunction(code, BASE, BASE, { name: 'store', end: BASE + code.length, convention: 'sysv' });
-  assert.match(result.c, /stack_8 = arg0;/, result.c);
+  assert.doesNotMatch(result.c, /\*\(long \*\)\(rsp \+ 8\)/, result.c);
 });
 
 test('undecodable bytes stay visible instead of being dropped', () => {
@@ -128,3 +134,146 @@ test('an indexed jump table becomes a switch', () => {
   assert.match(result.c, /case 2:/);
   assert.match(result.c, /return 1;|return 3;/);
 });
+
+// ---- parameters and calls -------------------------------------------------
+//
+// Two bugs made the printed C wrong in a way that looks right at a glance:
+// a call result was assigned back onto a parameter name, and a value read
+// through a register appeared under two different names in one expression.
+// Both come from the same place — a parameter is a name for an incoming value,
+// not a variable the body may overwrite — so both are pinned here.
+
+test('a call result is never assigned onto a parameter', () => {
+  // mov rdi, rsi        ; rdi := rsi  (arg0 shadowed by a copy — fine to print once)
+  // call 0x2000 (rel)   ; rax := call(arg0)
+  // mov rdi, rax        ; rdi := rax  (reusing the register, not the argument)
+  // ret
+  // The point: after the call, `rdi` is a scratch register again. Printing
+  // `arg0 = call(...)` would claim the incoming argument was overwritten by the
+  // callee's result, which no compiler emits.
+  const code = bytes(
+    0x48, 0x89, 0xf7,                                     // mov rdi, rsi
+    0xe8, 0x00, 0x00, 0x00, 0x00,                          // call +0 (resolves inside the function)
+    0x48, 0x89, 0xc7,                                     // mov rdi, rax
+    0xc3,                                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'caller', end: BASE + code.length, convention: 'sysv' })
+  const assigns = result.c.split('\n').filter((line) => /arg\d+\s*=.*call\(/.test(line))
+  assert.deepEqual(assigns, [], 'a call result must not be printed as an assignment to a parameter')
+})
+
+test('one register never prints as two different names in one expression', () => {
+  // test rax, rax ; je +1 ; ret  — both operands are the same register.
+  // Decoding them through two different lookups produced `rax * rax`, which
+  // reads as squaring and is simply false.
+  const code = bytes(
+    0x48, 0x85, 0xc0,      // test rax, rax
+    0x74, 0x01,            // je +1
+    0xc3,                  // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'selfcmp', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /arg\d+ & arg\d+/, 'a self-test must not become a binary op between two params')
+  assert.doesNotMatch(result.c, /(\w+) [&|^] \1\b/, 'a value must not be combined with itself')
+})
+
+test('a parameter that is only copied into a local is still a parameter', () => {
+  // mov rax, rdi     ; rax := arg0   — rdi is read before it is ever written
+  // add rax, 1
+  // ret
+  // The signature must carry that argument. It did not: the copy assigned `rax`
+  // first, `defined` gained rax before rdi was ever considered an input, and the
+  // function came out as `scratch(void)` with no parameters at all.
+  const code = bytes(
+    0x48, 0x89, 0xf8,                          // mov rax, rdi
+    0x48, 0x83, 0xc0, 0x01,                    // add rax, 1
+    0xc3,                                      // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'copied', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /copied\(long arg0\)/, 'the incoming argument must appear in the signature')
+})
+
+test('a value read before it is written is labelled, not printed as a normal local', () => {
+  // mov rdi, [rsi]  ; add rax, 1 ; ret
+  // The body has two statements, so it is not a pass-through. rax is read by the
+  // add before anything writes it — a real undefined read.
+  const code = bytes(
+    0x48, 0x8b, 0x3e,                              // mov rdi, [rsi]
+    0x48, 0x83, 0xc0, 0x01,                        // add rax, 1
+    0xc3,                                          // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'scratch', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /read before written: rax/, 'the undefined read must be stated')
+})
+
+test('a bare ret handing back the caller\'s register is not an undefined read', () => {
+  // `ret` alone: Go uses this to forward the result it already has in rax, so
+  // there is nothing undefined about it. Labelling it put the warning on a third
+  // of every binary and trained the reader to ignore it.
+  const code = bytes(0xc3)
+  const result = decompileFunction(code, BASE, BASE, { name: 'passthrough', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /read before written/, 'a pass-through return is not an undefined read')
+})
+
+test('a value that is written first carries no such label', () => {
+  const code = bytes(
+    0x48, 0x89, 0xf8,                          // mov rax, rdi
+    0x48, 0x83, 0xc0, 0x01,                    // add rax, 1
+    0xc3,                                      // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'copied', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /read before written/, 'a defined value is not an undefined read')
+  assert.match(result.c, /return arg0 \+ 1/)
+})
+
+// ---- stack frame ----------------------------------------------------------
+//
+// Go emits `push rbp; mov rbp, rsp; sub rsp, N` and then addresses its frame off
+// rsp anyway, because rsp is the register the stack guard already compared. The
+// frame reader skipped every rsp-relative access while a frame pointer existed,
+// so a Go function's whole frame printed as `*(long *)(rsp + 0x100)` on a
+// register nothing ever wrote — complete-looking code with no relation to the
+// instructions.
+
+test('an rsp-relative slot is named, not printed as pointer arithmetic', () => {
+  // push rbp ; mov rbp, rsp ; sub rsp, 0x20 ; mov [rsp+0x10], rcx ; ret
+  const code = bytes(
+    0x55,                                     // push rbp
+    0x48, 0x89, 0xe5,                         // mov rbp, rsp
+    0x48, 0x83, 0xec, 0x20,                   // sub rsp, 0x20
+    0x48, 0x89, 0x4c, 0x24, 0x10,             // mov [rsp+0x10], rcx
+    0xc3,                                     // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'frame', end: BASE + code.length, convention: 'win64' })
+  assert.doesNotMatch(result.c, /rsp \+ 0x/, 'the slot must have a name')
+  assert.doesNotMatch(result.c, /read before written: rsp/, 'rsp is not a value the body reads')
+})
+
+test('a result spilled above the return address is not called an argument', () => {
+  // push rbp ; mov rbp,rsp ; sub rsp,0x20 ; mov [rsp+0x30], rax ; ret
+  // The slot is beyond the frame, in the argument shadow space, but it is only
+  // ever written — it holds the outgoing result. Naming it `argN` claims the
+  // caller passed a sixth argument that the signature cannot support.
+  const code = bytes(
+    0x55,                                     // push rbp
+    0x48, 0x89, 0xe5,                         // mov rbp, rsp
+    0x48, 0x83, 0xec, 0x20,                   // sub rsp, 0x20
+    0x48, 0x89, 0x44, 0x24, 0x30,             // mov [rsp+0x30], rax
+    0xc3,                                     // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'spill', end: BASE + code.length, convention: 'win64' })
+  assert.doesNotMatch(result.c, /arg4/, 'a write-only spill must not become the fifth argument')
+  assert.doesNotMatch(result.c, /stack_arg_\d+ arg/, 'the spill is a slot, not a parameter')
+})
+
+test('a slot above the return address that is read first is a parameter', () => {
+  // push rbp ; mov rbp,rsp ; sub rsp,0x20 ; mov rax,[rsp+0x30] ; ret
+  const code = bytes(
+    0x55,                                     // push rbp
+    0x48, 0x89, 0xe5,                         // mov rbp, rsp
+    0x48, 0x83, 0xec, 0x20,                   // sub rsp, 0x20
+    0x48, 0x8b, 0x44, 0x24, 0x30,             // mov rax, [rsp+0x30]
+    0xc3,                                     // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'reads', end: BASE + code.length, convention: 'win64' })
+  assert.match(result.c, /reads\([^)]*arg\d/, 'an incoming stack argument is a parameter')
+})
