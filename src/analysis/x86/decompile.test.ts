@@ -300,3 +300,44 @@ test('folding a stack-check thunk does not delete the code after it', () => {
   const result = decompileFunction(code, BASE, BASE, { name: 'thunk', end: BASE + code.length, convention: 'win64' })
   assert.doesNotMatch(result.c, /read before written: rdx/, 'the lea after the thunk must survive')
 })
+
+// ---- parameters from memory operands --------------------------------------
+//
+// The two defects below were the largest single source of wrong output measured
+// over a real Go binary: together they accounted for most of the C that read a
+// local nothing had assigned.
+
+test('a receiver read through a memory operand is a parameter', () => {
+  // movzx eax, byte ptr [rax+0x17] ; ret
+  // `rax` is read as the base of the load — that is the receiver, and it belongs
+  // in the signature. Only `reg` operands used to be inspected, so the base of a
+  // memory operand never became an argument and the body read an unassigned local.
+  const code = bytes(
+    0x0f, 0xb6, 0x40, 0x17,      // movzx eax, byte ptr [rax+0x17]
+    0xc3,                        // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'kind', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /kind\(long arg0\)/, 'the receiver is a parameter')
+  assert.match(result.c, /\*\(char \*\)\(arg0 \+ 0x17\)/, 'the body uses that parameter')
+  assert.doesNotMatch(result.c, /read before written/, 'no unassigned local is left behind')
+})
+
+test('an assignment read only inside a later branch is not a dead store', () => {
+  // mov rdx, rcx ; sub rdx, 1 ; test rcx, rdx ; je skip ; mov rax, 1 ; ret ; skip: xor eax,eax ; ret
+  // The straight-line run is optimized on its own, so `rdx = rcx - 1` looked
+  // dead: its only reader is one statement further, inside the branch.
+  const code = bytes(
+    0x48, 0x89, 0xca,                     // mov rdx, rcx
+    0x48, 0x83, 0xea, 0x01,               // sub rdx, 1
+    0x48, 0x85, 0xd1,                     // test rcx, rdx
+    0x74, 0x06,                           // je +6
+    0xb8, 0x01, 0x00, 0x00, 0x00,         // mov eax, 1
+    0xc3,                                 // ret
+    0x31, 0xc0,                           // xor eax, eax
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'bound', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /rdx = arg0 - (0x)?1/, 'the assignment must survive')
+  assert.doesNotMatch(result.c, /read before written: rdx/, 'rdx is assigned before it is read')
+  assert.match(result.c, /if \(/, 'the branch is structured')
+})

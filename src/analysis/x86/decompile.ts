@@ -75,7 +75,12 @@ export function decompileFunction(
   // Go does not spill its register arguments, so when the frame has no saved
   // arguments the inputs are recovered from the first reads instead.
   const frameParams = [...frame.slots.values()].some((slot) => /^arg\d+$/.test(slot.name));
-  const inferred = frameParams ? [] : inferRegisterParams(fn.instructions, frame);
+  // Only the instructions the reader will actually see. The stack-growth retry
+  // restores callee-saved registers from values it saved earlier, and reading
+  // those made `rbx` look like an incoming argument when it was the runtime's
+  // own bookkeeping — one phantom parameter per guard.
+  const visible = liftableInstructions(fn.instructions, lifted);
+  const inferred = frameParams ? [] : inferRegisterParams(visible, frame);
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
   const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
@@ -130,42 +135,96 @@ export function decompileFunction(
  * function; the branch is a prologue detail, so the thunk is folded away and
  * the entry keeps its fall-through.
  */
-function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number): void {
-  const ordered = lifted.filter((block) => !block.folded).map((block) => block.start).sort((a, b) => a - b);
-  const byStart = new Map(lifted.map((block) => [block.start, block]));
-  const entryBlock = byStart.get(entry);
-  if (!entryBlock || entryBlock.term !== 'jcc' || entryBlock.target == null) return;
-
-  // Walk the single-successor chain from the branch target; the thunk may call
-  // morestack first and jump back from a following block.
+/** Fold the stack-growth retry a guard feeds, if that is where it leads. */
+function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, byStart: Map<number, import('./ir.js').LiftedBlock>): boolean {
+  if (guard.term !== 'jcc' || guard.target == null) return false;
+  const path: number[] = [];
   const seen = new Set<number>();
-  let current: number | null = entryBlock.target;
-  let returnsToEntry = false;
+  let current: number | null = guard.target;
+  let closes = false;
   while (current != null && !seen.has(current)) {
     seen.add(current);
     const block = byStart.get(current);
     if (!block) break;
-    if (block.term === 'jmp') { returnsToEntry = block.target === entry; break; }
-    if (block.term === 'ret' || block.term === 'jcc') break;
-    const index = ordered.indexOf(current);
-    current = index >= 0 && index + 1 < ordered.length ? ordered[index + 1] : null;
+    path.push(current);
+    if (block.term === 'jmp') { closes = block.target === entry; break; }
+    if (block.term === 'ret') break;
+    current = block.end;
   }
-  if (!returnsToEntry) return;
-
-  // Only the thunk is folded. The walk above follows single successors, and on a
-  // function whose thunk jumps back to the entry the chain continues straight
-  // into the entry's *own* following blocks — real code, which used to be marked
-  // folded and vanish from the output along with the `lea` that computed a loop
-  // bound. A block counts as thunk only while it has no statement of its own.
-  entryBlock.stmts.unshift({ t: 'unknown', text: 'stack check: morestack thunk folded' });
-  entryBlock.term = 'fallthrough';
-  entryBlock.cond = null;
-  delete entryBlock.target;
-  for (const start of seen) {
-    if (start === entry) continue;
+  if (!closes || !path.length) return false;
+  guard.term = 'fallthrough';
+  guard.cond = null;
+  delete guard.target;
+  for (const start of path) {
     const block = byStart.get(start);
-    if (block && !block.stmts.length) block.folded = true;
+    if (!block) continue;
+    block.folded = true;
+    block.stmts = [];
   }
+  return true;
+}
+
+function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number): void {
+  const byStart = new Map(lifted.map((block) => [block.start, block]));
+  const entryBlock = byStart.get(entry);
+  if (!entryBlock) return;
+
+  // Go emits one guard per function that needs a bigger stack, and they all lead
+  // to the same grow-and-retry tail. Following only the entry's guard left the
+  // others intact, and their restores read callee-saved registers that nothing in
+  // that path had written — which read as incoming arguments and printed as
+  // locals with no assignment.
+  let foldedAny = false;
+  for (const block of lifted) {
+    if (block.start === entry || block.folded) continue;
+    if (foldRetryPath(block, entry, byStart)) foldedAny = true;
+  }
+  if (foldRetryPath(entryBlock, entry, byStart)) {
+    // The entry's guard is the one the reader would otherwise ask about, so it
+    // keeps a one-line note in its place.
+    entryBlock.stmts.unshift({ t: 'unknown', text: 'stack check: grows the goroutine stack, then re-runs this function' });
+    foldedAny = true;
+  }
+  if (!foldedAny) return;
+
+  // A block that jumps back to the entry is the same retry reached from a guard
+  // that has just been folded; it is unreachable now.
+  for (const block of lifted) {
+    if (block.start === entry || block.folded) continue;
+    if (block.term === 'jmp' && block.target === entry) {
+      block.folded = true;
+      block.stmts = [];
+    }
+  }
+}
+
+/**
+ * The instructions that survive folding, in address order.
+ *
+ * Parameter inference wants the code a reader will see. Feeding it the whole
+ * listing let the stack-growth retry contribute: it restores callee-saved
+ * registers from slots it filled before, and the restore reads a register
+ * nothing in that path had written, which looked exactly like an incoming
+ * argument.
+ */
+function liftableInstructions(
+  all: import('./decode.js').Instruction[],
+  lifted: import('./ir.js').LiftedBlock[],
+): import('./decode.js').Instruction[] {
+  const kept = new Set<string>();
+  for (const block of lifted) {
+    if (block.folded) continue;
+    for (let address = block.start; address < block.end; address += 1) kept.add(String(address));
+  }
+  // Block boundaries are byte addresses, but instructions sit at arbitrary
+  // offsets; keep an instruction when its own address is inside a live block.
+  return all.filter((instruction) => {
+    for (const block of lifted) {
+      if (block.folded) continue;
+      if (instruction.address >= block.start && instruction.address < block.end) return true;
+    }
+    return false;
+  });
 }
 
 interface Collected {
@@ -415,23 +474,61 @@ function unrenameExpr(expr: Expr, mapping: Map<string, string>): Expr {
 function optimizeControl(stmts: CtrlStmt[]): CtrlStmt[] {
   const out: CtrlStmt[] = [];
   let buffer: Stmt[] = [];
-  const flush = () => {
-    if (!buffer.length) return;
-    out.push(...optimizeStatements(buffer));
-    buffer = [];
+  /**
+   * Names read by the statements after the current straight-line run.
+   *
+   * A run is optimized on its own, so `rdx = rcx - 1` followed by
+   * `if (rcx & rdx)` looked like a dead store: the flag-free deletion pass only
+   * sees the run, and the read is one statement further, inside the branch. That
+   * deleted the assignment and left the condition comparing against a local with
+   * no value. Everything the following statements read is collected first and
+   * handed to the pass as live.
+   */
+  const liveAfter = (from: number): Set<string> => {
+    const live = new Set<string>();
+    const walk = (value: Expr | undefined) => {
+      if (!value) return;
+      switch (value.t) {
+        case 'reg': case 'var': if (value.name) live.add(value.name); return;
+        case 'load': walk(value.addr); return;
+        case 'bin': walk(value.left); walk(value.right); return;
+        case 'un': walk(value.value); return;
+        case 'cast': walk(value.value); return;
+        case 'select': walk(value.cond); walk(value.a); walk(value.b); return;
+        case 'call': for (const arg of value.args) walk(arg); return;
+        default: return;
+      }
+    };
+    const visit = (items: CtrlStmt[]) => {
+      for (const item of items) {
+        if (item.t === 'assign') walk(item.value);
+        else if (item.t === 'expr') walk(item.expr);
+        else if (item.t === 'return') walk(item.value);
+        else if (item.t === 'if') { walk(item.cond); visit(item.then); if (item.else) visit(item.else); }
+        else if (item.t === 'while') { if (item.cond) walk(item.cond); visit(item.body); }
+        else if (item.t === 'do') { visit(item.body); walk(item.cond); }
+      }
+    };
+    visit(stmts.slice(from));
+    return live;
   };
-  for (const stmt of stmts) {
+  for (let index = 0; index < stmts.length; index++) {
+    const stmt = stmts[index];
     if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown') {
       buffer.push(stmt);
       continue;
     }
-    flush();
+    const live = liveAfter(index);
+    if (buffer.length) {
+      out.push(...optimizeStatements(buffer, live));
+      buffer = [];
+    }
     if (stmt.t === 'if') out.push({ ...stmt, then: optimizeControl(stmt.then), ...(stmt.else ? { else: optimizeControl(stmt.else) } : {}) });
     else if (stmt.t === 'while') out.push({ ...stmt, body: optimizeControl(stmt.body) });
     else if (stmt.t === 'do') out.push({ ...stmt, body: optimizeControl(stmt.body) });
     else out.push(stmt);
   }
-  flush();
+  if (buffer.length) out.push(...optimizeStatements(buffer, new Set()));
   return out;
 }
 

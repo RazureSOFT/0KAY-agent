@@ -282,10 +282,23 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame): 
     for (let index = 0; index < instruction.operands.length; index++) {
       if (index === 0 && written) continue;
       const operand = instruction.operands[index];
-      if (operand.kind !== 'reg' || !operand.reg) continue;
-      const name = baseName(operand.reg);
-      if (name === 'seg') continue;
-      if (!defined.has(name) && !inputs.includes(name)) inputs.push(name);
+      if (!operand) continue;
+      // A memory operand reads its base and index registers, and those are the
+      // registers a function receives its arguments in. Only looking at `reg`
+      // operands missed `movzx eax, [rax+0x17]` — a getter reading through its
+      // receiver — so the receiver never became a parameter and the body read a
+      // local that nothing had assigned.
+      const used: string[] = [];
+      if (operand.kind === 'reg' && operand.reg) used.push(operand.reg);
+      else if (operand.kind === 'mem') {
+        if (operand.base) used.push(operand.base);
+        if (operand.index) used.push(operand.index);
+      }
+      for (const raw of used) {
+        const name = baseName(raw);
+        if (name === 'seg' || name === 'rip') continue;
+        if (!defined.has(name) && !inputs.includes(name)) inputs.push(name);
+      }
     }
     if (written) defined.add(written);
   }

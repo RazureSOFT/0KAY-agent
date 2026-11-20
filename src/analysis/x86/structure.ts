@@ -121,6 +121,17 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
 
       if (block.term === 'jcc') {
         const cond = block.cond || { t: 'unknown' as const, text: 'flags', size: 1 };
+        // A branch into a folded block is a branch into the stack-growth retry,
+        // which the reader should not see. Once it is gone the guard has no
+        // alternative, so the block continues at its fall-through — and keeping
+        // the block's own statements (already pushed above) is what stops a
+        // `lea` that computed a value from disappearing with the guard.
+        const targetBlock = block.target != null ? byStart.get(block.target) : undefined;
+        const branchGone = block.target != null && (!targetBlock || targetBlock.folded);
+        if (branchGone) {
+          current = next;
+          continue;
+        }
         const thenBlock = block.target ?? null;
         const elseBlock = next;
         const join = ipdom(current);

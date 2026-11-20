@@ -141,7 +141,7 @@ export function propagate(stmts: Stmt[]): Stmt[] {
  * Drop assignments whose destination is never read and whose value has no
  * side effect. Argument variables are kept: the caller can observe them.
  */
-export function removeDeadStores(stmts: Stmt[]): Stmt[] {
+export function removeDeadStores(stmts: Stmt[], liveAfter: Set<string> = new Set()): Stmt[] {
   let current = stmts;
   for (let pass = 0; pass < 3; pass++) {
     const reads = new Set<string>();
@@ -154,7 +154,7 @@ export function removeDeadStores(stmts: Stmt[]): Stmt[] {
       if (stmt.t !== 'assign') return true;
       if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') return true;
       const name = stmt.target.name;
-      if (reads.has(name)) return true;
+      if (reads.has(name) || liveAfter.has(name)) return true;
       // Stack slots, arguments and outgoing spills are observable by the caller;
       // only a scratch register can be dropped safely. `stack_arg_` is the slot Go
       // spills a result into — dropping that write would delete the only thing
@@ -169,6 +169,6 @@ export function removeDeadStores(stmts: Stmt[]): Stmt[] {
   return current;
 }
 
-export function optimizeStatements(stmts: Stmt[]): Stmt[] {
-  return removeDeadStores(propagate(stmts));
+export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new Set()): Stmt[] {
+  return removeDeadStores(propagate(stmts), liveAfter);
 }
