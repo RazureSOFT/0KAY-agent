@@ -277,3 +277,26 @@ test('a slot above the return address that is read first is a parameter', () => 
   const result = decompileFunction(code, BASE, BASE, { name: 'reads', end: BASE + code.length, convention: 'win64' })
   assert.match(result.c, /reads\([^)]*arg\d/, 'an incoming stack argument is a parameter')
 })
+
+test('folding a stack-check thunk does not delete the code after it', () => {
+  // The thunk walk follows single successors, and when the thunk jumps back to
+  // the entry the chain continues into the entry's own following blocks — real
+  // code. Marking those folded removed a `lea` that computed a loop bound, and
+  // the decompiler then printed the register it defined as "never assigned".
+  // A block is a thunk only while it holds no statement of its own.
+  const code = bytes(
+    // entry: compare against the stack guard and branch to the slow path
+    0x49, 0x3b, 0x66, 0x10,               // cmp rsp, [r14+0x10]
+    0x76, 0x10,                           // jbe +0x10 (a block of its own)
+    // real work the function must keep
+    0x48, 0x8d, 0x51, 0xff,               // lea rdx, [rcx-1]
+    0x48, 0x85, 0xc9,                     // test rcx, rcx
+    0x75, 0x06,                           // jne +6
+    0x48, 0x89, 0xc8,                     // mov rax, rcx
+    0xc3,                                 // ret
+    // the "thunk": jump straight back to the entry
+    0xeb, 0xee,                           // jmp entry
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'thunk', end: BASE + code.length, convention: 'win64' })
+  assert.doesNotMatch(result.c, /read before written: rdx/, 'the lea after the thunk must survive')
+})

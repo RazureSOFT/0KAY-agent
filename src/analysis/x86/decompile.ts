@@ -152,13 +152,19 @@ function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number):
   }
   if (!returnsToEntry) return;
 
+  // Only the thunk is folded. The walk above follows single successors, and on a
+  // function whose thunk jumps back to the entry the chain continues straight
+  // into the entry's *own* following blocks — real code, which used to be marked
+  // folded and vanish from the output along with the `lea` that computed a loop
+  // bound. A block counts as thunk only while it has no statement of its own.
   entryBlock.stmts.unshift({ t: 'unknown', text: 'stack check: morestack thunk folded' });
   entryBlock.term = 'fallthrough';
   entryBlock.cond = null;
   delete entryBlock.target;
   for (const start of seen) {
+    if (start === entry) continue;
     const block = byStart.get(start);
-    if (block) block.folded = true;
+    if (block && !block.stmts.length) block.folded = true;
   }
 }
 
