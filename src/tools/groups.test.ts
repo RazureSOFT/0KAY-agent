@@ -38,7 +38,6 @@ test('core, agent and analysis ride along; the rest do not', () => {
   // The reverse-engineering tools are the headline capability. Behind an opt-in
   // load they existed, were described, and were never found.
   assert.equal(isAlwaysLoaded('pentest'), true)
-  assert.equal(isAlwaysLoaded('ghidra_analyze'), true)
   assert.equal(isAlwaysLoaded('binary_analyze'), true)
   assert.equal(isAlwaysLoaded('evolve_begin'), false)
   assert.deepEqual(ALWAYS_LOADED, ['core', 'agent', 'analysis'])

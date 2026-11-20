@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { ReconGraphTool, ValidateFindingTool, GhidraAnalyzeTool } from './analysis.js'
+import { ReconGraphTool, ValidateFindingTool } from './analysis.js'
 import { ReconGraph } from '../../analysis/recon/graph.js'
+import { BinaryAnalysisTool } from '../binary_analysis.js'
 import type { ToolContext } from '../types.js'
 
 const context = (): ToolContext => ({
@@ -69,17 +70,13 @@ test('validate_finding reports the three-state verdict and a line', async () => 
   assert.match(result.data.line, /CANNOT CONFIRM/)
 })
 
-test('ghidra_analyze without an install explains what is missing', async () => {
-  const previous = process.env.GHIDRA_HOME
-  delete process.env.GHIDRA_HOME
-  try {
-    const tool = new GhidraAnalyzeTool()
-    const result = await tool.execute({ path: 'C:\\samples\\a.exe' }, context())
-    // On a machine that does have Ghidra this test would actually run it, which
-    // is why it asserts on the message rather than on success.
-    if (!result.success) assert.match(result.error || '', /GHIDRA_HOME|Ghidra is not installed/)
-    else assert.ok(result.data.functions)
-  } finally {
-    if (previous !== undefined) process.env.GHIDRA_HOME = previous
-  }
+test('binary decompilation is a built-in tool, not an adapter', async () => {
+  // The answer to "decompile this" must not depend on what is installed. That was
+  // the whole shape of the old ghidra_analyze tool: installed Ghidra meant a real
+  // answer, absent Ghidra meant an explanation. binary_analyze always answers.
+  const tool = new BinaryAnalysisTool()
+  assert.equal(tool.name, 'binary_analyze')
+  assert.doesNotMatch(tool.description, /Ghidra|GHIDRA_HOME/, 'no install to depend on')
+  const missing = await tool.execute({ action: 'decompile', path: 'C:\samples\does-not-exist.exe' }, context())
+  assert.equal(missing.success, false)
 })

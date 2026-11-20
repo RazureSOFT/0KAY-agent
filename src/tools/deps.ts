@@ -58,11 +58,6 @@ export const CLI_CAPABILITIES: CliCapability[] = [
       { manager: 'brew', args: ['install', 'tesseract'] },
       { manager: 'apt', args: ['install', '-y', 'tesseract-ocr'] },
     ] } },
-  { name: 'ghidra', commands: ['analyzeHeadless', 'ghidraRun'], versionArg: ['-help'], purpose: 'Native binary decompilation (pseudocode) for reverse_engineer', envVar: 'GHIDRA_HOME',
-    install: { packages: [
-      { manager: 'choco', args: ['install', '-y', 'ghidra'] },
-      { manager: 'brew', args: ['install', '--cask', 'ghidra'] },
-    ], manual: 'Ghidra is a large bring-your-own tool: download from ghidra-sre.org or install via choco/brew; set GHIDRA_HOME if not on PATH.' } },
   { name: 'jadx', commands: ['jadx'], versionArg: ['--version'], purpose: 'Android APK/DEX decompilation',
     install: { packages: [
       { manager: 'choco', args: ['install', '-y', 'jadx'] },

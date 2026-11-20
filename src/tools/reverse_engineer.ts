@@ -5,9 +5,10 @@ import { success, failure, clamp, limitOutput } from './helpers.js';
 import { resolveCli, runCli, ensureDataDir } from './deps.js';
 import { buildZipRead } from './zip_read.js';
 import { analyzeJar } from './jar_analysis.js';
+import { decompileSummary } from './binary_analysis.js';
 
 interface Finding { kind: string; detail: any; }
-interface AnalyzeOptions { includeStrings: boolean; minStringLength: number; stringLimit: number; provider?: 'auto' | 'ghidra' | 'jadx' | 'objdump' | 'none'; functionName?: string; }
+interface AnalyzeOptions { includeStrings: boolean; minStringLength: number; stringLimit: number; provider?: 'auto' | 'native' | 'jadx' | 'objdump' | 'none'; functionName?: string; }
 
 const TEXT_EXT = new Set(['.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx', '.json', '.md', '.txt', '.yaml', '.yml', '.xml', '.html', '.css', '.py', '.go', '.rs', '.java', '.cs', '.sh', '.ps1', '.sql']);
 
@@ -322,13 +323,19 @@ async function runProvider(format: string, filePath: string, options: AnalyzeOpt
   const provider = options.provider || 'auto';
   if (provider === 'none') return findings;
 
-  if (provider === 'ghidra' || (provider === 'auto' && ['elf', 'pe', 'pe-dotnet', 'macho'].includes(format))) {
-    const ghidra = await resolveCli('ghidra');
-    if (ghidra.available) {
-      const outDir = await fs.mkdtemp(path.join((await import('os')).tmpdir(), '0kay-ghidra-'));
-      const args = [path.dirname(ghidra.command.split(' ')[0]), '-import', filePath, '-postScript', 'ExportDecompiler.py', outDir, '-deleteProject'];
-      const result = await runCli(ghidra.command, [ '-import', filePath, '-analyzeHeadless', outDir, 'temp', '-deleteProject' ], { timeout: 300_000, signal, maxBuffer: 32 * 1024 * 1024 }).catch(() => null);
-      findings.push({ kind: 'provider.ghidra', detail: { ran: !!result, exit: result?.code, note: 'Ghidra headless run; pseudocode output depends on project scripts', args } });
+  // The binary formats are decompiled here, by our own pipeline. There used to be
+  // a branch that shelled out to an installed Ghidra for this; it produced a
+  // "provider ran" note on the machines that had one and a "provider missing" note
+  // on the machines that did not, so the same input answered differently depending
+  // on what happened to be installed. One implementation, always available.
+  if (provider === 'native' || (provider === 'auto' && ['elf', 'pe', 'pe-dotnet', 'macho'].includes(format))) {
+    try {
+      const summary = await decompileSummary(filePath, {
+        ...(options.functionName ? { functionName: options.functionName } : {}),
+      });
+      findings.push({ kind: 'provider.decompile', detail: summary });
+    } catch (error: any) {
+      findings.push({ kind: 'provider.decompile', detail: { ran: false, error: error?.message || String(error) } });
     }
   }
   if (provider === 'jadx' || (provider === 'auto' && (format === 'apk' || format === 'jar'))) {
@@ -381,7 +388,7 @@ export class ReverseEngineerTool extends Tool {
       'Statically analyze a binary/bundle and report structure with evidence (the full static surface: containers, containers-of-containers, and metadata formats).',
       'Parses ELF (headers/sections/symbols/needed/mitigations), PE/.NET (imports/exports/sections/CLR), Mach-O, WASM, ASAR/ZIP/APK/JAR, SQLite, PCAP, JavaScript/Electron.',
       'Reports Go build info, Rust crates, .NET references/types, mitigations, per-section entropy, strings with offsets, and extracted IOCs.',
-      'provider:auto runs ghidra/jadx/objdump decompilation when installed (run setup_deps to check). path may be a file or a directory (inventory).',
+      'provider:auto decompiles ELF/PE/Mach-O with the built-in pipeline, and uses jadx/objdump only when those are installed. path may be a file or a directory (inventory).',
       'Read-only: the target is never executed. Only analyze artifacts you are authorized to inspect.',
     ].join('\n');
   }
@@ -389,7 +396,7 @@ export class ReverseEngineerTool extends Tool {
     return { type: 'object', required: ['path'], properties: {
       path: { type: 'string', description: 'File to analyze, or a directory to inventory.' },
       includeStrings: { type: 'boolean' }, minStringLength: { type: 'integer', minimum: 4, maximum: 32 }, stringLimit: { type: 'integer', minimum: 1, maximum: 5000 },
-      provider: { type: 'string', enum: ['auto', 'ghidra', 'jadx', 'objdump', 'none'], description: 'Deeper analysis provider; default auto.' },
+      provider: { type: 'string', enum: ['auto', 'native', 'jadx', 'objdump', 'none'], description: 'Deeper analysis provider; default auto. native runs our own decompiler on ELF/PE/Mach-O.' },
       functionName: { type: 'string', description: 'Focus a provider disassembly on a function (objdump).' },
       out: { type: 'string' },
     }};
@@ -400,7 +407,7 @@ export class ReverseEngineerTool extends Tool {
       const target = path.resolve(context.cwd, String(args.path || ''));
       const stat = await fs.stat(target);
       const findings: Finding[] = [];
-      const options: AnalyzeOptions = { includeStrings: args.includeStrings !== false, minStringLength: clamp(args.minStringLength, 6, 4, 32), stringLimit: clamp(args.stringLimit, 400, 1, 5000), provider: ['auto', 'ghidra', 'jadx', 'objdump', 'none'].includes(args.provider) ? args.provider : 'auto', functionName: typeof args.functionName === 'string' ? args.functionName : undefined };
+      const options: AnalyzeOptions = { includeStrings: args.includeStrings !== false, minStringLength: clamp(args.minStringLength, 6, 4, 32), stringLimit: clamp(args.stringLimit, 400, 1, 5000), provider: ['auto', 'native', 'jadx', 'objdump', 'none'].includes(args.provider) ? args.provider : 'auto', functionName: typeof args.functionName === 'string' ? args.functionName : undefined };
 
       if (stat.isDirectory()) {
         const files: Array<{ path: string; format: string; size: number }> = [];

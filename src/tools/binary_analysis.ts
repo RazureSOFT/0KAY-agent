@@ -281,3 +281,72 @@ export class BinaryAnalysisTool extends Tool {
     } catch (error) { return failure(error); }
   }
 }
+
+/**
+ * The self-contained decompilation of one binary, for callers that need it as
+ * data rather than as a tool result.
+ *
+ * `reverse_engineer` used to shell out to an installed Ghidra for this. That made
+ * a "deeper analysis" flag depend on a 400MB Java suite being on the machine,
+ * and when it was not the caller got a note saying so instead of an answer. The
+ * pipeline below is ours, always available, and reports the same way whether or
+ * not anything else is installed.
+ */
+export async function decompileSummary(
+  target: string,
+  options: { maxFunctions?: number; functionName?: string; maxInstructions?: number } = {},
+): Promise<{
+  format: string;
+  bits: number;
+  functions: number;
+  entrySource: string;
+  note?: string;
+  sample: Array<{ name: string; entry: string; size: number }>;
+  decompiled?: Array<{ name: string; entry: string; c: string; instructions: number; unknownPct: number; blocks: number; loops: number }>;
+}> {
+  const loaded = await load(target);
+  const maxFunctions = Math.max(1, Math.min(options.maxFunctions ?? 200, 20000));
+  const section = executableSections(loaded.image)[0];
+  const imageBase = section ? section.vaddr - section.offset : 0;
+
+  const picked = options.functionName
+    ? loaded.functions.filter((fn) => fn.name.includes(String(options.functionName)))
+    : loaded.functions;
+  const sample = picked.slice(0, 40).map((fn) => ({
+    name: fn.name,
+    entry: `0x${fn.entry.toString(16)}`,
+    size: fn.end > fn.entry ? fn.end - fn.entry : 0,
+  }));
+
+  // Decompiling every function of a large image would take minutes; a sample is
+  // enough to show what the pipeline recovers, and naming a function gets that
+  // one exactly.
+  const budget = options.functionName ? Math.min(picked.length, 8) : 3;
+  const decompiled: NonNullable<Awaited<ReturnType<typeof decompileSummary>>['decompiled']> = [];
+  if (section) {
+    for (const fn of picked.slice(0, budget)) {
+      try {
+        const result = decompileFunction(loaded.bytes, imageBase, fn.entry, {
+          name: fn.name,
+          end: fn.end > fn.entry ? Math.min(fn.end, section.vaddr + section.size) : section.vaddr + section.size,
+          imageFormat: loaded.image.format,
+          maxInstructions: options.maxInstructions ?? 2000,
+        });
+        decompiled.push({
+          name: result.name, entry: `0x${result.entry.toString(16)}`, c: result.c,
+          instructions: result.instructions, unknownPct: result.unknownPct, blocks: result.blocks, loops: result.loops,
+        });
+      } catch { /* one function that cannot be lifted does not fail the summary */ }
+    }
+  }
+
+  return {
+    format: loaded.image.format,
+    bits: loaded.image.bits,
+    functions: loaded.functions.length,
+    entrySource: loaded.entrySource,
+    ...(loaded.note ? { note: loaded.note } : {}),
+    sample,
+    ...(decompiled.length ? { decompiled } : {}),
+  };
+}

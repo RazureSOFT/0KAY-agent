@@ -1,16 +1,18 @@
 import { Tool } from '../types.js'
 import type { ToolContext, ToolResult } from '../types.js'
 import { success, failure } from '../helpers.js'
-import { findGhidra, analyzeBinary, decompileFunction, missingGhidraHint } from '../../analysis/ghidra/ghidra.js'
 import { validatePoc, verdictLine } from '../../analysis/poc/validate.js'
 import type { PocSpec } from '../../analysis/poc/validate.js'
 
-// Three analysis tools, each rebuilt from a larger project rather than vendored:
+// Two analysis tools, each rebuilt from a larger project rather than vendored:
 //
-//   recon_graph      the dual-graph model from RECON (assets vs. what we tried)
+//   recon_graph      the dual-graph model (assets vs. what we tried)
 //   validate_finding the PoC verdict (reproduced / fixed / cannot confirm)
-//   ghidra_analyze   an adapter to a local Ghidra install, because rewriting a
-//                    400MB Java suite is not a thing
+//
+// Binary decompilation is not here: it is `binary_analyze`, backed by our own
+// pipeline in analysis/x86. It used to be a third tool that shelled out to an
+// installed Ghidra, which meant the answer depended on what happened to be
+// installed rather than on the binary.
 
 export class ReconGraphTool extends Tool {
   get name(): string { return 'recon_graph'; }
@@ -171,55 +173,6 @@ export class ValidateFindingTool extends Tool {
       }
       const verdict = await validatePoc(spec, { timeoutMs: args.timeoutMs })
       return success({ ...verdict, line: verdictLine(verdict, spec.target) })
-    } catch (error) {
-      return failure(error)
-    }
-  }
-}
-
-export class GhidraAnalyzeTool extends Tool {
-  get name(): string { return 'ghidra_analyze'; }
-  get description(): string {
-    return [
-      'Analyze a binary with a local Ghidra install (headless): action=facts lists functions and strings; action=decompile returns the C for one function (symbol or entry address, empty = entry point).',
-      'Requires Ghidra with a JDK 17+; set GHIDRA_HOME if it is not in a standard location.',
-      'Without Ghidra this reports what is missing instead of guessing — use reverse_engineer for headers, imports and entropy.',
-    ].join(' ')
-  }
-  get parameters(): Record<string, any> {
-    return {
-      type: 'object',
-      required: ['path'],
-      properties: {
-        path: { type: 'string', description: 'Binary to analyze.' },
-        action: { type: 'string', enum: ['facts', 'decompile'], description: 'facts (default) lists functions and strings; decompile returns C for one function.' },
-        symbol: { type: 'string', description: 'decompile: function name or entry address; empty means the program entry point.' },
-        maxFunctions: { type: 'integer', minimum: 1, maximum: 5000 },
-        maxStrings: { type: 'integer', minimum: 0, maximum: 2000 },
-        timeoutMs: { type: 'integer', minimum: 10000, maximum: 900000 },
-      },
-    }
-  }
-  async execute(args: Record<string, any>, context: ToolContext): Promise<ToolResult> {
-    try {
-      const install = findGhidra()
-      if (!install) return failure(missingGhidraHint())
-      const target = String(args.path || '')
-      if (!target) throw new Error('path is required')
-      if (args.action === 'decompile') {
-        const result = await decompileFunction(install, target, {
-          symbol: typeof args.symbol === 'string' ? args.symbol : undefined,
-          timeoutMs: args.timeoutMs,
-          workDir: context.cwd,
-        })
-        return success({ ghidra: install.version, ...result })
-      }
-      const report = await analyzeBinary(install, target, {
-        maxFunctions: args.maxFunctions,
-        maxStrings: args.maxStrings,
-        timeoutMs: args.timeoutMs,
-      })
-      return success({ ghidra: install.version, ...report })
     } catch (error) {
       return failure(error)
     }
