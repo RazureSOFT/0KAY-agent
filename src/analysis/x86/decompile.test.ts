@@ -530,3 +530,24 @@ test('a spilled argument register stays a parameter', () => {
   const result = decompileFunction(code, BASE, BASE, { name: 'fwd', end: BASE + code.length, convention: 'sysv' })
   assert.doesNotMatch(result.c, /read before written: rcx/, 'the spilled argument is not an orphan')
 })
+
+test('a register rotation survives dead-store elimination', () => {
+  // mov rcx, rax; mov rax, rbx; mov rbx, rcx; call f
+  // This is how Go sets up a call whose arguments are not already in place. The
+  // third move reads the *first* move's destination, so forwarding `rcx -> rax`
+  // past the write to rax turned it into `rbx = rax` — the value rax holds after
+  // the rotation started, which is the wrong register entirely.
+  const code = bytes(
+    0x48, 0x89, 0xc1,                     // mov rcx, rax
+    0x48, 0x89, 0xd8,                     // mov rax, rbx
+    0x48, 0x89, 0xcb,                     // mov rbx, rcx
+    0xe8, 0x00, 0x00, 0x00, 0x00,         // call rel32
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'rotate', end: BASE + code.length, convention: 'sysv' })
+  // The rotation must appear: each of the three moves writes a distinct register
+  // from another one, and none of them reads the value it just wrote.
+  const moves = [...result.c.matchAll(/^\s{4}(\w+) = (\w+);$/gm)]
+  assert.ok(moves.length >= 2, `the rotation is printed, not collapsed: ${result.c}`)
+  for (const [, to, from] of moves) assert.notEqual(to, from, 'no move reads its own destination')
+})

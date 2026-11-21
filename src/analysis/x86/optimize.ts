@@ -138,6 +138,14 @@ export function propagate(stmts: Stmt[]): Stmt[] {
         }
       }
       if (target.t === 'reg' || target.t === 'var') {
+        // A write kills every alias that pointed *at* this name, not only the one
+        // under it. `rcx = rax; rax = rbx; rbx = rcx` rotates three registers; keeping
+        // `rcx -> rax` past the write to rax turned the third move into `rbx = rax`,
+        // which reads the value rax holds *after* the rotation started. The register
+        // forwarding chain in a Go call sequence is exactly this shape.
+        for (const [key, existing] of [...env]) {
+          if ((existing.t === 'reg' || existing.t === 'var') && existing.name === target.name) env.delete(key);
+        }
         if (value.t === 'const' || value.t === 'reg' || value.t === 'var') env.set(target.name, value);
         else env.delete(target.name);
       } else {
