@@ -273,7 +273,13 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
       const ops = (form & 2) ? [register(reg, size), operand] : [operand, register(reg, size)];
       return finish(name, ops);
     }
-    return finish(name, [register(0, size), imm(size)]);
+    // form 4 is `al, imm8` and form 5 is `eax, imm32` — the immediate's width is
+    // fixed by the form and does *not* follow the operand size. Using `size` read
+    // eight bytes for a `48 05` (`add rax, imm32`), which then swallowed the next
+    // instruction and left the rest of the function to be decoded from the wrong
+    // offset. `runtime.(*mheap).sysAlloc` lost its tail to this.
+    const immediateBits = form === 4 ? 8 : (operandSize === 16 ? 16 : 32);
+    return finish(name, [register(0, size), imm(immediateBits)]);
   }
 
   switch (opcode) {
