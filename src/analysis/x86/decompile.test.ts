@@ -391,3 +391,20 @@ test('code after a call that never returns is not presented as reachable', () =>
   })
   assert.doesNotMatch(result.c, /return rbx/, 'the unwind path is not part of the body')
 })
+
+test('an assignment is kept when its only reader is in another block', () => {
+  // lea rcx, [rsi+1] ; then a loop body does `rdi = rdi << rcx`.
+  // Each straight-line run is optimized on its own, so the run holding the `lea`
+  // saw no reader and deleted it; the loop then shifted by a variable nothing had
+  // assigned. Liveness is taken over the whole body, not the run.
+  const code = bytes(
+    0x48, 0x8d, 0x4e, 0x01,                // lea rcx, [rsi+1]
+    0x48, 0xd3, 0xe7,                     // shl rdi, cl
+    0x48, 0x83, 0xff, 0x00,               // cmp rdi, 0
+    0x7f, 0xf8,                           // jg -8 (back over the shl)
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'shift', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /rcx = arg1 \+ (0x)?1/, 'the lea survives its reader being in another block')
+  assert.doesNotMatch(result.c, /read before written: rcx/, 'and the loop body can read it')
+})

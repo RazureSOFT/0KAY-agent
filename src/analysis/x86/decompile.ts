@@ -633,64 +633,68 @@ function unrenameExpr(expr: Expr, mapping: Map<string, string>): Expr {
 
 
 /** Apply value propagation to each run of straight-line statements. */
-function optimizeControl(stmts: CtrlStmt[]): CtrlStmt[] {
+
+/** Every name the given statements read, at any depth. */
+function namesReadIn(stmts: CtrlStmt[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (value: Expr | undefined) => {
+    if (!value) return;
+    switch (value.t) {
+      case 'reg': case 'var': if (value.name) names.add(value.name); return;
+      case 'load': walk(value.addr); return;
+      case 'bin': walk(value.left); walk(value.right); return;
+      case 'un': walk(value.value); return;
+      case 'cast': walk(value.value); return;
+      case 'select': walk(value.cond); walk(value.a); walk(value.b); return;
+      case 'call': for (const arg of value.args) walk(arg); return;
+      default: return;
+    }
+  };
+  const visit = (items: CtrlStmt[]) => {
+    for (const item of items) {
+      switch (item.t) {
+        case 'assign': walk(item.value); walk(item.target); break;
+        case 'expr': walk(item.expr); break;
+        case 'return': walk(item.value); break;
+        case 'if': walk(item.cond); visit(item.then); if (item.else) visit(item.else); break;
+        case 'while': if (item.cond) walk(item.cond); visit(item.body); break;
+        case 'do': visit(item.body); walk(item.cond); break;
+        default: break;
+      }
+    }
+  };
+  visit(stmts);
+  return names;
+}
+
+function optimizeControl(stmts: CtrlStmt[], readsAnywhere?: Set<string>): CtrlStmt[] {
+  // Names the whole function reads, not just the statements after this run.
+  //
+  // The run-level view was not enough: `rcx = rsi + rdi * 2` sits in one block
+  // and its only reader — `rdi = rdi << rcx` — is in the next one, so neither
+  // block's local view contained a read and the assignment was deleted as dead.
+  // The C then shifted by a variable nothing had assigned. Liveness over the
+  // whole body is the cheap approximation of what a versioned form would give.
+  const reads = readsAnywhere || namesReadIn(stmts);
+  const recurse = (items: CtrlStmt[]) => optimizeControl(items, reads);
   const out: CtrlStmt[] = [];
   let buffer: Stmt[] = [];
-  /**
-   * Names read by the statements after the current straight-line run.
-   *
-   * A run is optimized on its own, so `rdx = rcx - 1` followed by
-   * `if (rcx & rdx)` looked like a dead store: the flag-free deletion pass only
-   * sees the run, and the read is one statement further, inside the branch. That
-   * deleted the assignment and left the condition comparing against a local with
-   * no value. Everything the following statements read is collected first and
-   * handed to the pass as live.
-   */
-  const liveAfter = (from: number): Set<string> => {
-    const live = new Set<string>();
-    const walk = (value: Expr | undefined) => {
-      if (!value) return;
-      switch (value.t) {
-        case 'reg': case 'var': if (value.name) live.add(value.name); return;
-        case 'load': walk(value.addr); return;
-        case 'bin': walk(value.left); walk(value.right); return;
-        case 'un': walk(value.value); return;
-        case 'cast': walk(value.value); return;
-        case 'select': walk(value.cond); walk(value.a); walk(value.b); return;
-        case 'call': for (const arg of value.args) walk(arg); return;
-        default: return;
-      }
-    };
-    const visit = (items: CtrlStmt[]) => {
-      for (const item of items) {
-        if (item.t === 'assign') walk(item.value);
-        else if (item.t === 'expr') walk(item.expr);
-        else if (item.t === 'return') walk(item.value);
-        else if (item.t === 'if') { walk(item.cond); visit(item.then); if (item.else) visit(item.else); }
-        else if (item.t === 'while') { if (item.cond) walk(item.cond); visit(item.body); }
-        else if (item.t === 'do') { visit(item.body); walk(item.cond); }
-      }
-    };
-    visit(stmts.slice(from));
-    return live;
-  };
   for (let index = 0; index < stmts.length; index++) {
     const stmt = stmts[index];
     if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown' || stmt.t === 'note') {
       buffer.push(stmt);
       continue;
     }
-    const live = liveAfter(index);
     if (buffer.length) {
-      out.push(...optimizeStatements(buffer, live));
+      out.push(...optimizeStatements(buffer, reads));
       buffer = [];
     }
-    if (stmt.t === 'if') out.push({ ...stmt, then: optimizeControl(stmt.then), ...(stmt.else ? { else: optimizeControl(stmt.else) } : {}) });
-    else if (stmt.t === 'while') out.push({ ...stmt, body: optimizeControl(stmt.body) });
-    else if (stmt.t === 'do') out.push({ ...stmt, body: optimizeControl(stmt.body) });
+    if (stmt.t === 'if') out.push({ ...stmt, then: recurse(stmt.then), ...(stmt.else ? { else: recurse(stmt.else) } : {}) });
+    else if (stmt.t === 'while') out.push({ ...stmt, body: recurse(stmt.body) });
+    else if (stmt.t === 'do') out.push({ ...stmt, body: recurse(stmt.body) });
     else out.push(stmt);
   }
-  if (buffer.length) out.push(...optimizeStatements(buffer, new Set()));
+  if (buffer.length) out.push(...optimizeStatements(buffer, reads));
   return out;
 }
 
