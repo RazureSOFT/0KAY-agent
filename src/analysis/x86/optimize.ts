@@ -289,6 +289,26 @@ function findRestore(stmts: Stmt[], from: number, savedName: string, sourceName:
  * Ordinary locals are left alone: one reader does not make a name the author
  * chose disposable. Only names the versioning created qualify.
  */
+
+/** How many times `name` appears inside one expression. */
+function countInExpr(value: Expr, name: string): number {
+  let total = 0;
+  const walk = (expr: Expr | undefined): void => {
+    if (!expr) return;
+    switch (expr.t) {
+      case 'reg': case 'var': if (expr.name === name) total += 1; return;
+      case 'load': walk(expr.addr); return;
+      case 'bin': walk(expr.left); walk(expr.right); return;
+      case 'un': case 'cast': walk(expr.value); return;
+      case 'select': walk(expr.cond); walk(expr.a); walk(expr.b); return;
+      case 'call': for (const arg of expr.args) walk(arg); return;
+      default: return;
+    }
+  };
+  walk(value);
+  return total;
+}
+
 export function inlineSingleUseTemps(stmts: Stmt[]): Stmt[] {
   const PURE = new Set(['bin', 'un', 'cast', 'const']);
   const swap = (value: Expr, name: string, with_: Expr): Expr => {
@@ -333,6 +353,9 @@ export function inlineSingleUseTemps(stmts: Stmt[]): Stmt[] {
     const name = stmt.target.name;
     if (!/_[2-9]\d*$/.test(name)) continue;
     if (!PURE.has(stmt.value.t)) continue;
+    // The value must not mention its own name: `rbx_3 = rbx_3 - 1` is a recurrence,
+    // and folding it into its reader would leave a name that nothing defines.
+    if (countInExpr(stmt.value, name) > 0) continue;
     if ((reads.get(name) || 0) !== 1) continue;
     foldable.set(name, stmt.value);
   }

@@ -73,6 +73,11 @@ export function decompileFunction(
     );
     if (info) lifted[index].switch = info;
   }
+  // A `jmp` out of the function is a tail call: the same arguments, handed on. Go
+  // uses it for the promoted methods of an embedded type — `(*StructType).NumMethod`
+  // is `jmp (*Type).NumMethod` — and for panic helpers. Printed as nothing it left
+  // an empty body that looked like a lost implementation.
+  markTailCalls(lifted, entry, options.end, fn.instructions);
   foldStackCheck(lifted, entry, options.noReturnCalls);
   const structured = structure(lifted, entry);
   const body = optimizeControl(optimize(structured.body));
@@ -203,6 +208,37 @@ function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, bySt
     block.stmts = [];
   }
   return true;
+}
+
+
+/**
+ * Turn a `jmp` that leaves the function into a tail call.
+ *
+ * The callee is entered with the registers this function was given, so the call
+ * carries the inferred arguments and the return value passes straight through.
+ * Only a jump whose target is outside `entry..end` qualifies: a jump inside the
+ * function is ordinary control flow and is handled by the structuring pass.
+ */
+function markTailCalls(
+  lifted: import('./ir.js').LiftedBlock[],
+  entry: number,
+  end: number | undefined,
+  instructions: import('./decode.js').Instruction[],
+): void {
+  const limit = end ?? Math.max(...instructions.map((instruction) => instruction.address), entry);
+  for (const block of lifted) {
+    if (block.term !== 'jmp' || block.target == null) continue;
+    if (block.target >= entry && block.target < limit) continue;
+    // Keep the statements the block already has: the nil check that guards the
+    // call is real code.
+    block.stmts.push({
+      t: 'return',
+      value: { t: 'call', target: `sub_${(block.target >>> 0).toString(16)}`, args: [], size: 64 },
+    });
+    // The block no longer falls through anywhere the structuring pass can follow.
+    block.term = 'ret';
+    delete block.target;
+  }
 }
 
 function foldStackCheck(
