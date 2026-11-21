@@ -341,11 +341,16 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     let target: number | undefined;
     let unknown = 0;
 
-    let rspShift = rspAtBlockEntry.get(block.start) || 0;
-    // Annotate every instruction with the live rsp displacement before lifting, so
-    // the slot naming below sees the same value the hardware would. The prologue's
-    // `sub rsp, frameSize` is not counted: `frame.frameSize` holds it.
+    // The offset is measured from where `rsp` sits *after* the prologue, because
+    // that is the frame `frame.slots` describes. Before the prologue `rsp` is still
+    // at its entry value, a whole frame higher, so an entry-block instruction that
+    // comes before it needs that much added back. Without this the stack-growth
+    // guard at the top of every Go function — `cmp [rsp+8], r14` — read the argument
+    // slot as a local eighty bytes down in the frame, and that local was a name
+    // nothing had assigned.
     let prologueSeen = block.start !== blocks[0]?.start;
+    let rspShift = rspAtBlockEntry.get(block.start) || 0;
+    if (!prologueSeen) rspShift = frame.frameSize + (frame.hasFramePointer ? 8 : 0);
     for (const ins of block.instructions) {
       const mnemonic = ins.mnemonic.toLowerCase();
       const first = ins.operands[0];
@@ -357,7 +362,8 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         || (mnemonic === 'mov' && first?.kind === 'reg' && registerBase(first.reg || '') === 'rbp')
         || (mnemonic === 'sub' && first?.kind === 'reg' && registerBase(first.reg || '') === 'rsp' && second?.kind === 'imm');
       if (isPrologue) {
-        prologueSeen = true;
+        // Past the prologue the frame is exactly where `frame.slots` says it is.
+        if (!prologueSeen) { prologueSeen = true; rspShift = 0; }
       } else if (prologueSeen) {
         if (mnemonic === 'push') rspShift -= 8;
         else if (mnemonic === 'pop') rspShift += 8;

@@ -662,6 +662,18 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   for (const slot of frame.slots.values()) {
     if (slot.kind === 'param') undefinedReturns.delete(slot.name);
   }
+  // Go passes arguments to assembly routines on the stack, and those routines
+  // write their results straight into the caller's frame. `cpuid.abi0` returns four
+  // registers by filling the four slots the caller reserved. There is no store in
+  // this function for such a slot and no address taken either — the callee writes
+  // it by agreement. When the body calls anything at all, a frame slot it only
+  // reads may have been filled that way, so silence it rather than claim the code
+  // reads garbage.
+  if (calledAnywhere(body)) {
+    for (const name of undefinedReturns) {
+      if (/^[vgs]_\d+$/.test(name)) undefinedReturns.delete(name);
+    }
+  }
   for (const name of undefinedReturns) {
     if (/^stack_arg_/.test(name)) undefinedReturns.delete(name);
   }
@@ -773,6 +785,39 @@ function printStmtForCheck(item: CtrlStmt): string {
     case 'do': return `${item.body.map(printStmtForCheck).join('')} ${printExpr(item.cond)}`;
     default: return '';
   }
+}
+
+
+/** Does the body call anything? */
+function calledAnywhere(body: CtrlStmt[]): boolean {
+  let found = false;
+  const walk = (value: Expr | undefined): void => {
+    if (!value || found) return;
+    switch (value.t) {
+      case 'call': found = true; return;
+      case 'load': walk(value.addr); return;
+      case 'bin': walk(value.left); walk(value.right); return;
+      case 'un': case 'cast': walk(value.value); return;
+      case 'select': walk(value.cond); walk(value.a); walk(value.b); return;
+      default: return;
+    }
+  };
+  const visit = (items: CtrlStmt[]): void => {
+    for (const item of items) {
+      if (found) return;
+      switch (item.t) {
+        case 'assign': walk(item.value); break;
+        case 'expr': walk(item.expr); break;
+        case 'return': walk(item.value); break;
+        case 'if': walk(item.cond); visit(item.then); if (item.else) visit(item.else); break;
+        case 'while': if (item.cond) walk(item.cond); visit(item.body); break;
+        case 'do': visit(item.body); walk(item.cond); break;
+        default: break;
+      }
+    }
+  };
+  visit(body);
+  return found;
 }
 
 function uninitialisedNote(info: Collected): string | null {

@@ -488,3 +488,4 @@ test('a chain of versioned values folds transitively', () => {
     assert.ok(assigned, `${name} is declared and must be assigned somewhere in the printed body`)
   }
 })
+
