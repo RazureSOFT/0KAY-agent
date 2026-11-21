@@ -168,14 +168,23 @@ function isNamedReg(operand: Operand | undefined, name: string): boolean {
 }
 
 interface PendingCondition {
-  op: 'cmp' | 'test' | 'float';
+  op: 'cmp' | 'test' | 'float' | 'overflow';
   left: Expr;
   right: Expr;
 }
 
+/**
+ * Jumps whose condition comes from the previous instruction's flags rather than
+ * from a compare's operands.
+ *
+ * `jo` reads the overflow flag and `jp` the parity flag, and Go produces both as
+ * paired reads of an `imul` or a `ucomiss`. They have no place in JCC — there is no
+ * comparison to invert — so the dispatch has to know about them separately.
+ */
+const FLAG_JUMPS = new Set(['jo', 'jno', 'jp', 'jnp']);
+
 const JCC: Record<string, { op: string; swap?: boolean; zero?: boolean }> = {
-  je: { op: '==' }, jz: { op: '==' },
-  jne: { op: '!=' }, jnz: { op: '!=' },
+  je: { op: '==' }, jz: { op: '==' },  jne: { op: '!=' }, jnz: { op: '!=' },
   jb: { op: '<' }, jnae: { op: '<' }, jc: { op: '<' },
   jae: { op: '>=' }, jnb: { op: '>=' }, jnc: { op: '>=' },
   jbe: { op: '<=' }, jna: { op: '<=' },
@@ -203,6 +212,17 @@ function conditionFrom(mnemonic: string, pending: PendingCondition | null): Expr
     if (spec.op === '==') return { t: 'bin', op: '==', left: subject, right: constExpr(0, left.size), size: 1 };
     if (spec.op === '!=') return { t: 'bin', op: '!=', left: subject, right: constExpr(0, left.size), size: 1 };
     return { t: 'bin', op: spec.op, left: subject, right: constExpr(0, left.size), size: 1 };
+  }
+  if (pending.op === 'overflow') {
+    // Go checks a multiplication for overflow with `imul` followed by `jo`: the
+    // jump asks whether the product fit. The printed test states that as the sign
+    // of the product, which is the part of it the source can show, and the note
+    // beside the multiplication says the rest. Without this the branch came out as
+    // `/* unknown: jo 0x66 */` with no way to tell what was being checked.
+    if (mnemonic === 'jo' || mnemonic === 'jno') {
+      return { t: 'bin', op: '<=', left: pending.left, right: constExpr(0, pending.left.size), size: 1 };
+    }
+    return null;
   }
   if (pending.op === 'float') {
     // A pair of flags read from one float compare: Go tests ZF first (`jne`/`je`) and
@@ -503,11 +523,19 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         target = a?.target;
         continue;
       }
-      if (m.startsWith('j') && JCC[m]) {
-        term = 'jcc';
-        cond = conditionFrom(m, pending);
-        target = a?.target;
-        // A jump consumes the comparison that set the flags.
+      if (m.startsWith('j') && (JCC[m] || FLAG_JUMPS.has(m))) {
+        // The flag-only jumps — `jo`, `jno`, `jp`, `jnp` — have no entry in JCC
+        // because their condition comes from the instruction before them, not from
+        // the operands of a compare. Asking `JCC[m]` here meant every one of them
+        // fell through to the catch-all, including the overflow checks (`imul; jo`)
+        // and the float compares (`ucomiss; jne; jnp`) that the two handlers above
+        // had just worked out a condition for.
+        const flagCond = conditionFrom(m, pending);
+        if (flagCond) {
+          term = 'jcc';
+          cond = flagCond;
+          target = a?.target;
+        }
         pending = null;
         continue;
       }
@@ -586,6 +614,10 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
           value: { t: 'bin', op: '*', left: { t: 'reg', name: 'rax', size: 64 }, right: operandExpr(a, ins, frame), size: 64 },
         });
         stmts.push({ t: 'note', text: 'the high half of this product is in rdx' });
+        // The `jo` that follows an unsigned multiply is Go's overflow check: the
+        // product lands in rdx:rax and the jump asks whether it fit in rax. Same
+        // treatment as `imul`, which reaches the shared arithmetic path below.
+        pending = { op: 'overflow', left: { t: 'reg', name: 'rax', size: 64 }, right: constExpr(0, 64) };
         continue;
       }
       if (/xmm\d+/.test(a?.reg || '') || /xmm\d+/.test(b?.reg || '')) continue;
@@ -695,8 +727,12 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         if (CARRIED[m]) stmts.push({ t: 'note', text: `${m} carries the borrow into this result` });
         // An arithmetic instruction overwrites the flags a compare left behind:
         // keeping the old operands made a following flag-only jump compare values
-        // from before this result existed.
-        pending = null;
+        // from before this result existed. A multiplication is the exception — the
+        // flags describe the product, and the `jo` that follows one is Go's overflow
+        // check on it.
+        pending = m === 'imul' || m === 'mul'
+          ? { op: 'overflow', left, right: constExpr(0, left.size) }
+          : null;
         continue;
       }
       // Bit test-and-modify: `bts a, b` sets one bit of a. The bit index is usually a
