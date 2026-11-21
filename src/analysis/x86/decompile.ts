@@ -705,6 +705,24 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   // is reading its own argument — `indexbody` was reported as reading `r10` and `rcx`
   // with no store, and both are simply where its fourth and fifth arguments came in.
   for (const register of frame.argRegisters) undefinedReturns.delete(register);
+  // Go passes integers in nine registers, not the four the platform's convention uses,
+  // and `frame.argRegisters` holds the platform's list: `indexbody` was reported as
+  // reading `r10` with no store, and `r10` is where its fifth argument arrives. The
+  // signature inference keeps the platform list — changing it moves every signature in
+  // the binary and is a separate question — but a read of a Go argument register is an
+  // argument, and saying otherwise is wrong about the ABI.
+  for (const register of ['rax', 'rbx', 'rcx', 'rdi', 'rsi', 'r8', 'r9', 'r10', 'r11']) {
+    undefinedReturns.delete(register);
+  }
+  // And the callee-save set. `rbx`, `rbp` and `r12`-`r15` hold their caller's values
+  // on entry — a function that reads one before storing to it is reading what it was
+  // handed, not garbage. `(*table).PutSlot` prints `r12 = r12` among the argument
+  // spills, whose whole meaning is that r12 was left alone; calling that an undefined
+  // read is the decompiler reporting the ABI as a bug in the code. The registers the
+  // convention passes arguments in were handled just above.
+  for (const register of ['rbx', 'rbp', 'r12', 'r13', 'r14', 'r15']) {
+    undefinedReturns.delete(register);
+  }
   // Go passes arguments to assembly routines on the stack, and those routines
   // write their results straight into the caller's frame. `cpuid.abi0` returns four
   // registers by filling the four slots the caller reserved. There is no store in
