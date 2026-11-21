@@ -198,10 +198,27 @@ function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, bySt
     current = block.end;
   }
   if (!closes || !path.length) return false;
+  // A block on the retry path that something *off* the path also jumps to is not part
+  // of the retry. Folding it emptied a block the structuring pass still had a jump to
+  // and printed `goto L_14006417e` with no label anywhere: `runtime.selectgo` lays out
+  // a jump table whose cases sit between a guard and its retry, so the fall-through
+  // walk crossed two blocks that the table also targets.
+  //
+  // The walk stops at the first such block. Everything before it is retry-only and is
+  // folded as usual; that block and whatever follows stay, because a jump needs them.
+  const onPath = new Set(path);
+  const all = [...byStart.values()];
+  const targetsOf = (start: number): boolean => all.some((other) =>
+    !onPath.has(other.start)
+    && (other.target === start
+      || (other.switch != null
+        && (other.switch.cases.some((item) => item.target === start)
+          || other.switch.defaultTarget === start))));
   guard.term = 'fallthrough';
   guard.cond = null;
   delete guard.target;
   for (const start of path) {
+    if (targetsOf(start)) break;
     const block = byStart.get(start);
     if (!block) continue;
     block.folded = true;
@@ -333,6 +350,21 @@ function foldUnreachable(
 
   for (const block of lifted) {
     if (block.folded || reachable.has(block.start)) continue;
+    // A block the reachability walk did not get to can still be the target of a jump
+    // the structuring pass will print. `runtime.selectgo` has a jump table whose cases
+    // are reached only through the table, so the walk misses them; folding one away
+    // left `goto L_14006417e` pointing at a label that was never written, because the
+    // block holding that label had been emptied and dropped from the order.
+    //
+    // Anything with an incoming edge is kept, whatever the walk concluded. The walk
+    // is a good filter for a panic tail nobody branches to; it is not a licence to
+    // delete a block that something jumps at.
+    const hasIncoming = lifted.some((other) =>
+      other.target === block.start
+      || (other.switch != null
+        && (other.switch.cases.some((item) => item.target === block.start)
+          || other.switch.defaultTarget === block.start)));
+    if (hasIncoming) continue;
     block.folded = true;
     block.stmts = [];
   }
