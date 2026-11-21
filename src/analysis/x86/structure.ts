@@ -164,12 +164,19 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         } else {
           const thenBody = emitRange(thenBlock, join);
           const elseBody = emitRange(elseBlock, join);
+          // A branch onto an already-emitted epilogue comes out empty, because the
+          // block was printed once and `emitRange` stops at `emitted`. When that
+          // block does nothing but return, the branch's body *is* that return:
+          // printing an empty pair of braces hides a real early exit, and Go shares
+          // one epilogue between every exit in the function, so this is common.
+          const epilogue = thenBody.length ? [] : sharedReturn(thenBlock, join, byStart, emitted);
           // An empty then-body beside a real else-body is the same test written the
           // other way round. It happens when the branch target was already emitted
           // by an enclosing structure, so `emitRange` returned nothing: printing
           // `if (x) { } else { ... }` shows an empty block that reads as lost code,
           // and every case of a switch that shares a tail comes out inverted.
-          if (!thenBody.length && elseBody.length) out.push({ t: 'if', cond: negate(cond), then: elseBody });
+          if (epilogue.length) out.push({ t: 'if', cond, then: epilogue, ...(elseBody.length ? { else: elseBody } : {}) });
+          else if (!thenBody.length && elseBody.length) out.push({ t: 'if', cond: negate(cond), then: elseBody });
           else out.push({ t: 'if', cond, then: thenBody, ...(elseBody.length ? { else: elseBody } : {}) });
         }
         current = join;
@@ -276,6 +283,29 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
   }
   void depth;
   return { body, orphans, loops: loops.length, gotos };
+}
+
+
+/**
+ * The statements of an already-emitted epilogue, when a branch targets one.
+ *
+ * Returns the block's own statements if it is a bare return — the shared exit Go
+ * uses for every `return` in a function — and nothing otherwise. Reusing them is
+ * correct because a return has no side effects beyond leaving, and inlining it
+ * where the branch goes says "this path exits here", which an empty block does not.
+ */
+function sharedReturn(
+  target: number | null,
+  stop: number | null,
+  byStart: Map<number, import('./ir.js').LiftedBlock>,
+  emitted: Set<number>,
+): CtrlStmt[] {
+  if (target == null || target === stop || !emitted.has(target)) return [];
+  const block = byStart.get(target);
+  if (!block || block.term !== 'ret') return [];
+  // Only a body that is nothing but the return, so nothing is duplicated.
+  if (block.stmts.length !== 1 || block.stmts[0].t !== 'return') return [];
+  return [{ ...block.stmts[0] }];
 }
 
 function labelOf(address: number): string {
