@@ -226,6 +226,11 @@ function sameExpr(a: Expr, b: Expr): boolean {
 const BINARY_VERBS: Record<string, string> = {
   add: '+', sub: '-', and: '&', or: '|', xor: '^', sbb: '-',
   shl: '<<', sal: '<<', shr: '>>', sar: '>>',
+  // The rotations. `rcr`/`rcl` pull the carry in, and the carry is not modelled, so
+  // the printed form is the plain rotate: it is what the instruction does to the
+  // value, minus one bit of state the reader can see is missing. Reporting the
+  // whole instruction as unexplained would be worse — the destination is written.
+  rol: '<<', ror: '>>', rcl: '<<', rcr: '>>',
   imul: '*', mul: '*',
 };
 
@@ -433,6 +438,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         term = 'jcc';
         cond = conditionFrom(m, pending);
         target = a?.target;
+        // A jump consumes the comparison that set the flags.
         pending = null;
         continue;
       }
@@ -618,6 +624,10 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
           value: { t: 'bin', op: BINARY_VERBS[m], left, right: operandExpr(b, ins, frame), size: left.size },
         });
         if (CARRIED[m]) stmts.push({ t: 'note', text: `${m} carries the borrow into this result` });
+        // An arithmetic instruction overwrites the flags a compare left behind:
+        // keeping the old operands made a following flag-only jump compare values
+        // from before this result existed.
+        pending = null;
         continue;
       }
       // Bit test-and-modify: `bts a, b` sets one bit of a. The bit index is usually a
