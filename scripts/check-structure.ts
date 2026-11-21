@@ -47,6 +47,7 @@ const fails: Record<string, Failure[]> = {
   selfAssign: [],
   repeatedCondition: [],
   readBeforeWritten: [],
+  undeclaredName: [],
 }
 let functions = 0
 let instructions = 0
@@ -122,11 +123,39 @@ for (const fn of named.slice(0, LIMIT)) {
   }
 
   if (/read before written/.test(c)) fails.readBeforeWritten.push({ name: fn.name, detail: '' })
+
+  // 8. Every name the body uses must be declared. This is the one that decides whether
+  //    the listing is C at all: an undeclared identifier is a compile error, and a
+  //    reader cannot look up a name the function never introduced. The other checks are
+  //    about readability; this one is about the output being source code.
+  const declared = new Set<string>()
+  for (const m of (c.split('{')[0] || '').matchAll(/\b(?:long|int|char|short|float|double|unsigned|void|__int64)\b\s*\*?\s*([A-Za-z_]\w*)/g)) {
+    declared.add(m[1])
+  }
+  const openBrace = c.indexOf('{')
+  const body = openBrace >= 0 ? c.slice(openBrace + 1) : ''
+  for (const m of body.matchAll(/^\s*(?:long|int|char|short|float|double|unsigned|void|__int64)\s+\*?\s*([A-Za-z_]\w*)\s*;/gm)) {
+    declared.add(m[1])
+  }
+  const missing = new Set<string>()
+  for (const m of body.matchAll(/\b([a-zA-Z_]\w*)\s*=(?!=)/g)) {
+    const name = m[1]
+    if (declared.has(name)) continue
+    if (!/^(?:r[a-z]{2}|r\d{1,2}|e[a-z]{2}|v_\d+|stack_\d+|xmm\d+|ymm\d+)$/.test(name)) continue
+    // `rsp` and `rbp` are the stack pointer and frame base. They are not variables the
+    // function owns, so a declaration for either would ask the reader to find a store
+    // that does not exist — the decompiler leaves them out on purpose.
+    if (name === 'rsp' || name === 'rbp') continue
+    missing.add(name)
+  }
+  if (missing.size) {
+    fails.undeclaredName.push({ name: fn.name, detail: [...missing].slice(0, 4).join(', ') })
+  }
 }
 
 const order = [
-  'emptyBranch', 'danglingGoto', 'unusedLabel', 'gotoCountMismatch',
-  'braceImbalance', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
+  'undeclaredName', 'braceImbalance', 'emptyBranch', 'danglingGoto', 'unusedLabel',
+  'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)
 let bad = 0

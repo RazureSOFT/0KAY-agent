@@ -462,7 +462,7 @@ test('a versioned value read once is folded into its reader', () => {
   // name it reads.
   const declared = [...result.c.matchAll(/^\s{4}long (\w+);$/gm)].map((m) => m[1])
   for (const name of declared) {
-    const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`, 'm').test(result.c)
+    const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`, 'm').test(result.c)
     assert.ok(assigned, `${name} is declared and must be assigned somewhere`)
   }
 })
@@ -484,7 +484,7 @@ test('a chain of versioned values folds transitively', () => {
   const result = decompileFunction(code, BASE, BASE, { name: 'bump', end: BASE + code.length, convention: 'sysv' })
   const declared = [...result.c.matchAll(/^\s{4}(?:long|int|short|char) (\w+);$/gm)].map((m) => m[1])
   for (const name of declared) {
-    const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`, 'm').test(result.c)
+    const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`, 'm').test(result.c)
     assert.ok(assigned, `${name} is declared and must be assigned somewhere in the printed body`)
   }
 })

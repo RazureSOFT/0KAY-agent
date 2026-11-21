@@ -843,7 +843,13 @@ function returnType(info: Collected): CType | 'void' {
 /** Is this a register name the body never assigns? */
 function isUnassignedRegister(body: CtrlStmt[], name: string): boolean {
   if (!/^(?:r[a-z]{2}|r\d{1,2}|return_address)$/.test(name)) return false;
-  const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`);
+  // The escapes have to be doubled. In a template literal `\w` and `\s` are not string
+  // escapes, so the backslash is dropped and the pattern becomes `[^w.]rdx =[^=]` —
+  // which matches almost nothing, so the test said "never assigned" about names it was
+  // looking straight at. `rdx = arg2 + -0x1;` was printed in the body and left out of
+  // the declarations, and 203 functions in the first 300 used a name that was never
+  // declared, which no C compiler accepts.
+  const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`);
   const lines = body.map((item) => printStmtForCheck(item)).join('\n');
   return !assigned.test(lines);
 }
