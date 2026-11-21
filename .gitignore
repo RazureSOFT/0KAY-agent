@@ -46,3 +46,6 @@ github_check.py
 # Local scratch files that must never be committed.
 make_excel.py
 nul
+
+# Local scratch: measurement scripts and probes, never part of the tree.
+.run/
