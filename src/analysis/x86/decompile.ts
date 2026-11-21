@@ -508,7 +508,12 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   // exist before the function does. Reporting either as "read before written" is
   // never right, and it was a large share of the remaining warnings on functions
   // that touch the frame through `mov [rsp+8], ...`.
-  const defined = new Set<string>([...params, 'rsp', 'rbp']);
+  // `r14` holds the goroutine pointer for the whole life of the thread. Go keeps it
+  // loaded by convention and never assigns it inside a function, so a body that
+  // reads it is not reading uninitialised memory — it is reading the runtime.
+  // `rsp` and `rbp` are the same kind of thing: state that exists before the code
+  // runs.
+  const defined = new Set<string>([...params, 'rsp', 'rbp', 'r14']);
   // A local whose address is taken is a buffer, not a scalar: `&v_208` is passed
   // to a routine that fills it, so the bytes are written through the pointer and
   // there is no assignment in this function to see. Reporting the later reads as
