@@ -206,10 +206,20 @@ function sameExpr(a: Expr, b: Expr): boolean {
 }
 
 const BINARY_VERBS: Record<string, string> = {
-  add: '+', sub: '-', and: '&', or: '|', xor: '^',
+  add: '+', sub: '-', and: '&', or: '|', xor: '^', sbb: '-',
   shl: '<<', sal: '<<', shr: '>>', sar: '>>',
   imul: '*', mul: '*',
 };
+
+/**
+ * Instructions whose result depends on the carry flag.
+ *
+ * `sbb a, b` is `a - b - carry`. The carry is not modelled here, so the printed
+ * expression says `a - b` and the comment says what was left out — Go uses sbb
+ * to materialise a borrow (`sbb x, x` is a branchless 0/-1), and calling that a
+ * plain subtraction would be a different program.
+ */
+const CARRIED: Record<string, true> = { sbb: true };
 
 /** Lift one function's blocks into IR. */
 export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame): LiftedBlock[] {
@@ -241,6 +251,10 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if (m === 'nop' || m === 'endbr64' || m === 'leave' || m === 'push' || m === 'pop'
         || m === 'stc' || m === 'clc' || m === 'cmc' || m === 'cld' || m === 'std'
         || m === 'sahf' || m === 'lahf' || m === 'pause') continue;
+      // `int3` is alignment padding (0xCC fills every function's tail). A block
+      // that begins there has nothing to say, so it ends the lift instead of
+      // contributing an "unknown" line the reader has to interpret.
+      if (m === 'int3') break;
       // Prologue and epilogue when a frame pointer is in use: the slots are
       // addressed through rbp, so adjusting rsp says nothing the reader needs.
       if (frame.hasFramePointer) {
@@ -291,6 +305,11 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         argStmtIndex.clear();
         continue;
       }
+      // Anything touching a vector register is outside what this IR models: it tracks
+// integer and pointer values, and a 128-bit lane has neither. Printing
+// `xmm0 = xmm0` for the compiler's `movd`/`xorps` register-juggling would add
+// lines that say nothing.
+      if (/xmm\d+/.test(a?.reg || '') || /xmm\d+/.test(b?.reg || '')) continue;
       if (m === 'mov' || m === 'movabs') {
         // Segment-register moves do not affect the value flow this IR models.
         if (a?.kind === 'reg' && a.reg === 'seg' || b?.kind === 'reg' && b.reg === 'seg') continue;
@@ -350,11 +369,31 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       }
       if (BINARY_VERBS[m] && a && b) {
         const left = operandExpr(a, ins, frame);
+        // `sbb x, x` is Go's branchless way to materialise a borrow: x - x - carry
+        // is just -carry, i.e. 0 or -1. Printed as `x = x - x` it reads as a value
+        // combined with itself, which is exactly the shape of thing this
+        // decompiler is supposed to never print.
+        const sameOperand = a.kind === 'reg' && b.kind === 'reg' && a.reg === b.reg;
+        if (m === 'sbb' && sameOperand) {
+          stmts.push({ t: 'assign', target: left, value: { t: 'un', op: '-', value: { t: 'const', v: 1, size: left.size }, size: left.size } });
+          stmts.push({ t: 'unknown', text: 'the -1 above is the borrow, not a literal: sbb x, x is 0 or -1 from the carry flag' });
+          continue;
+        }
         stmts.push({
           t: 'assign',
           target: left,
           value: { t: 'bin', op: BINARY_VERBS[m], left, right: operandExpr(b, ins, frame), size: left.size },
         });
+        if (CARRIED[m]) stmts.push({ t: 'unknown', text: `${m} carries the borrow into this result` });
+        continue;
+      }
+      // Bit test-and-modify: `bts a, b` sets one bit of a. The bit index is usually a
+// runtime value, so the exact mask cannot be printed; saying which bit was set
+// is more useful than dropping the instruction.
+      if ((m === 'bts' || m === 'btr' || m === 'btc') && a && b) {
+        const bit = operandExpr(b, ins, frame);
+        const verb = m === 'bts' ? 'sets' : m === 'btr' ? 'clears' : 'flips';
+        stmts.push({ t: 'unknown', text: `${m} ${verb} one bit of ${a.kind === 'mem' ? a.mem || 'that value' : operandExpr(a, ins, frame).t === 'var' ? (operandExpr(a, ins, frame) as { name: string }).name : 'the destination'}${bit.t === 'const' ? ` (bit ${bit.v})` : ''}` });
         continue;
       }
       if ((m === 'inc' || m === 'dec') && a) {

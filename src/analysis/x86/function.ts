@@ -84,7 +84,11 @@ export function disassembleFunction(
 
     const flow = instruction.flow;
     const fallthrough = address + instruction.length;
-    if (flow === 'ret' || flow === 'stop') continue;
+    // `int3` is padding, not code: every function is padded to an alignment
+    // boundary with 0xCC. Walking through it filled the tail of a body with
+    // unknown statements and made the padding look like a path the reader should
+    // follow.
+    if (flow === 'ret' || flow === 'stop' || flow === 'int') continue;
     if (flow === 'jump') {
       const direct = branchTarget(instruction);
       if (direct != null) { accept(direct); continue; }

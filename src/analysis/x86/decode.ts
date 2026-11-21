@@ -678,6 +678,23 @@ function decodeTwoByte(
     ]);
   }
 
+  // The SSE block. Go's compiler uses `movd`/`movq` to move small values between
+// general and vector registers, and `movups`/`xorps` for the zeroing idiom.
+  // They are named so the listing says what the instruction is; the IR prints the
+  // vector part as a comment rather than pretending to model 128-bit lanes.
+  const SSE_NAMES: Record<number, string> = {
+    0x10: 'movups', 0x11: 'movups', 0x28: 'movaps', 0x29: 'movaps',
+    0x6e: 'movd', 0x6f: 'movdqa', 0x7e: 'movd', 0x7f: 'movdqa',
+    0x57: 'xorps', 0x54: 'andps', 0x56: 'orps',
+    0x2a: 'cvtsi2ss', 0x2c: 'cvttss2si', 0x2d: 'cvtss2si',
+  };
+  const sseName = SSE_NAMES[second];
+  if (sseName && operand) {
+    const reg = { kind: 'reg' as const, reg: XMM[regField], size: 128 };
+    const isStore = second === 0x11 || second === 0x29 || second === 0x7e || second === 0x7f;
+    return finish(sseName, isStore ? [operand, reg] : [reg, operand]);
+  }
+
   if (known && operand) {
     if (known.name === 'imul') {
       return finish('imul', [{ kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize }, operand]);

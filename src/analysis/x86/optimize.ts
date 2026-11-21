@@ -100,9 +100,20 @@ export function propagate(stmts: Stmt[]): Stmt[] {
   }
   const versions = new Map<string, number>();
   const out: Stmt[] = [];
+  /**
+   * Old name -> current name for a pinned register that has been redefined.
+   *
+   * Renaming the destination without renaming the later reads left `rcx = rbx`
+   * referring to a name that the rename had just retired: the new `rbx_2 = rcx`
+   * was then unreferenced and deleted as a dead store, so `rbx` ended up read
+   * with no assignment anywhere. The two instructions are a save and a restore
+   * of the same value, and they have to agree on what it is called.
+   */
+  const current = new Map<string, string>();
+  const readName = (name: string): string => current.get(name) || name;
   for (const stmt of stmts) {
     if (stmt.t === 'assign') {
-      const value = substitute(stmt.value, env);
+      const value = renameReads(substitute(stmt.value, env), readName);
       let target = stmt.target;
       // A pinned name being redefined becomes a fresh variable, not an
       // overwrite of the value that arrived in it.
@@ -110,8 +121,11 @@ export function propagate(stmts: Stmt[]): Stmt[] {
       if (targetName && pinned.has(targetName)) {
         const next = (versions.get(targetName) || 1) + 1;
         versions.set(targetName, next);
-        target = { ...target, name: `${targetName}_${next}` } as Expr;
+        const fresh = `${targetName}_${next}`;
+        target = { ...target, name: fresh } as Expr;
+        current.set(targetName, fresh);
         env.delete(targetName);
+        env.delete(fresh);
       }
       if (target.t === 'reg' || target.t === 'var') {
         if (value.t === 'const' || value.t === 'reg' || value.t === 'var') env.set(target.name, value);
@@ -124,17 +138,36 @@ export function propagate(stmts: Stmt[]): Stmt[] {
       continue;
     }
     if (stmt.t === 'return') {
-      out.push(stmt.value ? { t: 'return', value: substitute(stmt.value, env) } : stmt);
+      out.push(stmt.value ? { t: 'return', value: renameReads(substitute(stmt.value, env), readName) } : stmt);
       continue;
     }
     if (stmt.t === 'expr') {
-      out.push({ t: 'expr', expr: substitute(stmt.expr, env) });
+      out.push({ t: 'expr', expr: renameReads(substitute(stmt.expr, env), readName) });
       continue;
     }
     env.clear();
+    current.clear();
     out.push(stmt);
   }
   return out;
+}
+
+/** Apply the pinned-register rename to every read inside an expression. */
+function renameReads(expr: Expr, readName: (name: string) => string): Expr {
+  switch (expr.t) {
+    case 'reg':
+    case 'var': {
+      const name = readName(expr.name);
+      return name === expr.name ? expr : { ...expr, name };
+    }
+    case 'load': return { ...expr, addr: renameReads(expr.addr, readName) };
+    case 'bin': return { ...expr, left: renameReads(expr.left, readName), right: renameReads(expr.right, readName) };
+    case 'un': return { ...expr, value: renameReads(expr.value, readName) };
+    case 'cast': return { ...expr, value: renameReads(expr.value, readName) };
+    case 'select': return { ...expr, cond: renameReads(expr.cond, readName), a: renameReads(expr.a, readName), b: renameReads(expr.b, readName) };
+    case 'call': return { ...expr, args: expr.args.map((arg) => renameReads(arg, readName)) };
+    default: return expr;
+  }
 }
 
 /**
@@ -170,5 +203,67 @@ export function removeDeadStores(stmts: Stmt[], liveAfter: Set<string> = new Set
 }
 
 export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new Set()): Stmt[] {
-  return removeDeadStores(propagate(stmts), liveAfter);
+  return removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter);
+}
+
+/**
+ * Drop `save = live; ...; live = save` pairs where nothing touched `save`.
+ *
+ * A compiler that needs a register for a moment saves it and restores it. The
+ * two assignments are a no-op as a pair, but printed separately they read like
+ * data movement through a variable that exists for no reason — and the moment
+ * the rename pass numbers the saved copy, the restore refers to a name the
+ * reader has to trace back to work out that nothing happened.
+ *
+ * Only removed when the value in between is untouched: if anything writes the
+ * saved name, the restore is doing real work.
+ */
+function collapseSaveRestore(stmts: Stmt[]): Stmt[] {
+  const out: Stmt[] = [];
+  let index = 0;
+  while (index < stmts.length) {
+    const save = stmts[index];
+    const saveTargetName = save.t === 'assign' && (save.target.t === 'reg' || save.target.t === 'var') ? save.target.name : '';
+    const saveSourceName = save.t === 'assign' && (save.value.t === 'reg' || save.value.t === 'var') ? save.value.name : '';
+
+    if (saveTargetName && saveSourceName && saveTargetName !== saveSourceName) {
+      const restoreAt = findRestore(stmts, index, saveTargetName, saveSourceName);
+      if (restoreAt > index) {
+        // Keep what happened between the two, drop the pair itself.
+        out.push(...stmts.slice(index + 1, restoreAt));
+        index = restoreAt + 1;
+        continue;
+      }
+    }
+    out.push(save);
+    index += 1;
+  }
+  return out;
+}
+
+/**
+ * The index of the matching restore, or -1.
+ *
+ * The restore is `source = saved` with nothing writing `saved` in between. It
+ * also requires nothing writing `source` in between: if the live value had been
+ * replaced, restoring the saved copy is not a no-op.
+ */
+function findRestore(stmts: Stmt[], from: number, savedName: string, sourceName: string): number {
+  for (let scan = from + 1; scan < stmts.length; scan++) {
+    const candidate = stmts[scan];
+    if (candidate.t !== 'assign') continue;
+    const targetName = candidate.target.t === 'reg' || candidate.target.t === 'var' ? candidate.target.name : '';
+    const valueName = candidate.value.t === 'reg' || candidate.value.t === 'var' ? candidate.value.name : '';
+    if (targetName === savedName) return -1; // the saved copy was reused
+    if (targetName === sourceName && valueName === savedName) {
+      for (let inner = from + 1; inner < scan; inner++) {
+        const between = stmts[inner];
+        if (between.t !== 'assign') continue;
+        const betweenTarget = between.target.t === 'reg' || between.target.t === 'var' ? between.target.name : '';
+        if (betweenTarget === sourceName) return -1;
+      }
+      return scan;
+    }
+  }
+  return -1;
 }

@@ -192,17 +192,32 @@ test('a parameter that is only copied into a local is still a parameter', () => 
   assert.match(result.c, /copied\(long arg0\)/, 'the incoming argument must appear in the signature')
 })
 
-test('a value read before it is written is labelled, not printed as a normal local', () => {
-  // mov rdi, [rsi]  ; add rax, 1 ; ret
-  // The body has two statements, so it is not a pass-through. rax is read by the
-  // add before anything writes it — a real undefined read.
+test('a routine that never sets rax does not print a return of rax', () => {
+  // mov qword [rsp+8], 1 ; ret — a hand-written routine that stores its result
+  // into the caller's frame. `long f(void) { return rax; }` would be an
+  // invention and would not compile as C; `void f(void)` with a bare return is
+  // what the instructions actually do.
+  const code = bytes(
+    0x48, 0xc7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00,   // mov qword [rsp+8], 1
+    0xc3,                                                    // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'noret', end: BASE + code.length, convention: 'win64' })
+  assert.match(result.c, /void noret\(void\)/, 'no invented return type')
+  assert.doesNotMatch(result.c, /return rax/, 'no invented return value')
+})
+
+test('a register only ever read at entry becomes a parameter, not a warning', () => {
+  // mov rdi, [rsi] ; add rax, 1 ; ret — every register read before its own write
+  // is something the caller supplied, so all of them are parameters. This used to
+  // print an undefined-read warning for rax while also listing it as arg0.
   const code = bytes(
     0x48, 0x8b, 0x3e,                              // mov rdi, [rsi]
     0x48, 0x83, 0xc0, 0x01,                        // add rax, 1
     0xc3,                                          // ret
   )
-  const result = decompileFunction(code, BASE, BASE, { name: 'scratch', end: BASE + code.length, convention: 'sysv' })
-  assert.match(result.c, /read before written: rax/, 'the undefined read must be stated')
+  const result = decompileFunction(code, BASE, BASE, { name: 'uses', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /read before written/, 'an incoming value is not an undefined read')
+  assert.match(result.c, /uses\(long arg0/, 'the destination of the add is an input')
 })
 
 test('a bare ret handing back the caller\'s register is not an undefined read', () => {

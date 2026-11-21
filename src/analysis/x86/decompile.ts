@@ -95,6 +95,11 @@ export function decompileFunction(
   params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
   const locals = [...info.vars.values()]
     .filter((local) => !params.some((param) => param.name === local.name))
+    // A declaration for a name that no printed statement mentions is noise, and
+    // the reader cannot tell it from a value the pipeline lost. The collectors
+    // run before the return-value rewrite above, so names that only appeared in a
+    // dropped return are still in `vars`.
+    .filter((local) => mentionsName(finalBody, local.name))
     .map((local) => ({ name: local.name, type: local.type }));
   const signature = `${returnType(info)} ${fn.name}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
@@ -185,16 +190,69 @@ function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number):
     entryBlock.stmts.unshift({ t: 'unknown', text: 'stack check: grows the goroutine stack, then re-runs this function' });
     foldedAny = true;
   }
-  if (!foldedAny) return;
 
-  // A block that jumps back to the entry is the same retry reached from a guard
-  // that has just been folded; it is unreachable now.
-  for (const block of lifted) {
-    if (block.start === entry || block.folded) continue;
-    if (block.term === 'jmp' && block.target === entry) {
-      block.folded = true;
-      block.stmts = [];
+  if (foldedAny) {
+    // A block that jumps back to the entry is the same retry reached from a guard
+    // that has just been folded; it is unreachable now.
+    for (const block of lifted) {
+      if (block.start === entry || block.folded) continue;
+      if (block.term === 'jmp' && block.target === entry) {
+        block.folded = true;
+        block.stmts = [];
+      }
     }
+  }
+
+  // Independent of guards: panic paths and alignment padding sit in the
+  // function's address range without a branch into them.
+  foldUnreachable(lifted, entry);
+}
+
+/**
+ * Fold blocks that control flow cannot reach.
+ *
+ * Go emits panic paths and stack-guard tails that sit after a `ret` with no
+ * branch into them: they run only from a call that never returns, and the
+ * disassembler still lifts them because they sit in the function's address
+ * range. Printing them puts `return rbx` in a body where rbx is the panic
+ * value, which reads as an unassigned local the reader is supposed to explain.
+ *
+ * Reachability is computed over the successors that survive folding, so this
+ * runs after the stack-guard pass and cannot resurrect what it removed.
+ */
+function foldUnreachable(lifted: import('./ir.js').LiftedBlock[], entry: number): void {
+  const byStart = new Map(lifted.map((block) => [block.start, block]));
+  const order = lifted.filter((block) => !block.folded).map((block) => block.start).sort((a, b) => a - b);
+  const nextOf = (block: import('./ir.js').LiftedBlock): number | null => {
+    const index = order.indexOf(block.start);
+    return index >= 0 && index + 1 < order.length ? order[index + 1] : null;
+  };
+
+  const reachable = new Set<number>();
+  const queue: number[] = [entry];
+  while (queue.length) {
+    const start = queue.pop() as number;
+    if (reachable.has(start)) continue;
+    const block = byStart.get(start);
+    if (!block || block.folded) continue;
+    reachable.add(start);
+    if (block.switch) {
+      for (const item of block.switch.cases) queue.push(item.target);
+      if (block.switch.defaultTarget != null) queue.push(block.switch.defaultTarget);
+      continue;
+    }
+    if (block.term === 'ret') continue;
+    if (block.target != null) queue.push(block.target);
+    if (block.term !== 'jmp') {
+      const next = nextOf(block);
+      if (next != null) queue.push(next);
+    }
+  }
+
+  for (const block of lifted) {
+    if (block.folded || reachable.has(block.start)) continue;
+    block.folded = true;
+    block.stmts = [];
   }
 }
 
@@ -317,6 +375,23 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
           // an undefined read.
           if (!passThroughReturn) undefinedReads(item.value, defined, undefinedReturns);
           expr(item.value);
+          // `rax` is only a return value if the function ever put something in
+          // it. A hand-written assembly routine stores its result into the
+          // caller's frame (`mov [rsp+8], 1`) and returns without touching rax —
+          // printing `long f(void) { return rax; }` there is an invention.
+          const returnsRax = item.value.t === 'reg' && item.value.name === 'rax';
+          if (returnsRax && !defined.has('rax') && !passThroughReturn) {
+            // Nothing wrote rax and this is not the pass-through idiom: the
+            // routine returns through the caller's frame or a different register.
+            // `void f(void) { return rax; }` is not C, so the value is dropped —
+            // and so is the undefined-read record for it, because the read is no
+            // longer in the output and a warning about an absent line is noise.
+            item.value = undefined;
+            undefinedReturns.delete('rax');
+            returnsValue = false;
+            return;
+          }
+          expr(item.value);
           returnsValue = true;
         }
         return;
@@ -334,7 +409,42 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   };
 
   body.forEach(stmt);
+  // A name that the function writes anywhere is not an undefined read, even when
+  // the read comes first in the printed order: the write is on another branch.
+  // Going by printed order alone labelled every register the decompiler happened
+  // to place after its assignment — `mov rcx, rbx` printed before the `lea rbx`
+  // that defines rbx is a branch, not a bug.
+  for (const name of writes) undefinedReturns.delete(name);
   return { vars, returnsValue, undefinedReturns };
+}
+
+/** Does any printed statement read or write this name? */
+function mentionsName(body: CtrlStmt[], name: string): boolean {
+  const inExpr = (value: Expr | undefined): boolean => {
+    if (!value) return false;
+    switch (value.t) {
+      case 'reg': case 'var': return value.name === name;
+      case 'load': return inExpr(value.addr);
+      case 'bin': return inExpr(value.left) || inExpr(value.right);
+      case 'un': return inExpr(value.value);
+      case 'cast': return inExpr(value.value);
+      case 'select': return inExpr(value.cond) || inExpr(value.a) || inExpr(value.b);
+      case 'call': return value.args.some((arg) => inExpr(arg));
+      default: return false;
+    }
+  };
+  const inStmt = (item: CtrlStmt): boolean => {
+    switch (item.t) {
+      case 'assign': return inExpr(item.target) || inExpr(item.value);
+      case 'expr': return inExpr(item.expr);
+      case 'return': return inExpr(item.value);
+      case 'if': return inExpr(item.cond) || item.then.some(inStmt) || (item.else || []).some(inStmt);
+      case 'while': return inExpr(item.cond || undefined) || item.body.some(inStmt);
+      case 'do': return item.body.some(inStmt) || inExpr(item.cond);
+      default: return false;
+    }
+  };
+  return body.some(inStmt);
 }
 
 /**

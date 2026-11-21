@@ -253,12 +253,31 @@ const WRITES_FIRST: Record<string, true> = {
   inc: true, dec: true, neg: true, not: true, bswap: true, pop: true,
 };
 
+/**
+ * Instructions that read their destination as well as write it.
+ *
+ * `add rax, rbx` computes `rax + rbx`, so rax is an input. Treating the first
+ * operand as a pure destination meant `nop; add rax, rbx; ret` — Go's
+ * two-value return, where rax and rbx both arrive in registers — produced a
+ * signature naming only `rbx` and a body that read an unassigned rax.
+ */
+const READS_DESTINATION: Record<string, true> = {
+  add: true, sub: true, and: true, or: true, xor: true, adc: true, sbb: true,
+  shl: true, sal: true, shr: true, sar: true, imul: true, mul: true,
+  inc: true, dec: true, neg: true, not: true, bswap: true,
+};
+
 function writtenRegister(instruction: Instruction): string | null {
   const mnemonic = instruction.mnemonic.toLowerCase();
   if (/^set[a-z]{1,2}$/.test(mnemonic) || mnemonic.startsWith('cmov')) return null;
   if (!WRITES_FIRST[mnemonic]) return null;
   const first = instruction.operands[0];
   return first?.kind === 'reg' && first.reg ? baseName(first.reg) : null;
+}
+
+/** Does this instruction read the register it writes? */
+function readsDestination(instruction: Instruction): boolean {
+  return READS_DESTINATION[instruction.mnemonic.toLowerCase()] === true;
 }
 
 export interface InferredParam {
@@ -274,13 +293,22 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame): 
   for (const instruction of instructions.slice(0, 48)) {
     const mnemonic = instruction.mnemonic.toLowerCase();
     if (instruction.flow === 'call' || mnemonic === 'call') break;
-    if (mnemonic === 'ret' || mnemonic === 'retn' || mnemonic === 'jmp') break;
+    // `ret` and `jmp` end the visible fall-through but not the register story.
+    // Go returns a second value in rbx and prints one branch at a time, so a
+    // `jmp` after the first case never contains the read that uses it. Stopping
+    // at control flow lost the second parameter of every multi-value and
+    // multi-case function.
+    //
+    // A call is different: it clobbers every argument register, so anything read
+    // after it is a scratch value rather than an incoming argument.
     // Reads before the instruction's own write: a register read here was live
     // on entry. The destination is skipped, or `mov eax, 0` would look like a
-    // use of eax and every function would grow a phantom first argument.
+    // use of eax and every function would grow a phantom first argument — unless
+    // the instruction reads that destination to compute its result.
     const written = writtenRegister(instruction);
+    const readsItsOwnDestination = readsDestination(instruction);
     for (let index = 0; index < instruction.operands.length; index++) {
-      if (index === 0 && written) continue;
+      if (index === 0 && written && !readsItsOwnDestination) continue;
       const operand = instruction.operands[index];
       if (!operand) continue;
       // A memory operand reads its base and index registers, and those are the
