@@ -11,7 +11,7 @@
 import { disassembleFunction } from './function.js';
 import { buildCfg } from './cfg.js';
 import { analyzeFrame, inferRegisterParams, type Convention, type Frame } from './frame.js';
-import { lift, type Expr, type Stmt } from './ir.js';
+import { lift, registerBase, type Expr, type Stmt } from './ir.js';
 import { structure, negate, type CtrlStmt } from './structure.js';
 import { optimizeStatements } from './optimize.js';
 import { recoverSwitch } from './switch.js';
@@ -834,8 +834,17 @@ function uninitialisedNote(info: Collected): string | null {
 /** Turn an inferred parameter register into a named variable throughout the body. */
 function renameExpr(expr: Expr, mapping: Map<string, string>): Expr {
   switch (expr.t) {
-    case 'reg':
-      return mapping.has(expr.name) ? { t: 'var', name: mapping.get(expr.name) as string, size: expr.size } : expr;
+    case 'reg': {
+      // The mapping is keyed by base register (`r8`), and an operand can name a
+      // sub-register (`r8b`). Matching the spelled name alone left the byte-sized
+      // form unrenamed, so the body still mentioned a register the signature had
+      // already given a parameter name.
+      const direct = mapping.get(expr.name);
+      if (direct) return { t: 'var', name: direct, size: expr.size };
+      const base = registerBase(expr.name);
+      const viaBase = mapping.get(base);
+      return viaBase ? { t: 'var', name: viaBase, size: expr.size } : expr;
+    }
     case 'load':
       return { ...expr, addr: renameExpr(expr.addr, mapping) };
     case 'bin':

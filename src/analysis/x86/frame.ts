@@ -315,7 +315,17 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame, e
   // out with two parameters while the body read a third that no instruction had
   // assigned.
   for (const register of spilled) inputs.push(register);
-  for (const instruction of (entryPath && entryPath.length ? entryPath : instructions).slice(0, 48)) {
+  // Scan until the first call, not for a fixed number of instructions. A register
+  // read after that call is the callee's, so the call is the real boundary; a fixed
+  // window can end before a read that is still the caller's. `atofHex` reads `r8b`
+  // at instruction 125 of 143 — past the old 48 — and r8 is never written, so that
+  // read did come from the caller.
+  //
+  // Scanning the whole function does not follow the entry path, which matters: a
+  // linear pass sees a panic path's `call` before the body's reads. The path is
+  // preferred when there is one; the longer scan only applies when there is not.
+  const scan = entryPath && entryPath.length ? entryPath : instructions;
+  for (const instruction of scan) {
     const mnemonic = instruction.mnemonic.toLowerCase();
     if (instruction.flow === 'call' || mnemonic === 'call') break;
     // `ret` and `jmp` end the visible fall-through but not the register story.
