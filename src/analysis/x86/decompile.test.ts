@@ -444,3 +444,25 @@ test('one spilled argument does not stand in for the whole signature', () => {
   assert.match(result.c, /twoargs\(long arg0, long arg1\)/, 'both arguments are in the signature')
   assert.doesNotMatch(result.c, /read before written: rbx/, 'rbx is an argument, not a lost local')
 })
+
+test('a versioned value read once is folded into its reader', () => {
+  // The versioning pass numbers a redefined register. When only one statement
+  // reads the numbered name, keeping it prints `rbx_2 = ...; rdx = rbx_2 + rbx_2`
+  // for a value that exists to be used once. The name goes away and the reader
+  // carries the expression.
+  const code = bytes(
+    0x48, 0x89, 0xf8,                  // mov rax, rdi
+    0x48, 0xd1, 0xf8,                  // sar rax, 1
+    0x48, 0xc1, 0xf8, 0x02,            // sar rax, 2
+    0x48, 0x01, 0xf8,                  // add rax, rdi
+    0xc3,                              // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'fold', end: BASE + code.length, convention: 'sysv' })
+  // Whatever the pipeline names the intermediate, the body must still assign every
+  // name it reads.
+  const declared = [...result.c.matchAll(/^\s{4}long (\w+);$/gm)].map((m) => m[1])
+  for (const name of declared) {
+    const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`, 'm').test(result.c)
+    assert.ok(assigned, `${name} is declared and must be assigned somewhere`)
+  }
+})

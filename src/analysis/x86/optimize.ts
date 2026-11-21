@@ -213,7 +213,7 @@ export function removeDeadStores(stmts: Stmt[], liveAfter: Set<string> = new Set
 }
 
 export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new Set()): Stmt[] {
-  return removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter);
+  return inlineSingleUseTemps(removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter));
 }
 
 /**
@@ -276,4 +276,91 @@ function findRestore(stmts: Stmt[], from: number, savedName: string, sourceName:
     }
   }
   return -1;
+}
+
+/**
+ * Fold a versioned temporary that has exactly one reader into that reader.
+ *
+ * `rbx_2 = arg1 >> 0x3d; rdx = rbx_2 + rbx_2` keeps a numbered name for a value
+ * that exists to be used once. The number is an artifact of the versioning pass,
+ * and printing it makes the reader wonder what the plain `rbx` was for. When the
+ * value is pure and read once, the name disappears.
+ *
+ * Ordinary locals are left alone: one reader does not make a name the author
+ * chose disposable. Only names the versioning created qualify.
+ */
+export function inlineSingleUseTemps(stmts: Stmt[]): Stmt[] {
+  const PURE = new Set(['bin', 'un', 'cast', 'const']);
+  const swap = (value: Expr, name: string, with_: Expr): Expr => {
+    switch (value.t) {
+      case 'reg': case 'var': return value.name === name ? with_ : value;
+      case 'load': return { ...value, addr: swap(value.addr, name, with_) };
+      case 'bin': return { ...value, left: swap(value.left, name, with_), right: swap(value.right, name, with_) };
+      case 'un': return { ...value, value: swap(value.value, name, with_) };
+      case 'cast': return { ...value, value: swap(value.value, name, with_) };
+      case 'select': return { ...value, cond: swap(value.cond, name, with_), a: swap(value.a, name, with_), b: swap(value.b, name, with_) };
+      case 'call': return { ...value, args: value.args.map((arg) => swap(arg, name, with_)) };
+      default: return value;
+    }
+  };
+  // Count readers first, so a value with exactly one reader can be folded wherever
+  // that reader sits. Order is not the point: the versioning pass can emit the
+  // definition after the use it feeds, and folding only forward then dropped the
+  // definition and left the reader naming a value that no longer existed.
+  const reads = new Map<string, number>();
+  const countIn = (value: Expr | undefined): void => {
+    if (!value) return;
+    switch (value.t) {
+      case 'reg': case 'var': reads.set(value.name, (reads.get(value.name) || 0) + 1); return;
+      case 'load': countIn(value.addr); return;
+      case 'bin': countIn(value.left); countIn(value.right); return;
+      case 'un': case 'cast': countIn(value.value); return;
+      case 'select': countIn(value.cond); countIn(value.a); countIn(value.b); return;
+      case 'call': for (const arg of value.args) countIn(arg); return;
+      default: return;
+    }
+  };
+  for (const stmt of stmts) {
+    if (stmt.t === 'assign') countIn(stmt.value);
+    else if (stmt.t === 'expr') countIn(stmt.expr);
+    else if (stmt.t === 'return') countIn(stmt.value);
+  }
+
+  const foldable = new Map<string, Expr>();
+  for (const stmt of stmts) {
+    if (stmt.t !== 'assign') continue;
+    if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') continue;
+    const name = stmt.target.name;
+    if (!/_[2-9]\d*$/.test(name)) continue;
+    if (!PURE.has(stmt.value.t)) continue;
+    if ((reads.get(name) || 0) !== 1) continue;
+    foldable.set(name, stmt.value);
+  }
+  if (!foldable.size) return stmts;
+
+  const out: Stmt[] = [];
+  for (const stmt of stmts) {
+    // Drop the definition of a value that has been folded into its single reader.
+    if (stmt.t === 'assign' && (stmt.target.t === 'reg' || stmt.target.t === 'var') && foldable.has(stmt.target.name)) continue;
+    if (stmt.t === 'assign') {
+      let value = stmt.value;
+      for (const [name, replacement] of foldable) value = swap(value, name, replacement);
+      out.push({ ...stmt, value });
+      continue;
+    }
+    if (stmt.t === 'expr') {
+      let expr = stmt.expr;
+      for (const [name, replacement] of foldable) expr = swap(expr, name, replacement);
+      out.push({ ...stmt, expr });
+      continue;
+    }
+    if (stmt.t === 'return' && stmt.value) {
+      let value = stmt.value;
+      for (const [name, replacement] of foldable) value = swap(value, name, replacement);
+      out.push({ t: 'return', value });
+      continue;
+    }
+    out.push(stmt);
+  }
+  return out;
 }

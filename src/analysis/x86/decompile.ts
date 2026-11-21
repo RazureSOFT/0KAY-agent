@@ -126,10 +126,16 @@ export function decompileFunction(
     // run before the return-value rewrite above, so names that only appeared in a
     // dropped return are still in `vars`.
     .filter((local) => mentionsName(finalBody, local.name))
-    // Register and stack-pointer names are not C variables. `rsp` in particular is
-    // not a local the function owns — declaring it just makes the reader wonder
-    // where it is assigned.
-    .filter((local) => !/^(?:r[a-z]{2}|r\d{1,2}|rsp|rbp)$/.test(local.name))
+    // The stack pointer and frame base are not variables the function owns, so a
+    // declaration for either makes the reader look for an assignment that cannot
+    // exist. Every other name in `vars` is printed somewhere and has to be
+    // declared, or the body would use an undeclared identifier.
+    // `rsp` and `rbp` are not variables the function owns. A bare register name
+    // that nothing assigns is the value the warning at the top of the function
+    // already accounts for; declaring it would ask the reader for a store that
+    // does not exist. A register the body does write is a real local and stays.
+    .filter((local) => local.name !== 'rsp' && local.name !== 'rbp')
+    .filter((local) => !isUnassignedRegister(finalBody, local.name))
     .map((local) => ({ name: local.name, type: local.type }));
   const signature = `${returnType(info)} ${fn.name}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
@@ -711,6 +717,28 @@ function returnType(info: Collected): CType | 'void' {
  * write in this function — so the honest output says so once at the declaration
  * instead of leaving a bare `long rax;` that reads like a normal local.
  */
+
+/** Is this a register name the body never assigns? */
+function isUnassignedRegister(body: CtrlStmt[], name: string): boolean {
+  if (!/^(?:r[a-z]{2}|r\d{1,2}|return_address)$/.test(name)) return false;
+  const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`);
+  const lines = body.map((item) => printStmtForCheck(item)).join('\n');
+  return !assigned.test(lines);
+}
+
+/** A flat rendering of a statement tree, used only to look for `name =`. */
+function printStmtForCheck(item: CtrlStmt): string {
+  switch (item.t) {
+    case 'assign': return `${printExpr(item.target)} = ${printExpr(item.value)};`;
+    case 'expr': return `${printExpr(item.expr)};`;
+    case 'return': return item.value ? `return ${printExpr(item.value)};` : 'return;';
+    case 'if': return `${printExpr(item.cond)} ${[item.then, item.else || []].flat().map(printStmtForCheck).join('')}`;
+    case 'while': return `${item.cond ? printExpr(item.cond) : '1'} ${item.body.map(printStmtForCheck).join('')}`;
+    case 'do': return `${item.body.map(printStmtForCheck).join('')} ${printExpr(item.cond)}`;
+    default: return '';
+  }
+}
+
 function uninitialisedNote(info: Collected): string | null {
   if (!info.undefinedReturns.size) return null;
   return `/* read before written: ${[...info.undefinedReturns].sort().join(', ')} — the disassembly shows no store to it */`;
