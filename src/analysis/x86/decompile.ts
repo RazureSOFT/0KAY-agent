@@ -667,6 +667,12 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   for (const slot of frame.slots.values()) {
     if (slot.kind === 'param') undefinedReturns.delete(slot.name);
   }
+  // The same thing for the registers the convention passes arguments in. A stack
+  // parameter gets a slot above the frame and was already covered; `rcx` and `r10`
+  // arrive in a register, and a function that reads one without storing to it first
+  // is reading its own argument — `indexbody` was reported as reading `r10` and `rcx`
+  // with no store, and both are simply where its fourth and fifth arguments came in.
+  for (const register of frame.argRegisters) undefinedReturns.delete(register);
   // Go passes arguments to assembly routines on the stack, and those routines
   // write their results straight into the caller's frame. `cpuid.abi0` returns four
   // registers by filling the four slots the caller reserved. There is no store in
