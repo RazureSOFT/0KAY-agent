@@ -388,7 +388,16 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
     // matters here: reading `62` as a data byte stopped the decode of the whole
     // basic block it appeared in.
     case 0x62: {
-      let cursor = index + 3;                 // the three prefix bytes after 62
+      // EVEX is four prefix bytes: 62, then three. The second of the three carries
+      // the opcode map in its low bits, the same way the two-byte `0f 38` and
+      // `0f 3a` maps do — and map 3 is the one whose instructions take a trailing
+      // imm8. Reading the instructions without it left the byte to be decoded as the
+      // next instruction, which is how a run of perfectly good EVEX loads turned into
+      // `db` and a stray `add`.
+      // By the time the switch runs, `index` points just past the `62`, so the
+      // three remaining prefix bytes are at index, index+1 and index+2.
+      const map = (bytes[index] ?? 0) & 0x3;   // P0: the map is in its low two bits
+      let cursor = index + 3;
       const opcodeByte = bytes[cursor] ?? 0;
       cursor += 1;
       const modrmByte = bytes[cursor] ?? 0;
@@ -400,6 +409,7 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
         else if (mod === 2) cursor += 4;
         else if ((modrmByte & 7) === 5) cursor += 4;
       }
+      if (map === 3) cursor += 1;
       index = Math.min(cursor, bytes.length);
       return { ...finish(`evex_${opcodeByte.toString(16).padStart(2, '0')}`, []), unknown: true };
     }
