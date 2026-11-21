@@ -348,28 +348,29 @@ export function inlineSingleUseTemps(stmts: Stmt[]): Stmt[] {
   }
   if (!foldable.size) return stmts;
 
+  // Folding is transitive: `rbx_4 = rbx_3 - 1` mentions `rbx_3`, which may itself be
+  // foldable. Substituting once left the reader naming an intermediate whose
+  // definition had just been dropped, which is exactly the "read a value nothing
+  // assigns" the whole pass exists to avoid. Repeating until nothing changes costs
+  // one extra comparison per name and removes the ordering dependence.
+  const expand = (value: Expr): Expr => {
+    let current = value;
+    for (let round = 0; round < foldable.size + 1; round += 1) {
+      let next = current;
+      for (const [name, replacement] of foldable) next = swap(next, name, replacement);
+      if (next === current) break;
+      current = next;
+    }
+    return current;
+  };
+
   const out: Stmt[] = [];
   for (const stmt of stmts) {
     // Drop the definition of a value that has been folded into its single reader.
     if (stmt.t === 'assign' && (stmt.target.t === 'reg' || stmt.target.t === 'var') && foldable.has(stmt.target.name)) continue;
-    if (stmt.t === 'assign') {
-      let value = stmt.value;
-      for (const [name, replacement] of foldable) value = swap(value, name, replacement);
-      out.push({ ...stmt, value });
-      continue;
-    }
-    if (stmt.t === 'expr') {
-      let expr = stmt.expr;
-      for (const [name, replacement] of foldable) expr = swap(expr, name, replacement);
-      out.push({ ...stmt, expr });
-      continue;
-    }
-    if (stmt.t === 'return' && stmt.value) {
-      let value = stmt.value;
-      for (const [name, replacement] of foldable) value = swap(value, name, replacement);
-      out.push({ t: 'return', value });
-      continue;
-    }
+    if (stmt.t === 'assign') { out.push({ ...stmt, value: expand(stmt.value) }); continue; }
+    if (stmt.t === 'expr') { out.push({ ...stmt, expr: expand(stmt.expr) }); continue; }
+    if (stmt.t === 'return' && stmt.value) { out.push({ t: 'return', value: expand(stmt.value) }); continue; }
     out.push(stmt);
   }
   return out;

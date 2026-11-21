@@ -80,7 +80,7 @@ export function decompileFunction(
   markTailCalls(lifted, entry, options.end, fn.instructions);
   foldStackCheck(lifted, entry, options.noReturnCalls);
   const structured = structure(lifted, entry);
-  const body = optimizeControl(optimize(structured.body));
+  const body = optimizeToFixedPoint(optimize(structured.body));
   // Judged on the structured body, before dead-store elimination: a single
   // constant move followed by `ret rax` optimises down to one statement, and
   // deciding afterwards would call that a pass-through when the function did
@@ -885,6 +885,92 @@ function namesReadIn(stmts: CtrlStmt[]): Set<string> {
   };
   visit(stmts);
   return names;
+}
+
+/**
+ * Optimize until no read names a value the output never assigns.
+ *
+ * The versioning pass runs inside each straight-line run and creates names the
+ * caller's liveness set cannot contain: that set comes from the statements as they
+ * were before versioning. So a run that defines `rbx_3` and a later run that reads
+ * it looked unrelated, the definition was deleted as dead, and the reader named a
+ * value with no assignment.
+ *
+ * Rather than predicting those names, this runs the optimizer, looks at what the
+ * output actually reads without defining, adds that to the live set, and runs
+ * again. Each round can only add names to the live set, the set is bounded by the
+ * names in the body, and the work stops as soon as a round adds nothing — so it
+ * terminates, and it measures the real product of the pass rather than guessing.
+ */
+function optimizeToFixedPoint(stmts: CtrlStmt[]): CtrlStmt[] {
+  const live = namesReadIn(stmts);
+  let body = optimizeControl(stmts, live);
+  for (let round = 0; round < 4; round += 1) {
+    const missing = namesReadWithoutDefinition(body);
+    let added = 0;
+    for (const name of missing) {
+      if (live.has(name)) continue;
+      live.add(name);
+      added += 1;
+    }
+    if (!added) break;
+    body = optimizeControl(stmts, live);
+  }
+  return body;
+}
+
+/**
+ * Names the body reads that nothing in it assigns.
+ *
+ * A parameter is not in this set: the signature is printed from the frame and the
+ * inferred registers, not from an assignment. Stack-passed arguments and buffers
+ * whose address escaped are excluded for the same reason they are never reported
+ * as read-before-written.
+ */
+function namesReadWithoutDefinition(body: CtrlStmt[]): Set<string> {
+  const read = new Set<string>();
+  const written = new Set<string>();
+  const collect = (value: Expr | undefined, into: Set<string>): void => {
+    if (!value) return;
+    switch (value.t) {
+      case 'reg': case 'var': into.add(value.name); return;
+      case 'load': collect(value.addr, into); return;
+      case 'bin': collect(value.left, into); collect(value.right, into); return;
+      case 'un': case 'cast': collect(value.value, into); return;
+      case 'select': collect(value.cond, into); collect(value.a, into); collect(value.b, into); return;
+      case 'call': for (const arg of value.args) collect(arg, into); return;
+      default: return;
+    }
+  };
+  const visit = (items: CtrlStmt[]): void => {
+    for (const item of items) {
+      switch (item.t) {
+        case 'assign':
+          collect(item.value, read);
+          if (item.target.t === 'reg' || item.target.t === 'var') written.add(item.target.name);
+          else if (item.target.t === 'load') collect(item.target.addr, read);
+          break;
+        case 'expr': collect(item.expr, read); break;
+        case 'return': collect(item.value, read); break;
+        case 'if': collect(item.cond, read); visit(item.then); if (item.else) visit(item.else); break;
+        case 'while': if (item.cond) collect(item.cond, read); visit(item.body); break;
+        case 'do': visit(item.body); collect(item.cond, read); break;
+        default: break;
+      }
+    }
+  };
+  visit(body);
+  const missing = new Set<string>();
+  for (const name of read) {
+    if (written.has(name)) continue;
+    // `rsp`/`rbp` are not values, arguments come from the caller, and an addressed
+    // buffer is filled through its pointer.
+    if (name === 'rsp' || name === 'rbp') continue;
+    if (/^(arg\d+|stack_arg_|v_)/.test(name)) continue;
+    if (addressedNames(body).has(name)) continue;
+    missing.add(name);
+  }
+  return missing;
 }
 
 function optimizeControl(stmts: CtrlStmt[], readsAnywhere?: Set<string>): CtrlStmt[] {

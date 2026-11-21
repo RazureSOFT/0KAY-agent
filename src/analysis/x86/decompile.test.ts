@@ -466,3 +466,25 @@ test('a versioned value read once is folded into its reader', () => {
     assert.ok(assigned, `${name} is declared and must be assigned somewhere`)
   }
 })
+
+test('a chain of versioned values folds transitively', () => {
+  // inc [rdx+0x20]; dec [rdx+0x21] — the shape Go emits for `x++; y--`.
+  // Folding `rbx_4 = rbx_3 - 1` into its reader left the `rbx_3` it mentions
+  // undefined, because the substitution was one level deep. Every name in the
+  // printed body must have an assignment.
+  const code = bytes(
+    0x0f, 0xb6, 0x43, 0x20,               // movzx eax, byte [rbx+0x20]
+    0x83, 0xc0, 0x01,                     // add eax, 1
+    0x88, 0x43, 0x20,                     // mov [rbx+0x20], al
+    0x0f, 0xb6, 0x43, 0x21,               // movzx eax, byte [rbx+0x21]
+    0x83, 0xe8, 0x01,                     // sub eax, 1
+    0x88, 0x43, 0x21,                     // mov [rbx+0x21], al
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'bump', end: BASE + code.length, convention: 'sysv' })
+  const declared = [...result.c.matchAll(/^\s{4}(?:long|int|short|char) (\w+);$/gm)].map((m) => m[1])
+  for (const name of declared) {
+    const assigned = new RegExp(`(^|[^\w.])${name}\s*=[^=]`, 'm').test(result.c)
+    assert.ok(assigned, `${name} is declared and must be assigned somewhere in the printed body`)
+  }
+})
