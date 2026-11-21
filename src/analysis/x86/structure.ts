@@ -102,7 +102,13 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       emitted.add(current);
       const block = byStart.get(current);
       if (!block) break;
-      out.push(...block.stmts);
+      // Every block is labelled where it is printed. A `goto` can only point at a
+      // block that some other path already printed, and the label has to be at that
+      // first printing — which is here. Labelling only the blocks that looked like
+      // they would be jumped to left 534 functions per 4000 jumping to a label that
+      // was never written; labelling the ones that are never jumped to costs nothing
+      // because `pruneLabels` takes them out again at the end.
+      out.push({ t: 'label', name: labelOf(current) }, ...block.stmts);
 
       if (block.term === 'ret') break;
       if (block.switch) {
@@ -197,6 +203,7 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       return { t: 'unknown', text: `loop at 0x${loop.header.toString(16)}` };
     }
     emitted.add(loop.header);
+    const headerLabel: CtrlStmt = { t: 'label', name: labelOf(loop.header) };
     const headerNext = nextBlock(header, byStart, order);
     // Everything emitted from here on is inside this loop, so a backward branch to
     // this header is a `continue` rather than an unexplained edge.
@@ -204,7 +211,7 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
 
     // while (cond) { ... }: the header branches to the exit and falls into the body.
     if (header.term === 'jcc' && header.target === exit && headerNext != null && loop.blocks.has(headerNext)) {
-      const body = emitRange(headerNext, loop.header);
+      const body = [headerLabel, ...emitRange(headerNext, loop.header)];
       depth -= 1;
       loopStack.pop();
       return { t: 'while', cond: header.cond || null, body };
@@ -241,7 +248,7 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         const block = byStart.get(start);
         if (!block || start === latch.start) continue;
         emitted.add(start);
-        body.push(...block.stmts);
+        body.push({ t: 'label', name: labelOf(start) }, ...block.stmts);
         // A branch out of the loop, with its target still present, is a real
         // conditional inside the body.
         if (block.term === 'jcc' && block.target != null && !loop.blocks.has(block.target)) {
@@ -259,13 +266,14 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       // unconditionally and leaves through a guard inside the body — Go's
       // `while (1) { ... if bad { break } ... }`. Printing `while (flags 0)` there
       // would be a condition the binary does not have.
-      if (!latch.cond) { loopStack.pop(); return { t: 'while', cond: null, body }; }
+      const loopBody = [headerLabel, ...body];
+      if (!latch.cond) { loopStack.pop(); return { t: 'while', cond: null, body: loopBody }; }
       loopStack.pop();
-      return { t: 'do', body, cond: latch.cond };
+      return { t: 'do', body: loopBody, cond: latch.cond };
     }
 
     // while (1) { ... }: the exit is reached from inside.
-    const body = emitRange(headerNext, exit);
+    const body = [headerLabel, ...emitRange(headerNext, exit)];
     depth -= 1;
     loopStack.pop();
     return { t: 'while', cond: null, body };
@@ -281,8 +289,9 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     if (block.term === 'jmp' && block.target != null) body.push({ t: 'goto', label: labelOf(block.target) });
     emitted.add(start);
   }
+  const gotos2 = pruneLabels(body);
   void depth;
-  return { body, orphans, loops: loops.length, gotos };
+  return { body, orphans, loops: loops.length, gotos: gotos2 };
 }
 
 
@@ -306,6 +315,64 @@ function sharedReturn(
   // Only a body that is nothing but the return, so nothing is duplicated.
   if (block.stmts.length !== 1 || block.stmts[0].t !== 'return') return [];
   return [{ ...block.stmts[0] }];
+}
+
+/**
+ * Drop the labels nothing jumps to, and return how many jumps remain.
+ *
+ * Labels are written generously — every block gets one, because a `goto` can point at
+ * any block that some other path printed first, and guessing which ones those are is
+ * what produced jumps to labels that were never written. Writing them all and then
+ * removing the unused ones is the cheap direction: the alternative is a listing
+ * buried in names nobody refers to (86 labels, 85 of them unused, in one function
+ * when this was first tried).
+ *
+ * Mutates the tree in place and returns the count, so the header and the body agree.
+ */
+function pruneLabels(body: CtrlStmt[]): number {
+  const referenced = new Set<string>();
+  let jumps = 0;
+  const collect = (nodes: CtrlStmt[]): void => {
+    for (const node of nodes) {
+      if (node.t === 'goto') { referenced.add(node.label); jumps += 1; }
+      else if (node.t === 'if') { collect(node.then); if (node.else) collect(node.else); }
+      else if (node.t === 'while' || node.t === 'do') collect(node.body);
+      else if (node.t === 'switch') {
+        for (const c of node.cases) collect(c.body);
+        if (node.defaultBody) collect(node.defaultBody);
+      }
+    }
+  };
+  collect(body);
+  const keep = new Set(body);
+  const filter = (nodes: CtrlStmt[]): CtrlStmt[] => {
+    const kept: CtrlStmt[] = [];
+    for (const node of nodes) {
+      if (node.t === 'label' && !referenced.has(node.name)) continue;
+      if (node.t === 'if') {
+        kept.push({ ...node, then: filter(node.then), ...(node.else ? { else: filter(node.else) } : {}) });
+      } else if (node.t === 'while' || node.t === 'do') {
+        kept.push({ ...node, body: filter(node.body) });
+      } else if (node.t === 'switch') {
+        kept.push({
+          ...node,
+          cases: node.cases.map((c) => ({ ...c, body: filter(c.body) })),
+          ...(node.defaultBody ? { defaultBody: filter(node.defaultBody) } : {}),
+        });
+      } else {
+        kept.push(node);
+      }
+    }
+    return kept;
+  };
+  const pruned = filter(body);
+  body.length = 0;
+  body.push(...pruned);
+  void keep;
+  // The header reports how many jumps the listing contains, so it has to be the
+  // number printed, not the number of distinct labels: two branches to the same
+  // target are two statements the reader counts.
+  return jumps;
 }
 
 function labelOf(address: number): string {
