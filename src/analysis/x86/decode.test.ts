@@ -224,3 +224,27 @@ test('the formatted listing shows address, bytes and text', () => {
   assert.match(line, /55/);
   assert.match(line, /push/);
 });
+
+test('the three-byte maps consume their whole instruction', () => {
+  // 0f 38 dc c1        aesenc xmm0, xmm1
+  // 0f 3a 22 c1 01     pinsrd xmm0, ecx, 1
+  // The lengths have to be right: a three-byte map read as a two-byte one leaves
+  // the cursor inside the instruction and every byte after it decodes as garbage.
+  const aes = one(0x0f, 0x38, 0xdc, 0xc1)
+  assert.equal(aes.mnemonic, 'aesenc')
+  assert.equal(aes.length, 4)
+
+  const pinsrd = one(0x0f, 0x3a, 0x22, 0xc1, 0x01)
+  assert.equal(pinsrd.mnemonic, 'pinsrd')
+  assert.equal(pinsrd.length, 5, 'the trailing immediate is consumed')
+})
+
+test('popcnt and pinsrw name their destination', () => {
+  const popcnt = one(0x0f, 0xb8, 0xc1)
+  assert.equal(popcnt.mnemonic, 'popcnt')
+  assert.equal(popcnt.operands.length, 2, 'destination and source')
+
+  const pinsrw = one(0x0f, 0xc4, 0xc1, 0x03)
+  assert.equal(pinsrw.mnemonic, 'pinsrw')
+  assert.equal(pinsrw.length, 4)
+})

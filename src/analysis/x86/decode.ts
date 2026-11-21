@@ -493,6 +493,12 @@ const TWO_BYTE_FLOW: Record<number, { name: string; flow?: Flow }> = {
   0xb1: { name: 'cmpxchg' },
   0xc1: { name: 'xadd' },
   0xc7: { name: 'cmpxchg8b' },
+  // Population count, the AVX-era system instructions, and one SSE insert. Go's
+  // bit-manipulation helpers use `popcnt`; the runtime uses `swapgs` on the way
+  // into a system call.
+  0xb8: { name: 'popcnt' },
+  0x01: { name: 'group01' },
+  0xc4: { name: 'pinsrw' },
 };
 
 /**
@@ -506,6 +512,12 @@ const TWO_BYTE_FLOW: Record<number, { name: string; flow?: Flow }> = {
 const SSE_TWO_BYTE: Record<number, string> = {
   0x10: 'movups', 0x11: 'movups', 0x28: 'movaps', 0x29: 'movaps',
   0x2e: 'ucomiss', 0x2f: 'comiss', 0x2a: 'cvtsi2sd', 0x2c: 'cvttsd2si', 0x2d: 'cvtsd2si',
+  // The float conversions and their neighbours. The `f3`/`f2` prefix selects a
+  // scalar form of several of these, and the name here is the packed one; the
+  // prefix is printed in front of it (`rep movsd` for `f3 0f 5a`), so the listing
+  // shows both parts without claiming the scalar name.
+  0x5a: 'cvtps2pd', 0x5b: 'cvtdq2ps', 0xe6: 'cvttpd2dq',
+  0x51: 'sqrtps', 0x52: 'rsqrtps', 0x53: 'rcpps', 0x5d: 'minps', 0x5f: 'maxps',
   0x6e: 'movd', 0x6f: 'movdqa', 0x7e: 'movd', 0x7f: 'movdqa',
   0x60: 'punpcklbw', 0x61: 'punpcklwd', 0x62: 'punpckldq', 0x63: 'packsswb',
   0x64: 'pcmpgtb', 0x65: 'pcmpgtw', 0x66: 'pcmpgtd', 0x67: 'packuswb',
@@ -636,6 +648,33 @@ function decodeTwoByte(
       'condition');
   }
 
+  // Three-byte opcode maps (`0f 38`, `0f 3a`). The instruction in the third byte
+  // names an operation this decoder does not model — they are AVX and AES
+  // encodings — but the length has to be right or every instruction after it in
+  // the function decodes from the wrong offset. `0f 3a` also carries an immediate.
+  if (second === 0x38 || second === 0x3a) {
+    const third = bytes[index] ?? 0;
+    index += 1;
+    const modrmByte = bytes[index] ?? 0;
+    const mod = modrmByte >> 6;
+    index += 1;
+    if (mod !== 3) {
+      if ((modrmByte & 7) === 4) index += 1;
+      if (mod === 1) index += 1;
+      else if (mod === 2) index += 4;
+      else if ((modrmByte & 7) === 5) index += 4;
+    }
+    if (second === 0x3a) index += 1;
+    // The AVX/AES names for the encodings Go's crypto uses. Everything else in
+    // these maps keeps the opcode form, which is honest: the length is right and
+    // the reader can look it up.
+    const THREE_BYTE_NAMES: Record<number, Record<number, string>> = {
+      0x38: { 0xdc: 'aesenc', 0xdd: 'aesenclast', 0xde: 'aesdec', 0xdf: 'aesdeclast', 0xdb: 'aesimc' },
+      0x3a: { 0x22: 'pinsrd', 0x44: 'pclmulqdq', 0x60: 'pcmpestrm', 0xdf: 'aeskeygenassist' },
+    };
+    const name = THREE_BYTE_NAMES[second]?.[third] ?? `0f${second.toString(16)} ${third.toString(16)}`;
+    return finish(name, []);
+  }
   const known = TWO_BYTE_FLOW[second];
 
   // Instructions that take no ModRM.
@@ -748,6 +787,22 @@ function decodeTwoByte(
         { kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize },
       ]);
     }
+    // The rest of the "reg, rm" two-byte forms: `popcnt` counts the bits of its
+    // source, `pinsrw` takes the ModRM register and an immediate. Naming them is
+    // the whole point of having an entry in the table.
+    if (known.name === 'popcnt' || known.name === 'pinsrw') {
+      const destination = { kind: 'reg' as const, reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize };
+      if (known.name === 'pinsrw') {
+        const immediate = bytes[index++] ?? 0;
+        return finish('pinsrw', [destination, operand, { kind: 'imm', value: immediate, size: 8 }]);
+      }
+      return finish(known.name, [destination, operand]);
+    }
+  }
+  // `0f 01` is a group instruction whose member is chosen by the ModRM byte, and
+  // the ones the runtime uses — `swapgs`, `rdtscp`, `lgdt` — take no operand.
+  if (known && known.name === 'group01') {
+    return finish('group01', []);
   }
 
   // Recognised shape, unnamed verb: report it as a two-byte opcode so the

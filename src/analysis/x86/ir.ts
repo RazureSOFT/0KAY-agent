@@ -307,6 +307,21 @@ function stackOffsetPerBlock(
   return result;
 }
 
+
+/** Mnemonics that only touch the vector unit. */
+const VECTOR_ONLY = new Set([
+  'aesenc', 'aesenclast', 'aesdec', 'aesdeclast', 'aesimc', 'aeskeygenassist',
+  'pinsrd', 'pinsrw', 'pclmulqdq', 'pcmpestrm',
+  'movups', 'movaps', 'movdqa', 'movdqu', 'movq', 'movd',
+  'punpcklbw', 'punpcklwd', 'punpckldq', 'punpckhbw', 'punpckhwd', 'punpckhdq',
+  'punpcklqdq', 'punpckhqdq', 'packsswb', 'packssdw', 'packuswb',
+  'pcmpgtb', 'pcmpgtw', 'pcmpgtd', 'pcmpeqb', 'pcmpeqw', 'pcmpeqd',
+  'pshufd', 'psrlw', 'psrld', 'psrlq', 'pmovmskb', 'pand', 'pandn', 'por', 'pxor',
+  'psadbw', 'paddd', 'psubd', 'andps', 'andnps', 'orps', 'xorps',
+  'addps', 'mulps', 'subps', 'divps', 'sqrtps', 'rsqrtps', 'rcpps', 'minps', 'maxps',
+  'cvtps2pd', 'cvtdq2ps', 'cvttpd2dq', 'vzeroupper', 'vzeroall',
+]);
+
 export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame): LiftedBlock[] {
   const byStart = new Map<number, BasicBlock>();
   for (const block of blocks) byStart.set(block.start, block);
@@ -475,6 +490,11 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         continue;
       }
       if (/xmm\d+/.test(a?.reg || '') || /xmm\d+/.test(b?.reg || '')) continue;
+      // Vector instructions named without operands — the AES and AVX encodings
+      // whose operand shapes this decoder does not model — are stepping stones for
+      // the vector unit alone. They carry no integer value this IR tracks, so they
+      // are passed over rather than reported as something not understood.
+      if (VECTOR_ONLY.has(m)) continue;
       // Atomics. `cmpxchg` compares the destination against rax and swaps on a
       // match; `xadd` exchanges and adds. Both say something about the value, so
       // they are recorded as a store with the exchange stated — dropping them
