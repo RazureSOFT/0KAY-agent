@@ -143,6 +143,23 @@ const VEX_NAMES: Record<number, string> = {
   0x5a: 'vcvtps2pd', 0x5b: 'vcvtdq2ps', 0x2e: 'vucomiss', 0x2f: 'vcomiss',
 };
 
+
+/**
+ * Two-byte SSE opcodes that carry a trailing imm8.
+ *
+ * The shuffle and shift-by-immediate forms, plus the compare-with-predicate. Their
+ * length is one more than the register-only forms, and getting that wrong desyncs
+ * every instruction after them in the function.
+ */
+const SSE_WITH_IMMEDIATE = new Set([
+  0x70, // pshufd / pshufhw / pshuflw
+  0x71, 0x72, 0x73, // psrlw, psrld, psrlq and friends
+  0xc2, // cmpps / cmpsd and the scalar compares
+  0xc4, // pinsrw
+  0xc5, // pextrw
+  0xc6, // shufps / shufpd
+]);
+
 export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instruction {
   const start = offset;
   let index = offset;
@@ -814,6 +831,14 @@ function decodeTwoByte(
   if (sseName && operand) {
     const reg = { kind: 'reg' as const, reg: XMM[regField], size: 128 };
     const isStore = second === 0x11 || second === 0x29 || second === 0x7e || second === 0x7f || second === 0xd6;
+    // Several of these take a trailing immediate: `pshufd xmm0, xmm0, 0` is five
+    // bytes. Reading only four left the immediate to be decoded as the next
+    // instruction, and everything after it was garbage — which is what
+    // `runtime.mapassign` printed for a hundred instructions.
+    if (SSE_WITH_IMMEDIATE.has(second)) {
+      const immediate = bytes[index++] ?? 0;
+      return finish(sseName, [...(isStore ? [operand, reg] : [reg, operand]), { kind: 'imm', value: immediate, size: 8 }]);
+    }
     return finish(sseName, isStore ? [operand, reg] : [reg, operand]);
   }
 
