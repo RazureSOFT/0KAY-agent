@@ -1099,7 +1099,7 @@ const PRECEDENCE: Record<string, number> = {
   '&': 35, '^': 30, '|': 25,
 };
 
-function printExpr(expr: Expr, parentPrecedence = 0): string {
+function printExpr(expr: Expr, parentPrecedence = 0, asCondition = false): string {
   switch (expr.t) {
     case 'const': {
       const value = expr.v;
@@ -1118,7 +1118,7 @@ function printExpr(expr: Expr, parentPrecedence = 0): string {
       return precedence < parentPrecedence ? `(${text})` : text;
     }
     case 'un':
-      return `${expr.op}${wrap(expr.value, 90)}`;
+      return `${expr.op}${wrap(expr.value, 90, asCondition)}`;
     case 'cast':
       return `(${typeForSize(expr.size, !expr.signed)})${wrap(expr.value, 90)}`;
     case 'select':
@@ -1126,14 +1126,18 @@ function printExpr(expr: Expr, parentPrecedence = 0): string {
     case 'call':
       return `${expr.target}(${expr.args.map((arg) => printExpr(arg)).join(', ')})`;
     case 'unknown':
-      return `/* ${expr.text} */ 0`;
+      // In a condition the safe placeholder is `1`: a condition printed as zero
+      // means the branch body is never shown, and hiding code is worse than showing
+      // a branch whose test is admittedly not modelled. In a value position `0` is
+      // the neutral choice. Neither is an answer, and the comment says so.
+      return `/* ${expr.text} */ ${asCondition ? 1 : 0}`;
     default:
       return '0';
   }
 }
 
-function wrap(expr: Expr, precedence: number): string {
-  const text = printExpr(expr, precedence);
+function wrap(expr: Expr, precedence: number, asCondition = false): string {
+  const text = printExpr(expr, precedence, asCondition);
   return text.startsWith('(') || /^[A-Za-z_][A-Za-z0-9_]*$/.test(text) || /^(0x[0-9a-f]+|\d+)$/.test(text)
     ? text
     : `(${text})`;
@@ -1171,7 +1175,7 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       if (!stmt.then.length && stmt.else?.length) {
         return printStmt({ t: 'if', cond: negate(stmt.cond), then: stmt.else }, level);
       }
-      const lines = [`${pad}if (${printExpr(stmt.cond)}) {`];
+      const lines = [`${pad}if (${printExpr(stmt.cond, 0, true)}) {`];
       for (const inner of stmt.then) lines.push(...printStmt(inner, level + 1));
       if (stmt.else?.length) {
         lines.push(`${pad}} else {`);
@@ -1181,7 +1185,7 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       return lines;
     }
     case 'while': {
-      const lines = [`${pad}while (${stmt.cond ? printExpr(stmt.cond) : '1'}) {`];
+      const lines = [`${pad}while (${stmt.cond ? printExpr(stmt.cond, 0, true) : '1'}) {`];
       for (const inner of stmt.body) lines.push(...printStmt(inner, level + 1));
       lines.push(`${pad}}`);
       return lines;
