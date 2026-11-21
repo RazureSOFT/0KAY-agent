@@ -216,18 +216,6 @@ export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new S
   return inlineSingleUseTemps(removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter));
 }
 
-/**
- * Drop `save = live; ...; live = save` pairs where nothing touched `save`.
- *
- * A compiler that needs a register for a moment saves it and restores it. The
- * two assignments are a no-op as a pair, but printed separately they read like
- * data movement through a variable that exists for no reason — and the moment
- * the rename pass numbers the saved copy, the restore refers to a name the
- * reader has to trace back to work out that nothing happened.
- *
- * Only removed when the value in between is untouched: if anything writes the
- * saved name, the restore is doing real work.
- */
 function collapseSaveRestore(stmts: Stmt[]): Stmt[] {
   const out: Stmt[] = [];
   let index = 0;
@@ -235,7 +223,6 @@ function collapseSaveRestore(stmts: Stmt[]): Stmt[] {
     const save = stmts[index];
     const saveTargetName = save.t === 'assign' && (save.target.t === 'reg' || save.target.t === 'var') ? save.target.name : '';
     const saveSourceName = save.t === 'assign' && (save.value.t === 'reg' || save.value.t === 'var') ? save.value.name : '';
-
     if (saveTargetName && saveSourceName && saveTargetName !== saveSourceName) {
       const restoreAt = findRestore(stmts, index, saveTargetName, saveSourceName);
       if (restoreAt > index) {
@@ -254,8 +241,8 @@ function collapseSaveRestore(stmts: Stmt[]): Stmt[] {
 /**
  * The index of the matching restore, or -1.
  *
- * The restore is `source = saved` with nothing writing `saved` in between. It
- * also requires nothing writing `source` in between: if the live value had been
+ * The restore is `source = saved` with nothing writing `saved` in between. It also
+ * requires nothing writing `source` in between: if the live value had been
  * replaced, restoring the saved copy is not a no-op.
  */
 function findRestore(stmts: Stmt[], from: number, savedName: string, sourceName: string): number {
@@ -264,7 +251,7 @@ function findRestore(stmts: Stmt[], from: number, savedName: string, sourceName:
     if (candidate.t !== 'assign') continue;
     const targetName = candidate.target.t === 'reg' || candidate.target.t === 'var' ? candidate.target.name : '';
     const valueName = candidate.value.t === 'reg' || candidate.value.t === 'var' ? candidate.value.name : '';
-    if (targetName === savedName) return -1; // the saved copy was reused
+    if (targetName === savedName) return -1;
     if (targetName === sourceName && valueName === savedName) {
       for (let inner = from + 1; inner < scan; inner++) {
         const between = stmts[inner];

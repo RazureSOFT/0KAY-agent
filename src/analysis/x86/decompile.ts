@@ -890,17 +890,15 @@ function namesReadIn(stmts: CtrlStmt[]): Set<string> {
 function optimizeControl(stmts: CtrlStmt[], readsAnywhere?: Set<string>): CtrlStmt[] {
   // Names the whole function reads, not just the statements after this run.
   //
-  // The run-level view was not enough: `rcx = rsi + rdi * 2` sits in one block
-  // and its only reader — `rdi = rdi << rcx` — is in the next one, so neither
-  // block's local view contained a read and the assignment was deleted as dead.
-  // The C then shifted by a variable nothing had assigned. Liveness over the
-  // whole body is the cheap approximation of what a versioned form would give.
+  // The run-level view was not enough: an assignment sits in one block and its
+  // only reader in the next, so neither block's local view contained a read and
+  // the assignment was deleted as dead. Liveness over the whole body is the cheap
+  // approximation of what a versioned form would give.
   const reads = readsAnywhere || namesReadIn(stmts);
   const recurse = (items: CtrlStmt[]) => optimizeControl(items, reads);
   const out: CtrlStmt[] = [];
   let buffer: Stmt[] = [];
-  for (let index = 0; index < stmts.length; index++) {
-    const stmt = stmts[index];
+  for (const stmt of stmts) {
     if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown' || stmt.t === 'note') {
       buffer.push(stmt);
       continue;
