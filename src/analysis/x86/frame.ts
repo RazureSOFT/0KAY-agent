@@ -307,6 +307,14 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame, e
   const defined = new Set(['rsp', 'rbp', 'r14']);
   for (const register of spilled) defined.add(register);
   const inputs: string[] = [];
+  // A register the prologue spilled into a slot named `argN` *is* an incoming
+  // argument, whatever the rest of the body does with it. `savedArgs` maps the
+  // register to that name — it is the only place that pairing exists, and the
+  // loop below works in register names, so it could not see it. `mapIterStart`
+  // spills rcx, never writes it again, and hands it to a callee; the signature came
+  // out with two parameters while the body read a third that no instruction had
+  // assigned.
+  for (const register of spilled) inputs.push(register);
   for (const instruction of (entryPath && entryPath.length ? entryPath : instructions).slice(0, 48)) {
     const mnemonic = instruction.mnemonic.toLowerCase();
     if (instruction.flow === 'call' || mnemonic === 'call') break;

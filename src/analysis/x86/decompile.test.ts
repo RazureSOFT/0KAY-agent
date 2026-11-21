@@ -509,3 +509,24 @@ test('spilling an argument through rsp does not overwrite the parameter', () => 
   assert.doesNotMatch(result.c, /arg0 = /, 'the parameter is not assigned to itself')
   assert.doesNotMatch(result.c, /read before written/, 'and nothing is left unassigned')
 })
+
+test('a spilled argument register stays a parameter', () => {
+  // push rbp; mov rbp,rsp; sub rsp,0x18; mov [rsp+0x38], rcx; ...
+  // The prologue spills rcx and the body forwards it to a callee. `savedArgs` is the
+  // only place that pairs the register with `argN`, and the inference loop works in
+  // register names, so it could not see the pairing: the signature came out short
+  // and the body read a register nothing had assigned.
+  const code = bytes(
+    0x55,
+    0x48, 0x89, 0xe5,
+    0x48, 0x83, 0xec, 0x18,               // sub rsp, 0x18
+    0x48, 0x89, 0x4c, 0x24, 0x38,         // mov [rsp+0x38], rcx
+    0x48, 0x89, 0xc3,                     // mov rbx, rax
+    0xe8, 0x00, 0x00, 0x00, 0x00,         // call rel32
+    0x48, 0x83, 0xc4, 0x18,               // add rsp, 0x18
+    0x5d,
+    0xc3,
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'fwd', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /read before written: rcx/, 'the spilled argument is not an orphan')
+})

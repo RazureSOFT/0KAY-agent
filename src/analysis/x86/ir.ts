@@ -452,6 +452,30 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
           const index = argStmtIndex.get(register);
           if (index != null) deleted.add(index);
         }
+        // The statement that set up an argument register is dropped because the
+        // call carries its value. That is only true if the register is not read
+        // again: `mov rcx, rax; mov rbx, rcx; call f` forwards rcx *through* rbx,
+        // and dropping the first move left the second reading a register nothing
+        // assigned. Keep any deleted statement whose destination is still read by
+        // an instruction later in this block.
+        for (const [register, index] of argStmtIndex) {
+          if (!deleted.has(index)) continue;
+          // Any read anywhere in the block counts, not only reads after the call:
+          // the forwarding chain `mov rcx, rax; mov rbx, rcx; call f` reads rcx
+          // before the call, and that read is what carries the value forward.
+          const stillNeeded = block.instructions.some((later) => {
+            if (later.address === ins.address) return false;
+            return later.operands.some((operand) => {
+              if (operand.kind === 'reg') return registerBase(operand.reg || '') === register;
+              if (operand.kind === 'mem') {
+                return registerBase(operand.base || '') === register
+                  || registerBase(operand.index || '') === register;
+              }
+              return false;
+            });
+          });
+          if (stillNeeded) deleted.delete(index);
+        }
         stmts.push({
           t: 'assign',
           target: { t: 'reg', name: 'rax', size: 64 },
