@@ -114,7 +114,7 @@ function addressExpr(operand: Operand, instruction: Instruction): Expr {
   return expr || constExpr(0, 64);
 }
 
-function slotFor(offset: number, size: number, frame: Frame): Expr {
+export function slotFor(offset: number, size: number, frame: Frame): Expr {
   const slot = frame.slots.get(offset);
   return { t: 'var', name: slot ? slot.name : (offset < 0 ? `v_${Math.abs(offset)}` : `stack_${offset}`), size: size || 64 };
 }
@@ -246,6 +246,16 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     const argStmtIndex = new Map<string, number>();
     const deleted = new Set<number>();
     let pending: PendingCondition | null = null;
+    /**
+     * How far `rsp` has moved from the function's entry value.
+     *
+     * Every slot is addressed relative to the *current* `rsp`, so the same
+     * displacement names a different variable before and after `sub rsp, 0x1a0`.
+     * Without this the two were folded into one name: an argument spilled at
+     * entry (`[rsp+0x30]` before the subtraction) and a local at the same
+     * displacement after it became the same variable, and the printed body read a
+     * local nothing had written.
+     */
     let cond: Expr | null = null;
     let term: LiftedBlock['term'] = 'fallthrough';
     let target: number | undefined;
@@ -262,6 +272,9 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         pending = { op: m === 'cmp' ? 'cmp' : 'test', left: operandExpr(a, ins, frame), right: operandExpr(b, ins, frame) };
         continue;
       }
+      // Track the stack pointer: push/pop and the prologue's `sub rsp` change what
+      // a displacement means. `push` moves rsp down by 8, `pop` up by 8, and a
+      // `sub rsp, N` moves it by N.
       if (m === 'nop' || m === 'endbr64' || m === 'leave' || m === 'push' || m === 'pop'
         || m === 'stc' || m === 'clc' || m === 'cmc' || m === 'cld' || m === 'std'
         || m === 'sahf' || m === 'lahf' || m === 'pause') continue;

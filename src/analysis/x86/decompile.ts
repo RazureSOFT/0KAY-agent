@@ -93,7 +93,11 @@ export function decompileFunction(
   // those made `rbx` look like an incoming argument when it was the runtime's
   // own bookkeeping — one phantom parameter per guard.
   const visible = liftableInstructions(fn.instructions, lifted);
-  const inferred = inferRegisterParams(visible, frame);
+  // The code that runs first, following the entry block through fall-through and
+  // the main arm of each guard. A linear scan sees the panic path's `call` before
+  // the body does and stops there.
+  const entryPath = entryPathInstructions(fn.instructions, lifted, entry);
+  const inferred = inferRegisterParams(visible, frame, entryPath);
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
   const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
@@ -318,6 +322,83 @@ function liftableInstructions(
     }
     return false;
   });
+}
+
+
+/**
+ * The instructions on the entry path, in execution order.
+ *
+ * Walks from the entry block along its fall-through edge and, at a guard, into
+ * the arm that continues rather than the one that leaves the function. Go lays
+ * panic paths out inside the same address range, often before the main body, and
+ * a linear read of the listing hit their `call` and stopped — so the arguments
+ * the body reads afterwards were never seen.
+ */
+function entryPathInstructions(
+  all: import('./decode.js').Instruction[],
+  lifted: import('./ir.js').LiftedBlock[],
+  entry: number,
+): import('./decode.js').Instruction[] {
+  const byStart = new Map(lifted.map((block) => [block.start, block]));
+  const order = lifted.filter((block) => !block.folded).map((block) => block.start).sort((a, b) => a - b);
+  const nextOf = (block: import('./ir.js').LiftedBlock): number | null => {
+    const index = order.indexOf(block.start);
+    return index >= 0 && index + 1 < order.length ? order[index + 1] : null;
+  };
+  const path: import('./decode.js').Instruction[] = [];
+  const seen = new Set<number>();
+  let current: number | null = entry;
+  while (current != null && !seen.has(current) && path.length < 64) {
+    seen.add(current);
+    const block = byStart.get(current);
+    if (!block || block.folded) break;
+    for (let address = block.start; address < block.end; address += 1) {
+      const instruction = all.find((candidate) => candidate.address === address);
+      if (instruction) path.push(instruction);
+    }
+    if (block.term === 'ret') break;
+    // At a guard, follow the arm that continues the body: the fall-through when
+    // that is a live block, and the branch target when the fall-through is the
+    // path that leaves. Go puts the panic or error path in the fall-through slot
+    // as often as in the target slot, so neither position can be assumed.
+    const fallthrough = nextOf(block);
+    if (block.term === 'jcc' && block.target != null) {
+      const target = byStart.get(block.target);
+      const fallthroughBlock = fallthrough != null ? byStart.get(fallthrough) : undefined;
+      // Both arms of a guard can end in `ret`: one returns a value, the other
+      // calls a panic helper and returns. Picking by `term` therefore cannot tell
+      // the body from the exit path. The body is the arm that carries the work, so
+      // the comparison is on how much code follows.
+      // Compare the two arms by how many instructions they carry in total,
+      // following only forward edges. A panic arm is a call and a return; the body
+      // carries the work.
+      const weight = (start: number | null | undefined): number => {
+        if (start == null) return -1;
+        const seen = new Set<number>();
+        const queue = [start];
+        let total = 0;
+        while (queue.length && seen.size < 40) {
+          const nextStart = queue.shift() as number;
+          if (seen.has(nextStart)) continue;
+          seen.add(nextStart);
+          const candidate = byStart.get(nextStart);
+          if (!candidate || candidate.folded) continue;
+          total += candidate.instructions || 1;
+          if (candidate.term === 'ret' || candidate.term === 'jmp') continue;
+          if (candidate.term === 'jcc' && candidate.target != null) queue.push(candidate.target);
+          const following = nextOf(candidate);
+          if (following != null) queue.push(following);
+        }
+        return total;
+      };
+      const targetWeight = weight(block.target);
+      const fallthroughWeight = weight(fallthrough);
+      current = fallthroughWeight > targetWeight ? fallthrough : block.target;
+      continue;
+    }
+    current = block.term === 'jmp' ? block.target ?? null : fallthrough;
+  }
+  return path;
 }
 
 interface Collected {

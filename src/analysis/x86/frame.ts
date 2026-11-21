@@ -286,7 +286,16 @@ export interface InferredParam {
   index: number;
 }
 
-export function inferRegisterParams(instructions: Instruction[], frame: Frame): InferredParam[] {
+/**
+ * Incoming register arguments, read off the code that actually runs first.
+ *
+ * The scan follows the entry block and its fall-through successors rather than
+ * the address-ordered listing. Go places a panic path *inside* the function's
+ * address range and often before the main body, so a linear scan hit its `call`
+ * and stopped — the argument registers are read after that call, on the path that
+ * really executes, and every one of them was reported as an unassigned local.
+ */
+export function inferRegisterParams(instructions: Instruction[], frame: Frame, entryPath?: Instruction[]): InferredParam[] {
   // A prologue that spills its arguments names them, but spilling *some* of them
   // does not name all: `mov [rsp+0xb0], rax` names rax and says nothing about
   // rbx, which the next comparison reads. Returning early whenever anything was
@@ -298,7 +307,7 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame): 
   const defined = new Set(['rsp', 'rbp', 'r14']);
   for (const register of spilled) defined.add(register);
   const inputs: string[] = [];
-  for (const instruction of instructions.slice(0, 48)) {
+  for (const instruction of (entryPath && entryPath.length ? entryPath : instructions).slice(0, 48)) {
     const mnemonic = instruction.mnemonic.toLowerCase();
     if (instruction.flow === 'call' || mnemonic === 'call') break;
     // `ret` and `jmp` end the visible fall-through but not the register story.

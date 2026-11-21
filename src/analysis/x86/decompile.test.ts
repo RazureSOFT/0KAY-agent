@@ -22,7 +22,7 @@ test('an if/else becomes structured C, not a goto', () => {
   );
   const result = decompileFunction(code, BASE, BASE, { name: 'pick', end: BASE + code.length, convention: 'sysv' });
   assert.equal(result.name, 'pick');
-  assert.match(result.c, /if \(arg0 == 0\)/);
+  assert.match(result.c, /if \(arg1 == 0\)/);
   assert.match(result.c, /return/);
   assert.doesNotMatch(result.c, /goto /);
   assert.equal(result.gotos, 0);
@@ -352,7 +352,7 @@ test('an assignment read only inside a later branch is not a dead store', () => 
     0xc3,                                 // ret
   )
   const result = decompileFunction(code, BASE, BASE, { name: 'bound', end: BASE + code.length, convention: 'sysv' })
-  assert.match(result.c, /rdx = arg0 - (0x)?1/, 'the assignment must survive')
+  assert.match(result.c, /rdx = arg1 - (0x)?1/, 'the assignment must survive')
   assert.doesNotMatch(result.c, /read before written: rdx/, 'rdx is assigned before it is read')
   assert.match(result.c, /if \(/, 'the branch is structured')
 })

@@ -119,13 +119,23 @@ export function propagate(stmts: Stmt[]): Stmt[] {
       // overwrite of the value that arrived in it.
       const targetName = target.t === 'var' || target.t === 'reg' ? target.name : '';
       if (targetName && pinned.has(targetName)) {
-        const next = (versions.get(targetName) || 1) + 1;
-        versions.set(targetName, next);
-        const fresh = `${targetName}_${next}`;
-        target = { ...target, name: fresh } as Expr;
-        current.set(targetName, fresh);
-        env.delete(targetName);
-        env.delete(fresh);
+        const seenBefore = versions.get(targetName) || 0;
+        versions.set(targetName, seenBefore + 1);
+        // The first write keeps the plain name: it is the value the function
+        // receives or computes first, and calling it `rbx_2` would leave `rbx`
+        // with no assignment anywhere — the read that follows would name a value
+        // that does not exist in the output. Only a genuine second write gets a
+        // numbered name, because that one really is a different value.
+        if (seenBefore > 0) {
+          const fresh = `${targetName}_${seenBefore + 1}`;
+          target = { ...target, name: fresh } as Expr;
+          current.set(targetName, fresh);
+          env.delete(targetName);
+          env.delete(fresh);
+        } else {
+          current.set(targetName, targetName);
+          env.delete(targetName);
+        }
       }
       if (target.t === 'reg' || target.t === 'var') {
         if (value.t === 'const' || value.t === 'reg' || value.t === 'var') env.set(target.name, value);
