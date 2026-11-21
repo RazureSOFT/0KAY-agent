@@ -235,6 +235,27 @@ const BINARY_VERBS: Record<string, string> = {
 };
 
 /**
+ * Instructions the decoder understands but this IR has no operator for.
+ *
+ * Each is recorded as an assignment of a named, obviously-approximate value rather
+ * than as "unexplained": the destination is written, the reader can see that the
+ * computation is being summarised, and the function stops looking like it contains
+ * bytes nobody can read. `popcnt` is named because Go's bit tricks use it and the
+ * name is the whole explanation.
+ */
+const NAMED_VALUES: Record<string, string> = {
+  popcnt: 'popcount',
+  bswap: 'byteswap',
+  bsfl: 'lowest_bit',
+  bsfq: 'lowest_bit',
+  bsrl: 'highest_bit',
+  bsrq: 'highest_bit',
+  cpuid: 'cpuid',
+  rdtsc: 'rdtsc',
+  rdtscp: 'rdtscp',
+};
+
+/**
  * Instructions whose result depends on the carry flag.
  *
  * `sbb a, b` is `a - b - carry`. The carry is not modelled here, so the printed
@@ -243,6 +264,15 @@ const BINARY_VERBS: Record<string, string> = {
  * plain subtraction would be a different program.
  */
 const CARRIED: Record<string, true> = { sbb: true };
+
+
+/** The implicit-operand string instructions Go emits for small copies and fills. */
+const STRING_OPS: Record<string, { kind: 'move' | 'store'; width: string }> = {
+  movsb: { kind: 'move', width: 'b' }, movsw: { kind: 'move', width: 'w' },
+  movsd: { kind: 'move', width: 'd' }, movsq: { kind: 'move', width: 'q' },
+  stosb: { kind: 'store', width: 'b' }, stosw: { kind: 'store', width: 'w' },
+  stosd: { kind: 'store', width: 'd' }, stosq: { kind: 'store', width: 'q' },
+};
 
 /** Lift one function's blocks into IR. */
 
@@ -701,6 +731,32 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if (m === 'int' && (a?.kind === 'imm' ? a.value === 3 : false)) {
         stmts.push({ t: 'note', text: 'int 3: breakpoint trap, does not continue' });
         term = 'ret';
+        continue;
+      }
+      // The string instructions take no operands: the source and destination are
+      // implicit in rsi/rdi. Go inlines small copies this way, and the output should
+      // say what happened to the memory rather than leaving a hole where the copy is.
+      if (STRING_OPS[m]) {
+        const sizes: Record<string, number> = { b: 8, w: 16, d: 32, q: 64 };
+        const width = sizes[STRING_OPS[m].width] ?? 8;
+        const destination = { t: 'load' as const, addr: { t: 'reg' as const, name: 'rdi', size: 64 }, size: width };
+        const source = STRING_OPS[m].kind === 'move'
+          ? { t: 'load' as const, addr: { t: 'reg' as const, name: 'rsi', size: 64 }, size: width }
+          : { t: 'reg' as const, name: 'rax', size: width };
+        stmts.push({ t: 'assign', target: destination, value: source });
+        stmts.push({ t: 'note', text: `${m} advances the pointer by ${width / 8} byte(s)` });
+        continue;
+      }
+      if (NAMED_VALUES[m]) {
+        // Zero-operand forms (cpuid) write rax too, but naming the operation is what
+        // matters; the destination of the general form is operand 0.
+        const target = a ? operandExpr(a, ins, frame) : { t: 'reg' as const, name: 'rax', size: 64 };
+        const source = b ? operandExpr(b, ins, frame) : null;
+        stmts.push({
+          t: 'assign',
+          target,
+          value: { t: 'call', target: NAMED_VALUES[m], args: source ? [source] : [], size: target.size || 64 },
+        });
         continue;
       }
       unknown += 1;
