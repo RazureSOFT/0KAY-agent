@@ -13,7 +13,7 @@ import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { success, failure } from './helpers.js';
 import { parseImage, executableSections, sectionNamed } from '../analysis/x86/image.js';
 import type { Section } from '../analysis/x86/image.js';
-import { parsePclntab } from '../analysis/x86/pclntab.js';
+import { parsePclntab, findPclntab } from '../analysis/x86/pclntab.js';
 import { parseSymbols, functionAt } from '../analysis/x86/symbols.js';
 import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
@@ -63,9 +63,28 @@ async function load(target: string): Promise<Loaded> {
       note = [note, table.note || 'Go function table had no readable functions'].filter(Boolean).join('; ');
     }
   }
-  // On PE the Go function table is folded into .rdata with a layout that moves
-  // between releases. The linker's symbol table is the stable, documented
-  // source of function entry points there.
+  // On PE the table is folded into .rdata, beside the type metadata, so there is no
+  // section to look for by name. Scan for it before falling back to the linker's
+  // symbol table: on the binary this was measured against the table has 2436 more
+  // functions than the symbol table does, and the extra ones are real.
+  if (!functions.length) {
+    for (const section of image.sections) {
+      if (section.size <= 0 || section.offset < 0 || section.offset + section.size > bytes.length) continue;
+      const slice = bytes.subarray(section.offset, section.offset + section.size);
+      // The table's own textStart is zero on PE: the entries are offsets from the
+      // image base rather than from a field in the header. Leaving it at zero made
+      // every function start at address 0, and the disassembler then produced one
+      // instruction per function. The section the code lives in is the base.
+      const codeSection = image.sections.find((s) => s.executable && s.size > 0);
+      const found = findPclntab(slice, codeSection?.vaddr);
+      if (!found) continue;
+      functions = found.functions.map((fn) => ({ ...fn, source: 'go-pclntab' as const }));
+      textStart = found.textStart;
+      entrySource = `Go function table (${found.functions.length} functions, found in ${section.name})`;
+      if (found.note) note = [note, found.note].filter(Boolean).join('; ');
+      break;
+    }
+  }
   if (!functions.length) {
     const symbols = parseSymbols(bytes, image);
     if (symbols.length) {

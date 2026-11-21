@@ -79,6 +79,11 @@ export function parsePclntab(data: Uint8Array, textStartOverride?: number): Pcln
     const nameOff = u32(data, funcAt + 4);
     const name = cstring(data, funcnameOffset + nameOff);
     if (!name) unnamed++;
+    // The first entry is not a function: Go puts the build id there under the name
+    // `go:buildid` and points it at the start of .text, which is not code. Listing it
+    // gave a function whose body decompiled to nothing, and it is the only name in
+    // the table with a colon that is not a package path.
+    if (name === 'go:buildid') continue;
     const entry = textStart + entryOff;
     const end = textStart + nextEntryOff;
     functions.push({
@@ -95,6 +100,30 @@ export function parsePclntab(data: Uint8Array, textStartOverride?: number): Pcln
     ptrSize,
     note: unnamed ? `${unnamed} name(s) could not be read; those functions got address labels` : undefined,
   };
+}
+
+/**
+ * Find the Go function table inside a section that holds other data too.
+ *
+ * On PE the linker folds the table into `.rdata`, next to the string constants and
+ * the type metadata, so there is no section named `gopclntab` to look for. Scanning
+ * for the header is safe because the header is self-describing: the magic is a
+ * specific value, the pointer size is 4 or 8, and the function count has to be
+ * plausible and fit in the data. A false positive that satisfies all three and
+ * parses into tens of thousands of named functions does not occur by accident.
+ */
+export function findPclntab(data: Uint8Array, textStart?: number): PclnTable | undefined {
+  for (let at = 0; at + 72 < data.length; at += 4) {
+    const magic = u32(data, at);
+    if (magic !== GO116MAGIC && magic !== GO120MAGIC) continue;
+    const ptrSize = data[at + 7];
+    if (ptrSize !== 4 && ptrSize !== 8) continue;
+    const nfunc = uptr(data, at + 8, ptrSize);
+    if (!Number.isFinite(nfunc) || nfunc < 16 || nfunc > MAX_FUNCS) continue;
+    const table = parsePclntab(data.subarray(at), textStart);
+    if (table.functions.length >= 16) return table;
+  }
+  return undefined;
 }
 
 /** Find a function whose address range contains `address`. */

@@ -77,9 +77,18 @@ export function disassembleFunction(
     found.push(instruction);
     if (instruction.unknown) {
       unknown++;
-      // An undecodable byte is data or an opcode we do not know. Continuing
-      // linearly from here is exactly the mistake this traversal avoids.
-      continue;
+      // Two kinds arrive here, and they need opposite handling.
+      //
+      // A byte that decoded to nothing (`db`, length 1) is data or an opcode we do
+      // not know; following it linearly is the mistake this traversal exists to
+      // avoid, so the path stops.
+      //
+      // An instruction whose *length* is known and whose name is not — the VEX and
+      // EVEX forms, `0fXX` — is a different thing: the decoder read it correctly and
+      // only failed to name it. Stopping there truncated the function to one
+      // instruction. `internal/runtime/gc/scan.expandAVX512_1` is a single EVEX load
+      // followed by `ret`, and it printed as `100% undecoded` with an empty body.
+      if (instruction.length <= 1) continue;
     }
 
     const flow = instruction.flow;
