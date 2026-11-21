@@ -786,6 +786,14 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         stmts.push({ t: 'note', text: `${m} advances the pointer by ${width / 8} byte(s)` });
         continue;
       }
+      // The flag save and restore. `pushfq`/`popfq` move the flags register through
+      // the stack and write no general register, so there is no assignment to make;
+      // the flags are state this IR does not model, and saying so is the whole
+      // statement.
+      if (m === 'pushfq' || m === 'popfq') {
+        stmts.push({ t: 'note', text: `${m}: saves or restores the flags register` });
+        continue;
+      }
       if (NAMED_VALUES[m]) {
         // Zero-operand forms (cpuid) write rax too, but naming the operation is what
         // matters; the destination of the general form is operand 0.
