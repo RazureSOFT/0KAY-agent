@@ -44,6 +44,12 @@ export interface Instruction {
   /** Set when the decoder could not name this instruction. */
   unknown?: boolean;
   flow?: Flow;
+  /**
+   * How far `rsp` sits below its value at function entry when this instruction
+   * runs. Set by the lifter: slots are addressed relative to the live `rsp`, so a
+   * displacement alone does not name a variable.
+   */
+  rspOffset?: number;
 }
 
 const REG64 = ['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',

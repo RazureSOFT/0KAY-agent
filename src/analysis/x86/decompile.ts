@@ -98,6 +98,15 @@ export function decompileFunction(
   // the body does and stops there.
   const entryPath = entryPathInstructions(fn.instructions, lifted, entry);
   const inferred = inferRegisterParams(visible, frame, entryPath);
+  // A body that is nothing but `ret` hands back the value it was given, so the
+  // register it reads is an argument even though no instruction reads it before
+  // the return. Without this `NoEscape` printed as `long f(void) { return rax; }`.
+  if (passThroughReturn && structured.body[0]?.t === 'return') {
+    const returned = structured.body[0].value;
+    if (returned?.t === 'reg' && returned.name === 'rax' && !inferred.length) {
+      inferred.push({ name: 'arg0', register: 'rax', index: 0 });
+    }
+  }
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
   const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
@@ -117,6 +126,10 @@ export function decompileFunction(
     // run before the return-value rewrite above, so names that only appeared in a
     // dropped return are still in `vars`.
     .filter((local) => mentionsName(finalBody, local.name))
+    // Register and stack-pointer names are not C variables. `rsp` in particular is
+    // not a local the function owns — declaring it just makes the reader wonder
+    // where it is assigned.
+    .filter((local) => !/^(?:r[a-z]{2}|r\d{1,2}|rsp|rbp)$/.test(local.name))
     .map((local) => ({ name: local.name, type: local.type }));
   const signature = `${returnType(info)} ${fn.name}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
@@ -408,6 +421,45 @@ interface Collected {
   undefinedReturns: Set<string>;
 }
 
+
+/** Names whose address the body takes anywhere, at any depth. */
+function addressedNames(body: CtrlStmt[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (value: Expr | undefined): void => {
+    if (!value) return;
+    switch (value.t) {
+      // `&x` is the address of x; x itself is the thing addressed.
+      case 'un':
+        if (value.op === '&' && (value.value.t === 'var' || value.value.t === 'reg')) {
+          names.add(value.value.name);
+        }
+        walk(value.value);
+        return;
+      case 'load': walk(value.addr); return;
+      case 'bin': walk(value.left); walk(value.right); return;
+      case 'cast': walk(value.value); return;
+      case 'select': walk(value.cond); walk(value.a); walk(value.b); return;
+      case 'call': for (const arg of value.args) walk(arg); return;
+      default: return;
+    }
+  };
+  const visit = (items: CtrlStmt[]): void => {
+    for (const item of items) {
+      switch (item.t) {
+        case 'assign': walk(item.value); walk(item.target); break;
+        case 'expr': walk(item.expr); break;
+        case 'return': walk(item.value); break;
+        case 'if': walk(item.cond); visit(item.then); if (item.else) visit(item.else); break;
+        case 'while': if (item.cond) walk(item.cond); visit(item.body); break;
+        case 'do': visit(item.body); walk(item.cond); break;
+        default: break;
+      }
+    }
+  };
+  visit(body);
+  return names;
+}
+
 function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set(), passThroughReturn = false): Collected {
   const vars: Collected['vars'] = new Map();
   // `rsp` and `rbp` always hold something: the stack pointer and the frame base
@@ -415,6 +467,12 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   // never right, and it was a large share of the remaining warnings on functions
   // that touch the frame through `mov [rsp+8], ...`.
   const defined = new Set<string>([...params, 'rsp', 'rbp']);
+  // A local whose address is taken is a buffer, not a scalar: `&v_208` is passed
+  // to a routine that fills it, so the bytes are written through the pointer and
+  // there is no assignment in this function to see. Reporting the later reads as
+  // "before written" was wrong — the write happens, just not as a store this
+  // walk can name. Anything addressed this way counts as defined from the start.
+  for (const name of addressedNames(body)) defined.add(name);
   const undefinedReturns = new Set<string>();
   /** Names the body writes. Empty means the function computes nothing of its own. */
   const writes = new Set<string>();
@@ -551,6 +609,20 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   // to place after its assignment — `mov rcx, rbx` printed before the `lea rbx`
   // that defines rbx is a branch, not a bug.
   for (const name of writes) undefinedReturns.delete(name);
+  // A buffer whose address escaped was filled through a pointer, so its contents
+  // are defined even though no store here names it. Saying "read before written"
+  // about something the callee wrote would be the decompiler describing its own
+  // blind spot as a property of the code.
+  for (const name of addressedNames(body)) undefinedReturns.delete(name);
+  // Slots above the frame belong to the caller: they hold the arguments that did
+  // not fit in registers, so they are defined before the function runs. Reporting
+  // them as "read before written" was wrong about the calling convention itself.
+  for (const slot of frame.slots.values()) {
+    if (slot.kind === 'param') undefinedReturns.delete(slot.name);
+  }
+  for (const name of undefinedReturns) {
+    if (/^stack_arg_/.test(name)) undefinedReturns.delete(name);
+  }
   return { vars, returnsValue, undefinedReturns };
 }
 

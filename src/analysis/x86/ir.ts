@@ -142,8 +142,16 @@ export function operandExpr(operand: Operand | undefined, instruction: Instructi
       // `sub rsp, N` and then addresses everything off rsp, so gating this on
       // `!hasFramePointer` printed its entire frame as pointer arithmetic on a
       // register that no instruction ever writes.
-      if (operand.base === 'rsp' && typeof operand.disp === 'number') {
-        const slot = slotFor(rspSlotOffset(operand.disp, frame), size, frame);
+      // An indexed operand is an array element, not a slot. `[rsp+rax*8+0xa8]` is
+      // the base of a frame array plus a scaled index; treating it as the scalar at
+      // displacement 0xa8 made the read name a variable nothing had written, and
+      // silently dropped the index so the printed code fetched the wrong element.
+      if (operand.base === 'rsp' && typeof operand.disp === 'number' && !operand.index) {
+        // The displacement names a slot only together with how far rsp has moved
+        // on the way here. `frame.frameSize` accounts for the prologue; the
+        // instruction carries the rest.
+        const adjusted = operand.disp + (instruction.rspOffset || 0);
+        const slot = slotFor(rspSlotOffset(adjusted, frame), size, frame);
         return asAddress ? { t: 'un', op: '&', value: slot, size: 64 } : slot;
       }
       const address = addressExpr(operand, instruction);
@@ -232,10 +240,92 @@ const BINARY_VERBS: Record<string, string> = {
 const CARRIED: Record<string, true> = { sbb: true };
 
 /** Lift one function's blocks into IR. */
+
+/**
+ * The stack-pointer displacement at the start of each block.
+ *
+ * Walks the CFG in address order, taking the smallest magnitude when a join has
+ * predecessors that disagree — the paths that reach a join with different stack
+ * depths are almost always a `push` on one arm and a value in a register on the
+ * other, and the arm that reaches the join with the shallowest stack is the one
+ * the following code is written for.
+ *
+ * Only the prologue's own subtraction is excluded: `frame.frameSize` already
+ * accounts for it, and counting it twice moved every slot by a whole frame.
+ */
+function stackOffsetPerBlock(
+  blocks: BasicBlock[],
+  byStart: Map<number, BasicBlock>,
+): Map<number, number> {
+  const result = new Map<number, number>();
+  if (!blocks.length) return result;
+  // Delta a block applies to rsp, ignoring the prologue's own `sub rsp, frameSize`
+  // because `frame.frameSize` already accounts for it.
+  const deltaOf = (block: BasicBlock, isEntry: boolean): number => {
+    let delta = 0;
+    let skippedPrologue = !isEntry;
+    for (const instruction of block.instructions) {
+      const mnemonic = instruction.mnemonic.toLowerCase();
+      const first = instruction.operands[0];
+      const second = instruction.operands[1];
+      if (!skippedPrologue && mnemonic === 'sub' && first?.kind === 'reg'
+        && registerBase(first.reg || '') === 'rsp' && second?.kind === 'imm') {
+        skippedPrologue = true;
+        continue;
+      }
+      if (!skippedPrologue) continue;
+      if (mnemonic === 'push') delta -= 8;
+      if (mnemonic === 'pop') delta += 8;
+      if ((mnemonic === 'sub' || mnemonic === 'add') && first?.kind === 'reg'
+        && registerBase(first.reg || '') === 'rsp' && second?.kind === 'imm') {
+        const amount = typeof second.value === 'number' ? second.value : 0;
+        delta += mnemonic === 'sub' ? -amount : amount;
+      }
+    }
+    return delta;
+  };
+
+  const entry = blocks[0].start;
+  const worklist = [entry];
+  result.set(entry, 0);
+  let guard = 0;
+  while (worklist.length && guard++ < 2000) {
+    const start = worklist.shift() as number;
+    const block = byStart.get(start);
+    if (!block) continue;
+    const outgoing = (result.get(start) || 0) + deltaOf(block, start === entry);
+    for (const successor of block.successors) {
+      // Keep the shallower stack: the arm that carries a pushed value is deeper,
+      // and the code at the join is written against the shallower one.
+      const existing = result.get(successor);
+      if (existing == null || Math.abs(outgoing) < Math.abs(existing)) {
+        result.set(successor, outgoing);
+        worklist.push(successor);
+      }
+    }
+  }
+  return result;
+}
+
 export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame): LiftedBlock[] {
   const byStart = new Map<number, BasicBlock>();
   for (const block of blocks) byStart.set(block.start, block);
   const lifted: LiftedBlock[] = [];
+  /**
+   * How far `rsp` sits below its value at the start of the prologue, per block.
+   *
+   * Slots are addressed relative to the live `rsp`, so `[rsp+168]` names a
+   * different variable depending on how much stack the path leading there has
+   * taken. Measured off the block alone, a slot written on one path and read on
+   * another came out as two different variables: the write landed on a name
+   * nothing read and the read on a name nothing wrote. That is the
+   * `read before written: v_72` class — the write exists in the binary, at a
+   * displacement that only makes sense with the right stack adjustment.
+   *
+   * The prologue's own `sub rsp, N` is already folded into `frame.frameSize`, so
+   * the walk starts at zero there and only tracks movement after it.
+   */
+  const rspAtBlockEntry = stackOffsetPerBlock(blocks, byStart);
 
   for (const block of blocks) {
     const stmts: Stmt[] = [];
@@ -246,21 +336,39 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     const argStmtIndex = new Map<string, number>();
     const deleted = new Set<number>();
     let pending: PendingCondition | null = null;
-    /**
-     * How far `rsp` has moved from the function's entry value.
-     *
-     * Every slot is addressed relative to the *current* `rsp`, so the same
-     * displacement names a different variable before and after `sub rsp, 0x1a0`.
-     * Without this the two were folded into one name: an argument spilled at
-     * entry (`[rsp+0x30]` before the subtraction) and a local at the same
-     * displacement after it became the same variable, and the printed body read a
-     * local nothing had written.
-     */
     let cond: Expr | null = null;
     let term: LiftedBlock['term'] = 'fallthrough';
     let target: number | undefined;
     let unknown = 0;
 
+    let rspShift = rspAtBlockEntry.get(block.start) || 0;
+    // Annotate every instruction with the live rsp displacement before lifting, so
+    // the slot naming below sees the same value the hardware would. The prologue's
+    // `sub rsp, frameSize` is not counted: `frame.frameSize` holds it.
+    let prologueSeen = block.start !== blocks[0]?.start;
+    for (const ins of block.instructions) {
+      const mnemonic = ins.mnemonic.toLowerCase();
+      const first = ins.operands[0];
+      const second = ins.operands[1];
+      // The prologue is `push rbp; mov rbp, rsp; sub rsp, N`. `frameSize` is that
+      // N, and the push is not part of it, so counting the push as an adjustment
+      // moved every slot in the function by eight bytes.
+      const isPrologue = mnemonic === 'push' && first?.kind === 'reg' && registerBase(first.reg || '') === 'rbp'
+        || (mnemonic === 'mov' && first?.kind === 'reg' && registerBase(first.reg || '') === 'rbp')
+        || (mnemonic === 'sub' && first?.kind === 'reg' && registerBase(first.reg || '') === 'rsp' && second?.kind === 'imm');
+      if (isPrologue) {
+        prologueSeen = true;
+      } else if (prologueSeen) {
+        if (mnemonic === 'push') rspShift -= 8;
+        else if (mnemonic === 'pop') rspShift += 8;
+        else if ((mnemonic === 'sub' || mnemonic === 'add') && first?.kind === 'reg'
+          && registerBase(first.reg || '') === 'rsp' && second?.kind === 'imm') {
+          const amount = typeof second.value === 'number' ? second.value : 0;
+          rspShift += mnemonic === 'sub' ? -amount : amount;
+        }
+      }
+      ins.rspOffset = rspShift;
+    }
     for (const ins of block.instructions) {
       // Prefixes are part of the printed mnemonic (`lock cmpxchg`) but not part of
   // the instruction's identity: the atomics below are the same operation with or
