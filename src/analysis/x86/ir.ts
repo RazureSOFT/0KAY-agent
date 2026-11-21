@@ -689,6 +689,20 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         continue;
       }
       // Anything else stays visible instead of being dropped.
+      // Trap instructions end the path by design. `ud2` is the compiler's "this
+      // cannot happen", `int 3` is a breakpoint, and Go emits both as the body of a
+      // function that is not meant to return — `runtime.abort.abi0` is one `int 3`.
+      // Reporting them as unexplained made those functions look empty.
+      if (m === 'ud2') {
+        stmts.push({ t: 'note', text: 'ud2: the compiler marked this path unreachable' });
+        term = 'ret';
+        continue;
+      }
+      if (m === 'int' && (a?.kind === 'imm' ? a.value === 3 : false)) {
+        stmts.push({ t: 'note', text: 'int 3: breakpoint trap, does not continue' });
+        term = 'ret';
+        continue;
+      }
       unknown += 1;
       stmts.push({ t: 'unknown', text: `${m} ${ins.operands.map((operand) => operand.reg || operand.mem || (operand.value != null ? `0x${(operand.value >>> 0).toString(16)}` : '')).filter(Boolean).join(', ')}`.trim() });
     }
