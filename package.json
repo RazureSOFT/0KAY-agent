@@ -9,7 +9,8 @@
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "check:structure": "node --import tsx scripts/check-structure.ts"
   },
   "dependencies": {
     "@0kay/mcp": "file:../mcp",
