@@ -24,6 +24,16 @@ export interface DecompileOptions {
   /** Exclusive end of the function, normally the next symbol's entry. */
   end?: number;
   maxInstructions?: number;
+  /**
+   * Names of routines that never return, so control does not continue past a
+   * call to one.
+   *
+   * Go's panic helpers (`runtime.gopanic`, `runtime.panicindex`, …) end the
+   * goroutine. The code after them in the same function is only reached on the
+   * unwind path, not by falling through, and printing it puts `return rbx` in a
+   * body where rbx is the panic value.
+   */
+  noReturnCalls?: Set<string>;
 }
 
 export interface DecompiledFunction {
@@ -63,7 +73,7 @@ export function decompileFunction(
     );
     if (info) lifted[index].switch = info;
   }
-  foldStackCheck(lifted, entry);
+  foldStackCheck(lifted, entry, options.noReturnCalls);
   const structured = structure(lifted, entry);
   const body = optimizeControl(optimize(structured.body));
   // Judged on the structured body, before dead-store elimination: a single
@@ -169,7 +179,11 @@ function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, bySt
   return true;
 }
 
-function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number): void {
+function foldStackCheck(
+  lifted: import('./ir.js').LiftedBlock[],
+  entry: number,
+  noReturnCalls: Set<string> = new Set(),
+): void {
   const byStart = new Map(lifted.map((block) => [block.start, block]));
   const entryBlock = byStart.get(entry);
   if (!entryBlock) return;
@@ -205,7 +219,7 @@ function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number):
 
   // Independent of guards: panic paths and alignment padding sit in the
   // function's address range without a branch into them.
-  foldUnreachable(lifted, entry);
+  foldUnreachable(lifted, entry, noReturnCalls);
 }
 
 /**
@@ -220,7 +234,11 @@ function foldStackCheck(lifted: import('./ir.js').LiftedBlock[], entry: number):
  * Reachability is computed over the successors that survive folding, so this
  * runs after the stack-guard pass and cannot resurrect what it removed.
  */
-function foldUnreachable(lifted: import('./ir.js').LiftedBlock[], entry: number): void {
+function foldUnreachable(
+  lifted: import('./ir.js').LiftedBlock[],
+  entry: number,
+  noReturnCalls: Set<string> = new Set(),
+): void {
   const byStart = new Map(lifted.map((block) => [block.start, block]));
   const order = lifted.filter((block) => !block.folded).map((block) => block.start).sort((a, b) => a - b);
   const nextOf = (block: import('./ir.js').LiftedBlock): number | null => {
@@ -243,7 +261,9 @@ function foldUnreachable(lifted: import('./ir.js').LiftedBlock[], entry: number)
     }
     if (block.term === 'ret') continue;
     if (block.target != null) queue.push(block.target);
-    if (block.term !== 'jmp') {
+    // Falling through a call that never returns does not happen: the code that
+    // follows it in the same function is only entered from the unwind path.
+    if (block.term !== 'jmp' && !endsInNoReturnCall(block, noReturnCalls)) {
       const next = nextOf(block);
       if (next != null) queue.push(next);
     }
@@ -254,6 +274,18 @@ function foldUnreachable(lifted: import('./ir.js').LiftedBlock[], entry: number)
     block.folded = true;
     block.stmts = [];
   }
+}
+
+/** Does this block's last statement call a routine that never returns? */
+function endsInNoReturnCall(block: import('./ir.js').LiftedBlock, noReturnCalls: Set<string>): boolean {
+  if (!noReturnCalls.size) return false;
+  for (let index = block.stmts.length - 1; index >= 0; index -= 1) {
+    const stmt = block.stmts[index];
+    if (stmt.t !== 'assign') continue;
+    if (stmt.value.t !== 'call') continue;
+    return noReturnCalls.has(stmt.value.target);
+  }
+  return false;
 }
 
 /**
@@ -294,7 +326,11 @@ interface Collected {
 
 function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set(), passThroughReturn = false): Collected {
   const vars: Collected['vars'] = new Map();
-  const defined = new Set<string>(params);
+  // `rsp` and `rbp` always hold something: the stack pointer and the frame base
+  // exist before the function does. Reporting either as "read before written" is
+  // never right, and it was a large share of the remaining warnings on functions
+  // that touch the frame through `mov [rsp+8], ...`.
+  const defined = new Set<string>([...params, 'rsp', 'rbp']);
   const undefinedReturns = new Set<string>();
   /** Names the body writes. Empty means the function computes nothing of its own. */
   const writes = new Set<string>();
@@ -360,6 +396,15 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
           const base = nameOf(item.target).replace(/_\d+$/, '');
           if (base !== nameOf(item.target)) defined.add(base);
         }
+        // A call hands back its results in registers the previous call also
+        // wrote. Go returns a second value in rbx, so `mov rax, rbx` after
+        // `call ExportedMethods` reads that call's result — a defined value, not
+        // an unassigned local.
+        if (item.value.t === 'call') {
+          for (const register of ['rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11']) {
+            defined.add(register);
+          }
+        }
         if (item.target.t === 'reg' && item.target.name === 'rax') returnsValue = true;
         return;
       case 'expr':
@@ -374,6 +419,13 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
           // ignore it. Anything longer that reads an unwritten name really is
           // an undefined read.
           if (!passThroughReturn) undefinedReads(item.value, defined, undefinedReturns);
+          else {
+            // The pass-through idiom reads the value it was handed, so that value
+            // is defined — the function's whole body is "give back what you got".
+            // Without this the declaration pass declared the register and nothing
+            // ever assigned it, which reads like a lost statement.
+            for (const name of ['rax', 'rbx']) defined.add(name);
+          }
           expr(item.value);
           // `rax` is only a return value if the function ever put something in
           // it. A hand-written assembly routine stores its result into the

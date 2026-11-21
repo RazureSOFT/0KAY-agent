@@ -292,6 +292,37 @@ export class BinaryAnalysisTool extends Tool {
  * pipeline below is ours, always available, and reports the same way whether or
  * not anything else is installed.
  */
+/**
+ * The call targets a block cannot fall through.
+ *
+ * Go's runtime panic helpers end the goroutine instead of returning, so the code
+ * after them in the same function is entered only on the unwind path. Treating
+ * the fall-through as live put `return rbx` into bodies where rbx is the panic
+ * value — an unassigned local the reader has no way to explain.
+ *
+ * The names are the ones the Go runtime uses across releases; the check is by
+ * suffix so a package path prefix does not matter.
+ */
+const NO_RETURN_SUFFIXES = [
+  'runtime.gopanic', 'runtime.panicindex', 'panicslice', 'panicdivide',
+  'panicoverflow', 'panicshift', 'panicmem', 'panicunsupported',
+  'runtime.throw', 'runtime.fatal', 'runtime.goexit', 'runtime.exit',
+  'runtime.morestack', 'morestack_noctxt', 'runtime.sigpanic',
+  'runtime.panicdottype', 'runtime.panicnil', 'runtime.unsafe', 'abort',
+];
+
+function collectNoReturnTargets(functions: Array<{ name: string; entry: number }>): Set<string> {
+  const targets = new Set<string>();
+  for (const fn of functions) {
+    const name = fn.name.toLowerCase();
+    if (!NO_RETURN_SUFFIXES.some((suffix) => name.includes(suffix.toLowerCase()))) continue;
+    // The IR names a call after its target address, so that is what a block
+    // compares against.
+    targets.add(`sub_${(fn.entry >>> 0).toString(16)}`);
+  }
+  return targets;
+}
+
 export async function decompileSummary(
   target: string,
   options: { maxFunctions?: number; functionName?: string; maxInstructions?: number } = {},
@@ -323,6 +354,7 @@ export async function decompileSummary(
   // one exactly.
   const budget = options.functionName ? Math.min(picked.length, 8) : 3;
   const decompiled: NonNullable<Awaited<ReturnType<typeof decompileSummary>>['decompiled']> = [];
+  const noReturnCalls = collectNoReturnTargets(loaded.functions);
   if (section) {
     for (const fn of picked.slice(0, budget)) {
       try {
@@ -331,6 +363,7 @@ export async function decompileSummary(
           end: fn.end > fn.entry ? Math.min(fn.end, section.vaddr + section.size) : section.vaddr + section.size,
           imageFormat: loaded.image.format,
           maxInstructions: options.maxInstructions ?? 2000,
+          ...(noReturnCalls.size ? { noReturnCalls } : {}),
         });
         decompiled.push({
           name: result.name, entry: `0x${result.entry.toString(16)}`, c: result.c,

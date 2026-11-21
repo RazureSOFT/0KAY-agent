@@ -356,3 +356,38 @@ test('an assignment read only inside a later branch is not a dead store', () => 
   assert.doesNotMatch(result.c, /read before written: rdx/, 'rdx is assigned before it is read')
   assert.match(result.c, /if \(/, 'the branch is structured')
 })
+
+test('a register a call wrote is not an undefined read afterwards', () => {
+  // call f ; mov rax, rbx ; ret
+  // Go returns its second value in rbx, so reading rbx after the call reads that
+  // result. The body used to report it as a local nothing had assigned because the
+  // call only marked rax as defined.
+  const code = bytes(
+    0xe8, 0x00, 0x00, 0x00, 0x00,      // call +0 (target is inside the block)
+    0x48, 0x89, 0xd8,                  // mov rax, rbx
+    0xc3,                              // ret
+    0xc3,                              // ret (call target)
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'twovalue', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /read before written: rbx/, 'a call result is a defined value')
+})
+
+test('code after a call that never returns is not presented as reachable', () => {
+  // call a known no-return routine, then a block that reads a register nothing
+  // wrote. The second block only runs on the unwind path, so printing it puts an
+  // unassigned local in the body.
+  const code = bytes(
+    0x55,                              // push rbp
+    0x48, 0x89, 0xe5,                  // mov rbp, rsp
+    0xe8, 0x00, 0x00, 0x00, 0x00,      // call +0 (the panic helper below)
+    0x48, 0x89, 0xd8,                  // mov rax, rbx   <- unreachable
+    0xc3,                              // ret
+    0xc3,                              // panic helper: ret (never really returns)
+  )
+  const panicHelper = `sub_${(BASE + 0x9).toString(16)}`
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'panics', end: BASE + code.length, convention: 'sysv',
+    noReturnCalls: new Set([panicHelper]),
+  })
+  assert.doesNotMatch(result.c, /return rbx/, 'the unwind path is not part of the body')
+})
