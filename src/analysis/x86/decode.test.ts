@@ -25,6 +25,29 @@ test('mov r64, immediate uses a 10-byte form with REX.W', () => {
   assert.deepEqual(instruction.operands.map((o) => o.reg ?? o.value), ['rax', 42]);
 });
 
+test('a 64-bit immediate is eight bytes, not four', () => {
+  // 49 bb 80 80 80 80 80 80 80 80 = mov r11, 0x8080808080808080
+  // Go emits this as the mask for byte-order reversal. Reading only four bytes
+  // left the cursor in the middle of the constant, so every instruction after it
+  // in the function decoded from the wrong offset — one wrong length corrupted
+  // the rest of the body.
+  const instruction = one(0x49, 0xbb, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+  assert.equal(instruction.mnemonic, 'mov');
+  assert.equal(instruction.length, 10, 'the whole immediate is consumed');
+})
+
+test('instructions after a 64-bit immediate decode in step', () => {
+  // The mask, then `movd xmm0, r11`, then `ret`. With a four-byte read the movd
+  // started four bytes early and decoded as padding.
+  const codes = decode(new Uint8Array([
+    0x49, 0xbb, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x66, 0x49, 0x0f, 0x6e, 0xc3,
+    0xc3,
+  ]), { base: 0x1000 });
+  assert.deepEqual(codes.map((i) => i.mnemonic), ['mov', 'movd', 'ret']);
+  assert.equal(codes.some((i) => i.unknown), false, 'nothing decoded as an unknown byte');
+})
+
 test('push and pop of the callee-saved registers', () => {
   assert.equal(text(0x55).includes('push'), true);
   assert.match(text(0x55), /push rax|push rbp/);

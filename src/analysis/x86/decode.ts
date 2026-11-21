@@ -190,6 +190,16 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
   const imm = (size: number): Operand => {
     if (size === 8) return { kind: 'imm', value: bytes[index++] ?? 0, size: 8 };
     if (size === 16) { const v = read16(bytes, index); index += 2; return { kind: 'imm', value: v, size: 16 }; }
+    // A 64-bit immediate is eight bytes, not four. `mov r11, 0x8080808080808080`
+    // is the swap-bytes mask Go uses for byte-order reversal, and reading only
+    // half of it left the decoder four bytes into the middle of the constant —
+    // every instruction after it in the function decoded from the wrong offset.
+    if (size === 64) {
+      const low = read32(bytes, index);
+      const high = read32(bytes, index + 4);
+      index += 8;
+      return { kind: 'imm', value: low + high * 0x100000000, size: 64 };
+    }
     const v = readInt32(bytes, index);
     index += 4;
     return { kind: 'imm', value: v, size };
@@ -471,6 +481,35 @@ const TWO_BYTE_FLOW: Record<number, { name: string; flow?: Flow }> = {
   0xb7: { name: 'movzx' },
   0xbe: { name: 'movsx' },
   0xbf: { name: 'movsx' },
+  // Atomics and bit scans. Go's memory model and its compare-and-swap paths use
+  // these, and they appeared in the listing as `lock 0fb1` — the length was right
+  // but the name said nothing.
+  0xb1: { name: 'cmpxchg' },
+  0xc1: { name: 'xadd' },
+  0xc7: { name: 'cmpxchg8b' },
+};
+
+/**
+ * Names for the SSE instructions Go's compiler actually emits.
+ *
+ * The vector registers are not modelled (this IR tracks integer and pointer
+ * values), but the listing has to say what the instruction is: `0f60` and
+ * `0fd7` are `punpcklbw` and `pmovmskb`, which is how a reader recognises the
+ * string-compare fast paths.
+ */
+const SSE_TWO_BYTE: Record<number, string> = {
+  0x10: 'movups', 0x11: 'movups', 0x28: 'movaps', 0x29: 'movaps',
+  0x2e: 'ucomiss', 0x2f: 'comiss', 0x2a: 'cvtsi2sd', 0x2c: 'cvttsd2si', 0x2d: 'cvtsd2si',
+  0x6e: 'movd', 0x6f: 'movdqa', 0x7e: 'movd', 0x7f: 'movdqa',
+  0x60: 'punpcklbw', 0x61: 'punpcklwd', 0x62: 'punpckldq', 0x63: 'packsswb',
+  0x64: 'pcmpgtb', 0x65: 'pcmpgtw', 0x66: 'pcmpgtd', 0x67: 'packuswb',
+  0x68: 'punpckhbw', 0x69: 'punpckhwd', 0x6a: 'punpckhdq', 0x6b: 'packssdw',
+  0x6c: 'punpcklqdq', 0x6d: 'punpckhqdq', 0x70: 'pshufd', 0x71: 'psrlw',
+  0x72: 'psrld', 0x73: 'psrlq', 0x74: 'pcmpeqb', 0x75: 'pcmpeqw', 0x76: 'pcmpeqd',
+  0xd6: 'movq', 0xd7: 'pmovmskb', 0xdb: 'pand', 0xdf: 'pandn',
+  0xeb: 'por', 0xef: 'pxor', 0xf7: 'psadbw', 0xfe: 'paddd', 0xfa: 'psubd',
+  0x54: 'andps', 0x55: 'andnps', 0x56: 'orps', 0x57: 'xorps',
+  0x58: 'addps', 0x59: 'mulps', 0x5c: 'subps', 0x5e: 'divps',
 };
 
 /**
@@ -678,20 +717,12 @@ function decodeTwoByte(
     ]);
   }
 
-  // The SSE block. Go's compiler uses `movd`/`movq` to move small values between
-// general and vector registers, and `movups`/`xorps` for the zeroing idiom.
-  // They are named so the listing says what the instruction is; the IR prints the
-  // vector part as a comment rather than pretending to model 128-bit lanes.
-  const SSE_NAMES: Record<number, string> = {
-    0x10: 'movups', 0x11: 'movups', 0x28: 'movaps', 0x29: 'movaps',
-    0x6e: 'movd', 0x6f: 'movdqa', 0x7e: 'movd', 0x7f: 'movdqa',
-    0x57: 'xorps', 0x54: 'andps', 0x56: 'orps',
-    0x2a: 'cvtsi2ss', 0x2c: 'cvttss2si', 0x2d: 'cvtss2si',
-  };
-  const sseName = SSE_NAMES[second];
+  // The SSE block, named from the shared table so the listing says what the
+  // instruction is even though the IR does not model vector registers.
+  const sseName = SSE_TWO_BYTE[second];
   if (sseName && operand) {
     const reg = { kind: 'reg' as const, reg: XMM[regField], size: 128 };
-    const isStore = second === 0x11 || second === 0x29 || second === 0x7e || second === 0x7f;
+    const isStore = second === 0x11 || second === 0x29 || second === 0x7e || second === 0x7f || second === 0xd6;
     return finish(sseName, isStore ? [operand, reg] : [reg, operand]);
   }
 
@@ -701,6 +732,15 @@ function decodeTwoByte(
     }
     if (known.name === 'movzx' || known.name === 'movsx') {
       return finish(known.name, [{ kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize }, operand]);
+    }
+    // `cmpxchg` and `xadd` name a register in the ModRM reg field and a
+    // destination in the rm field, like imul. Their implicit operands (cmpxchg
+    // uses rax) are stated by the IR rather than invented here.
+    if (known.name === 'cmpxchg' || known.name === 'xadd') {
+      return finish(known.name, [
+        operand,
+        { kind: 'reg', reg: regName(regField, state.operandSize, state.hasRex), size: state.operandSize },
+      ]);
     }
   }
 

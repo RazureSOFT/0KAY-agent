@@ -28,6 +28,16 @@ export type Stmt =
   | { t: 'assign'; target: Expr; value: Expr }
   | { t: 'expr'; expr: Expr }
   | { t: 'return'; value?: Expr }
+  /**
+   * An explanation the decompiler adds because the C cannot say it.
+   *
+   * Distinct from `unknown`, which means "there is an instruction here the
+   * pipeline could not lift". Both print as a comment, but only one of them is a
+   * gap in the analysis: `sbb x, x` is understood and stated, a `punpcklbw` with
+   * no semantics is not. Conflating them made the unknown rate look dominated by
+   * the decompiler's own notes.
+   */
+  | { t: 'note'; text: string }
   | { t: 'unknown'; text: string };
 
 export interface LiftedBlock {
@@ -242,7 +252,11 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     let unknown = 0;
 
     for (const ins of block.instructions) {
-      const m = ins.mnemonic.toLowerCase();
+      // Prefixes are part of the printed mnemonic (`lock cmpxchg`) but not part of
+  // the instruction's identity: the atomics below are the same operation with or
+  // without `lock`, and matching on the full text silently skipped every one of
+  // them that had a prefix.
+  const m = ins.mnemonic.toLowerCase().replace(/^(lock|repne|rep|lock repne|lock rep)\s+/i, '');
       const [a, b] = ins.operands;
       if (m === 'cmp' || m === 'test') {
         pending = { op: m === 'cmp' ? 'cmp' : 'test', left: operandExpr(a, ins, frame), right: operandExpr(b, ins, frame) };
@@ -309,7 +323,49 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
 // integer and pointer values, and a 128-bit lane has neither. Printing
 // `xmm0 = xmm0` for the compiler's `movd`/`xorps` register-juggling would add
 // lines that say nothing.
+      if ((m === 'bsf' || m === 'bsr') && a && b) {
+        // Bit scan: index of the lowest or highest set bit. Go uses these to
+        // compute shifts and leading-zero counts, so saying which bit is meant it
+        // keeps the value flow that follows readable.
+        const target = operandExpr(a, ins, frame);
+        stmts.push({
+          t: 'assign',
+          target,
+          value: { t: 'call', target: m === 'bsf' ? 'lowest_set_bit' : 'highest_set_bit', args: [operandExpr(b, ins, frame)], size: target.size },
+        });
+        continue;
+      }
+      if (m === 'mul' && a) {
+        // Unsigned multiply of rax by the operand; the product lands in rdx:rax.
+        // Go emits it for division by a constant, so the high half is usually the
+        // one read next.
+        stmts.push({
+          t: 'assign',
+          target: { t: 'reg', name: 'rax', size: 64 },
+          value: { t: 'bin', op: '*', left: { t: 'reg', name: 'rax', size: 64 }, right: operandExpr(a, ins, frame), size: 64 },
+        });
+        stmts.push({ t: 'note', text: 'the high half of this product is in rdx' });
+        continue;
+      }
       if (/xmm\d+/.test(a?.reg || '') || /xmm\d+/.test(b?.reg || '')) continue;
+      // Atomics. `cmpxchg` compares the destination against rax and swaps on a
+      // match; `xadd` exchanges and adds. Both say something about the value, so
+      // they are recorded as a store with the exchange stated — dropping them
+      // would lose the write entirely, and the destination is exactly what the
+      // lock prefix exists to protect.
+      if (m === 'cmpxchg' || m === 'xadd') {
+        if (!a || !b) continue;
+        const destination = operandExpr(a, ins, frame);
+        const register = operandExpr(b, ins, frame);
+        stmts.push({ t: 'assign', target: destination, value: register });
+        stmts.push({
+          t: 'note',
+          text: m === 'cmpxchg'
+            ? 'atomic: swaps rax and the destination when they are equal'
+            : 'atomic: exchanges the register and the destination, then adds them',
+        });
+        continue;
+      }
       if (m === 'mov' || m === 'movabs') {
         // Segment-register moves do not affect the value flow this IR models.
         if (a?.kind === 'reg' && a.reg === 'seg' || b?.kind === 'reg' && b.reg === 'seg') continue;
@@ -376,7 +432,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         const sameOperand = a.kind === 'reg' && b.kind === 'reg' && a.reg === b.reg;
         if (m === 'sbb' && sameOperand) {
           stmts.push({ t: 'assign', target: left, value: { t: 'un', op: '-', value: { t: 'const', v: 1, size: left.size }, size: left.size } });
-          stmts.push({ t: 'unknown', text: 'the -1 above is the borrow, not a literal: sbb x, x is 0 or -1 from the carry flag' });
+          stmts.push({ t: 'note', text: 'the -1 above is the borrow, not a literal: sbb x, x is 0 or -1 from the carry flag' });
           continue;
         }
         stmts.push({
@@ -384,7 +440,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
           target: left,
           value: { t: 'bin', op: BINARY_VERBS[m], left, right: operandExpr(b, ins, frame), size: left.size },
         });
-        if (CARRIED[m]) stmts.push({ t: 'unknown', text: `${m} carries the borrow into this result` });
+        if (CARRIED[m]) stmts.push({ t: 'note', text: `${m} carries the borrow into this result` });
         continue;
       }
       // Bit test-and-modify: `bts a, b` sets one bit of a. The bit index is usually a
@@ -393,7 +449,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if ((m === 'bts' || m === 'btr' || m === 'btc') && a && b) {
         const bit = operandExpr(b, ins, frame);
         const verb = m === 'bts' ? 'sets' : m === 'btr' ? 'clears' : 'flips';
-        stmts.push({ t: 'unknown', text: `${m} ${verb} one bit of ${a.kind === 'mem' ? a.mem || 'that value' : operandExpr(a, ins, frame).t === 'var' ? (operandExpr(a, ins, frame) as { name: string }).name : 'the destination'}${bit.t === 'const' ? ` (bit ${bit.v})` : ''}` });
+        stmts.push({ t: 'note', text: `${m} ${verb} one bit of ${a.kind === 'mem' ? a.mem || 'that value' : operandExpr(a, ins, frame).t === 'var' ? (operandExpr(a, ins, frame) as { name: string }).name : 'the destination'}${bit.t === 'const' ? ` (bit ${bit.v})` : ''}` });
         continue;
       }
       if ((m === 'inc' || m === 'dec') && a) {

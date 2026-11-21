@@ -201,7 +201,7 @@ function foldStackCheck(
   if (foldRetryPath(entryBlock, entry, byStart)) {
     // The entry's guard is the one the reader would otherwise ask about, so it
     // keeps a one-line note in its place.
-    entryBlock.stmts.unshift({ t: 'unknown', text: 'stack check: grows the goroutine stack, then re-runs this function' });
+    entryBlock.stmts.unshift({ t: 'note', text: 'stack check: grows the goroutine stack, then re-runs this function' });
     foldedAny = true;
   }
 
@@ -676,7 +676,7 @@ function optimizeControl(stmts: CtrlStmt[]): CtrlStmt[] {
   };
   for (let index = 0; index < stmts.length; index++) {
     const stmt = stmts[index];
-    if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown') {
+    if (stmt.t === 'assign' || stmt.t === 'expr' || stmt.t === 'return' || stmt.t === 'unknown' || stmt.t === 'note') {
       buffer.push(stmt);
       continue;
     }
@@ -791,6 +791,10 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       return [stmt.value ? `${pad}return ${printExpr(stmt.value)};` : `${pad}return;`];
     case 'unknown':
       return [`${pad}/* unknown: ${stmt.text} */`];
+    case 'note':
+      // An explanation, not a gap. Same comment shape so the listing stays one
+      // stream, but the wording does not claim ignorance.
+      return [`${pad}/* ${stmt.text} */`];
     case 'if': {
       const lines = [`${pad}if (${printExpr(stmt.cond)}) {`];
       for (const inner of stmt.then) lines.push(...printStmt(inner, level + 1));
