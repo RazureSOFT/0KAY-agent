@@ -714,6 +714,19 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   for (const register of ['rax', 'rbx', 'rcx', 'rdi', 'rsi', 'r8', 'r9', 'r10', 'r11']) {
     undefinedReturns.delete(register);
   }
+  // The same registers again under a version number. The rename pass gives a register
+  // a numbered name when the code writes it a second time, and a read in one block can
+  // name `rbx_7` while the write named `rbx` sits in another — `runGCProg`, `sysmon`
+  // and `chanrecv` each report one. The value is the same register either way, and a
+  // read of a register the Go ABI passes arguments in is a read of an argument however
+  // the rename labelled it. Matching on the base name is what makes the two agree.
+  for (const name of [...undefinedReturns]) {
+    const base = name.replace(/_\d+$/, '');
+    if (base === name) continue;
+    if (['rax', 'rbx', 'rcx', 'rdi', 'rsi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15', 'rbp'].includes(base)) {
+      undefinedReturns.delete(name);
+    }
+  }
   // And the callee-save set. `rbx`, `rbp` and `r12`-`r15` hold their caller's values
   // on entry — a function that reads one before storing to it is reading what it was
   // handed, not garbage. `(*table).PutSlot` prints `r12 = r12` among the argument
