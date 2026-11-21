@@ -221,7 +221,29 @@ export function removeDeadStores(stmts: Stmt[], liveAfter: Set<string> = new Set
 }
 
 export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new Set()): Stmt[] {
-  return inlineSingleUseTemps(removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter));
+  return dropSelfAssignments(
+    inlineSingleUseTemps(removeDeadStores(collapseSaveRestore(propagate(stmts)), liveAfter)),
+  );
+}
+
+/**
+ * Remove `x = x`.
+ *
+ * The rename in `propagate` gives a redefined pinned register a numbered name, and
+ * when the value being stored is that same register under its old name the renaming
+ * makes the two sides equal: `r9 = rbx` became `r9 = r9` once `rbx` was retired in
+ * favour of `r9`. Those two lines read as a mistake in the listing — 327 functions
+ * per 4000 had one — and the cleanup that the caller does runs *before* this pass,
+ * so it cannot catch what the renaming creates here. It has to happen after the last
+ * step that can introduce one.
+ */
+function dropSelfAssignments(stmts: Stmt[]): Stmt[] {
+  return stmts.filter((stmt) => {
+    if (stmt.t !== 'assign') return true;
+    if (stmt.target.t !== stmt.value.t) return true;
+    if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') return true;
+    return stmt.target.name !== (stmt.value as { name?: string }).name;
+  });
 }
 
 function collapseSaveRestore(stmts: Stmt[]): Stmt[] {

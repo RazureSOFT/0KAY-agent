@@ -87,6 +87,46 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
    */
   const loopStack: { header: number; exit: number | null }[] = [];
 
+  /**
+   * One arm of a conditional, as statements.
+   *
+   * Almost always this is just `emitRange`. The case that needed saying out loud is
+   * the block that an *earlier* path already printed: `emitRange` stops at the first
+   * emitted block and returns nothing, and an empty pair of braces in the output reads
+   * as lost code — 237 of the first 2000 functions had one, and it was never clear
+   * from the listing whether the branch did nothing or the decompiler dropped it.
+   *
+   * Three answers, in order:
+   *
+   *  - the block printed nothing because it holds no statements: the arm is empty and
+   *    the caller omits the braces;
+   *  - the block was printed elsewhere and is a bare `return`: repeat the return, which
+   *    is what Go's shared epilogue means;
+   *  - the block was printed elsewhere and does something: jump to it. The label is
+   *    written where it was printed, and `pruneLabels` removes the ones nothing needs,
+   *    so the jump always has somewhere to land.
+   */
+  const branchArm = (target: number | null, join: number | null): CtrlStmt[] => {
+    const body = emitRange(target, join);
+    if (body.length || target == null || !emitted.has(target)) return body;
+    const shared = sharedReturn(target, join, byStart, emitted);
+    if (shared.length) return shared;
+    const visited = byStart.get(target);
+    if (!visited) return body;
+    // The block was printed on an earlier path. Jump to it: the label is at that
+    // printing, so the jump lands, and an empty pair of braces would say the branch
+    // does nothing when the code it selects is real.
+    //
+    // This used to fall through to `return body` when the block had no statements of
+    // its own, on the theory that a statement-less block is a decision with nothing to
+    // say. That is true of a split the compiler made for a test, but a *loop header*
+    // also holds only its test: `cmp rbx, 8; jbe done` is the whole of it, and the code
+    // it selects is the loop body it dominates. `memeqbody` reaches the same head from
+    // two places, the second one printed `if (arg1 < 0x40) { }`, and the body — a whole
+    // unrolled copy loop — was nowhere in the output.
+    return [{ t: 'goto', label: labelOf(target) }];
+  };
+
   const emitRange = (start: number | null, stop: number | null): CtrlStmt[] => {
     const out: CtrlStmt[] = [];
     let current = start;
@@ -158,32 +198,16 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         const join = ipdom(current);
         if (thenBlock == null || elseBlock == null) break;
         if (join === elseBlock) {
-          const thenBody = emitRange(thenBlock, join);
-          // An empty then-body is the negative of the same test. Printing
-          // `if (x != 0x12) { } else { ... }` for a comparison chain that tests
-          // for equality makes every case of a type switch read backwards, and
-          // the empty braces look like lost code.
-          if (!thenBody.length) out.push({ t: 'if', cond: negate(cond), then: emitRange(elseBlock, join) });
-          else out.push({ t: 'if', cond, then: thenBody });
+          // `if (cond) { then }` — the else side falls straight through to the join.
+          out.push({ t: 'if', cond, then: branchArm(thenBlock, join) });
         } else if (join === thenBlock) {
-          out.push({ t: 'if', cond: negate(cond), then: emitRange(elseBlock, join) });
+          // The branch target *is* the join, so the body belongs to the fall-through
+          // side and the test reads the other way round.
+          out.push({ t: 'if', cond: negate(cond), then: branchArm(elseBlock, join) });
         } else {
-          const thenBody = emitRange(thenBlock, join);
-          const elseBody = emitRange(elseBlock, join);
-          // A branch onto an already-emitted epilogue comes out empty, because the
-          // block was printed once and `emitRange` stops at `emitted`. When that
-          // block does nothing but return, the branch's body *is* that return:
-          // printing an empty pair of braces hides a real early exit, and Go shares
-          // one epilogue between every exit in the function, so this is common.
-          const epilogue = thenBody.length ? [] : sharedReturn(thenBlock, join, byStart, emitted);
-          // An empty then-body beside a real else-body is the same test written the
-          // other way round. It happens when the branch target was already emitted
-          // by an enclosing structure, so `emitRange` returned nothing: printing
-          // `if (x) { } else { ... }` shows an empty block that reads as lost code,
-          // and every case of a switch that shares a tail comes out inverted.
-          if (epilogue.length) out.push({ t: 'if', cond, then: epilogue, ...(elseBody.length ? { else: elseBody } : {}) });
-          else if (!thenBody.length && elseBody.length) out.push({ t: 'if', cond: negate(cond), then: elseBody });
-          else out.push({ t: 'if', cond, then: thenBody, ...(elseBody.length ? { else: elseBody } : {}) });
+          const thenBody = branchArm(thenBlock, join);
+          const elseBody = branchArm(elseBlock, join);
+          out.push({ t: 'if', cond, then: thenBody, ...(elseBody.length ? { else: elseBody } : {}) });
         }
         current = join;
         continue;
@@ -254,7 +278,7 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         if (block.term === 'jcc' && block.target != null && !loop.blocks.has(block.target)) {
           const targetBlock = byStart.get(block.target);
           if (targetBlock && !targetBlock.folded && block.target !== exit) {
-            body.push({ t: 'if', cond: block.cond || { t: 'unknown', text: 'flags', size: 1 }, then: emitRange(block.target, exit) });
+            body.push({ t: 'if', cond: block.cond || { t: 'unknown', text: 'flags', size: 1 }, then: branchArm(block.target, exit) });
           }
         }
       }
@@ -329,6 +353,56 @@ function sharedReturn(
  *
  * Mutates the tree in place and returns the count, so the header and the body agree.
  */
+/**
+ * Delete every label the given set of jump targets does not contain, recursively.
+ *
+ * Separate from `filter` on purpose: `filter` also removes emptied branches as it
+ * goes, so the set it compares against is the one collected before those removals.
+ * This one takes the set as given and only removes labels, which is what makes it
+ * safe to run last.
+ */
+function sweepLabels(nodes: CtrlStmt[], live: Set<string>): CtrlStmt[] {
+  const out: CtrlStmt[] = [];
+  for (const node of nodes) {
+    if (node.t === 'label' && !live.has(node.name)) continue;
+    if (node.t === 'if') {
+      const then = sweepLabels(node.then, live);
+      const otherwise = node.else ? sweepLabels(node.else, live) : null;
+      if (!then.length && !(otherwise && otherwise.length)) continue;
+      // `else` is listed explicitly so the spread cannot carry the original array
+      // through: `{ ...node }` copies `node.else`, and omitting the key when there is
+      // no else leaves the *old*, unswept array in place. That is how a label survived
+      // a sweep that had just printed itself dropping it.
+      const rebuilt: CtrlStmt = otherwise && otherwise.length
+        ? { t: 'if', cond: node.cond, then, else: otherwise }
+        : { t: 'if', cond: node.cond, then };
+      out.push(rebuilt);
+    } else if (node.t === 'while' || node.t === 'do') {
+      out.push({ ...node, body: sweepLabels(node.body, live) });
+    } else if (node.t === 'switch') {
+      out.push({
+        ...node,
+        cases: node.cases.map((c) => ({ ...c, body: sweepLabels(c.body, live) })),
+        ...(node.defaultBody ? { defaultBody: sweepLabels(node.defaultBody, live) } : {}),
+      });
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+function countNodes(nodes: CtrlStmt[]): number {
+  let total = 0;
+  for (const node of nodes) {
+    total += 1;
+    if (node.t === 'if') { total += countNodes(node.then); if (node.else) total += countNodes(node.else); }
+    else if (node.t === 'while' || node.t === 'do') total += countNodes(node.body);
+    else if (node.t === 'switch') { for (const c of node.cases) total += countNodes(c.body); if (node.defaultBody) total += countNodes(node.defaultBody); }
+  }
+  return total;
+}
+
 function pruneLabels(body: CtrlStmt[]): number {
   const referenced = new Set<string>();
   let jumps = 0;
@@ -350,7 +424,20 @@ function pruneLabels(body: CtrlStmt[]): number {
     for (const node of nodes) {
       if (node.t === 'label' && !referenced.has(node.name)) continue;
       if (node.t === 'if') {
-        kept.push({ ...node, then: filter(node.then), ...(node.else ? { else: filter(node.else) } : {}) });
+        const then = filter(node.then);
+        const otherwise = node.else ? filter(node.else) : null;
+        // Both arms can come out empty here even though the `if` was not empty when it
+        // was built: dropping an unreferenced label is what empties them. A `then` that
+        // held only a label now holds nothing, and printing `if (cond) { }` says the
+        // branch does nothing. The branch's real content was the code at the label, so
+        // the honest thing is to remove the now-meaningless test rather than print it
+        // empty.
+        if (!then.length && !(otherwise && otherwise.length)) continue;
+        // Same care as in `sweepLabels`: the spread would copy the original `else`
+        // back in whenever the rebuilt node has none.
+        kept.push(otherwise && otherwise.length
+          ? { t: 'if', cond: node.cond, then, else: otherwise }
+          : { t: 'if', cond: node.cond, then });
       } else if (node.t === 'while' || node.t === 'do') {
         kept.push({ ...node, body: filter(node.body) });
       } else if (node.t === 'switch') {
@@ -365,15 +452,42 @@ function pruneLabels(body: CtrlStmt[]): number {
     }
     return kept;
   };
-  const pruned = filter(body);
+  // Remove until a pass changes nothing.
+  //
+  // The two removals feed each other: dropping an `if` whose arms both came out empty
+  // also drops the jumps inside it, which can leave a label with no reader, which can
+  // empty another `if`. Each pass reads the jumps out of the tree it is about to
+  // filter — reading them once up front kept a label alive on the strength of a jump
+  // that the same pass was about to delete.
+  let pruned = body;
+  for (let round = 0; round < 16; round += 1) {
+    referenced.clear();
+    collect(pruned);
+    const before = countNodes(pruned);
+    const next = filter(pruned);
+    if (countNodes(next) === before) { pruned = next; break; }
+    pruned = next;
+  }
+  // Final sweep. `filter` removes a label it believes nothing jumps to, using the set
+  // collected at the top of its round; a label can still be standing if the round that
+  // should have removed it also removed the branch it was nested under. Rather than
+  // reason about the order, walk the finished tree once and delete every label whose
+  // name is not in the set of names the finished tree jumps to.
+  referenced.clear();
+  jumps = 0;
+  collect(pruned);
+  pruned = sweepLabels(pruned, referenced);
+  referenced.clear();
+  jumps = 0;
+  collect(pruned);
   body.length = 0;
   body.push(...pruned);
-  void keep;
   // The header reports how many jumps the listing contains, so it has to be the
   // number printed, not the number of distinct labels: two branches to the same
   // target are two statements the reader counts.
   return jumps;
 }
+
 
 function labelOf(address: number): string {
   return `L_${address.toString(16)}`;
