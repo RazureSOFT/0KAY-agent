@@ -304,7 +304,12 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame, e
   // r14 is Go's goroutine pointer, not an argument: the runtime keeps it loaded
   // for the whole life of the thread, and counting it as a parameter put an
   // argument in every signature that happened to read it.
-  const defined = new Set(['rsp', 'rbp', 'r14']);
+  // Registers that hold something before the code runs but that are not arguments.
+  // `r14` is the goroutine pointer; `r12`, `r13` and `r15` are Go's callee-save set
+  // and are never argument registers in either ABI — Go passes integers in rax, rbx,
+  // rcx, rdi, rsi and r8-r11. Reading one of these says nothing about the signature;
+  // `chacha8rand.block` read r15 and grew a parameter for it.
+  const defined = new Set(['rsp', 'rbp', 'r12', 'r13', 'r14', 'r15']);
   for (const register of spilled) defined.add(register);
   const inputs: string[] = [];
   // A register the prologue spilled into a slot named `argN` *is* an incoming
@@ -360,6 +365,11 @@ export function inferRegisterParams(instructions: Instruction[], frame: Frame, e
       for (const raw of used) {
         const name = baseName(raw);
         if (name === 'seg' || name === 'rip') continue;
+        // Vector registers are not tracked by this IR, so a read of one says nothing
+        // about the signature. `chacha8rand.block` loads sixteen constants into
+        // xmm0-xmm15 before using them, and every one was taken for a float
+        // parameter: the signature had twenty arguments and the body used two.
+        if (/^(xmm|ymm|zmm)\d+$/.test(name)) continue;
         if (!defined.has(name) && !inputs.includes(name)) inputs.push(name);
       }
     }
