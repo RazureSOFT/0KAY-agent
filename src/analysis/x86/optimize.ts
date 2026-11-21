@@ -238,29 +238,24 @@ export function optimizeStatements(stmts: Stmt[], liveAfter: Set<string> = new S
  * step that can introduce one.
  */
 function dropSelfAssignments(stmts: Stmt[]): Stmt[] {
-  // Which names have a second definition somewhere in the list. A self-assignment is
-  // only removable when the name has another one: `rbx_7 = rbx_7` is not the value
-  // definition of `rbx_7`, but if it is the *only* line mentioning the name as a
-  // target then the reader in another block has nothing left to point at — and that
-  // is what a plain filter produced, taking `read before written` from 7 functions in
-  // 1000 to 10.
-  const otherDefinitions = new Map<string, number>();
-  for (const stmt of stmts) {
-    if (stmt.t !== 'assign') continue;
-    if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') continue;
-    const name = stmt.target.name;
-    const selfAssign = stmt.target.t === stmt.value.t
-      && 'name' in stmt.value
-      && stmt.target.name === (stmt.value as { name?: string }).name;
-    if (selfAssign) continue;
-    otherDefinitions.set(name, (otherDefinitions.get(name) || 0) + 1);
-  }
+  // `x = x` never produces a value, so removing it can never remove the definition a
+  // reader needs: whatever the reader finds afterwards is what it would have found
+  // anyway. An earlier attempt kept the ones whose name had no other definition in the
+  // *same list*, which was the wrong question — the counterpart is usually in another
+  // block. `(*Map).Clear` prints
+  //
+  //     rcx = v_16;
+  //     rdx = rdx;      <- the compiler's "rdx needs no restore"
+  //     rbx = stack_arg_24;
+  //
+  // among the register restores after a call, and `rdx` was written by an `inc rdx`
+  // several blocks earlier. Keeping the line does not make `rdx` defined; it only
+  // shows the reader a statement that does nothing.
   return stmts.filter((stmt) => {
     if (stmt.t !== 'assign') return true;
     if (stmt.target.t !== stmt.value.t) return true;
     if (stmt.target.t !== 'reg' && stmt.target.t !== 'var') return true;
-    if (stmt.target.name !== (stmt.value as { name?: string }).name) return true;
-    return !otherDefinitions.has(stmt.target.name);
+    return stmt.target.name !== (stmt.value as { name?: string }).name;
   });
 }
 
