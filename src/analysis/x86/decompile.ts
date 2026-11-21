@@ -12,7 +12,7 @@ import { disassembleFunction } from './function.js';
 import { buildCfg } from './cfg.js';
 import { analyzeFrame, inferRegisterParams, type Convention, type Frame } from './frame.js';
 import { lift, type Expr, type Stmt } from './ir.js';
-import { structure, type CtrlStmt } from './structure.js';
+import { structure, negate, type CtrlStmt } from './structure.js';
 import { optimizeStatements } from './optimize.js';
 import { recoverSwitch } from './switch.js';
 import { typeForSize, typeOfExpr, refineParam, type CType } from './types.js';
@@ -84,13 +84,16 @@ export function decompileFunction(
 
   // Go does not spill its register arguments, so when the frame has no saved
   // arguments the inputs are recovered from the first reads instead.
-  const frameParams = [...frame.slots.values()].some((slot) => /^arg\d+$/.test(slot.name));
+  // Always infer from the reads, and let the merge below reconcile them with the
+  // slots the prologue already named. A slot named `argN` records that one
+  // argument was spilled; it says nothing about the ones the body still reads out
+  // of registers, so treating a spill as a complete signature left the rest out.
   // Only the instructions the reader will actually see. The stack-growth retry
   // restores callee-saved registers from values it saved earlier, and reading
   // those made `rbx` look like an incoming argument when it was the runtime's
   // own bookkeeping — one phantom parameter per guard.
   const visible = liftableInstructions(fn.instructions, lifted);
-  const inferred = frameParams ? [] : inferRegisterParams(visible, frame);
+  const inferred = inferRegisterParams(visible, frame);
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
   const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
@@ -800,6 +803,13 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       // stream, but the wording does not claim ignorance.
       return [`${pad}/* ${stmt.text} */`];
     case 'if': {
+      // A branch printed with an empty then-body and a full else is the same test
+      // written backwards, and it reads like lost code. The reconstruction can
+      // produce it when the join point lands on the branch target; the meaning is
+      // preserved by inverting the test here.
+      if (!stmt.then.length && stmt.else?.length) {
+        return printStmt({ t: 'if', cond: negate(stmt.cond), then: stmt.else }, level);
+      }
       const lines = [`${pad}if (${printExpr(stmt.cond)}) {`];
       for (const inner of stmt.then) lines.push(...printStmt(inner, level + 1));
       if (stmt.else?.length) {

@@ -408,3 +408,39 @@ test('an assignment is kept when its only reader is in another block', () => {
   assert.match(result.c, /rcx = arg1 \+ (0x)?1/, 'the lea survives its reader being in another block')
   assert.doesNotMatch(result.c, /read before written: rcx/, 'and the loop body can read it')
 })
+
+test('a loop whose latch has no branch of its own still owns its body', () => {
+  // lea rcx, [rsi+1] ; shl rdi, cl ; cmp rdi, 0 ; jg back over the shl ; ret
+  // The backward edge lands on a `fallthrough` block, not on a `jcc`. Requiring
+  // the latch to be a conditional branch made the loop fall through to the
+  // empty-body case, and the body then read a register whose assignment had been
+  // placed in another subtree.
+  const code = bytes(
+    0x48, 0x8d, 0x4e, 0x01,                // lea rcx, [rsi+1]
+    0x48, 0xd3, 0xe7,                     // shl rdi, cl
+    0x48, 0x83, 0xff, 0x00,               // cmp rdi, 0
+    0x7f, 0xf8,                           // jg -8
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'latched', end: BASE + code.length, convention: 'sysv' })
+  // The body must contain both the producing assignment and the shifting read.
+  assert.match(result.c, /rcx = arg1 \+ (0x)?1/, 'the producing assignment is in the body')
+  assert.match(result.c, /<< rcx/, 'and so is its reader')
+})
+
+test('one spilled argument does not stand in for the whole signature', () => {
+  // mov [rsp+0x18], rax ; cmp rbx, 0 ; je +2 ; ret ; ret
+  // The prologue names rax by spilling it. rbx is read straight out of a register
+  // and is an argument too; treating the spill as a complete signature reported it
+  // as an unassigned local.
+  const code = bytes(
+    0x48, 0x89, 0x44, 0x24, 0x18,         // mov [rsp+0x18], rax
+    0x48, 0x83, 0xfb, 0x00,               // cmp rbx, 0
+    0x74, 0x01,                           // je +1
+    0xc3,                                 // ret
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'twoargs', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /twoargs\(long arg0, long arg1\)/, 'both arguments are in the signature')
+  assert.doesNotMatch(result.c, /read before written: rbx/, 'rbx is an argument, not a lost local')
+})

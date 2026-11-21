@@ -287,8 +287,16 @@ export interface InferredParam {
 }
 
 export function inferRegisterParams(instructions: Instruction[], frame: Frame): InferredParam[] {
-  if (frame.savedArgs.size > 0) return []; // the prologue already named them
-  const defined = new Set(['rsp', 'rbp']);
+  // A prologue that spills its arguments names them, but spilling *some* of them
+  // does not name all: `mov [rsp+0xb0], rax` names rax and says nothing about
+  // rbx, which the next comparison reads. Returning early whenever anything was
+  // spilled left every further argument out of the signature.
+  const spilled = frame.savedArgs.size > 0 ? new Set(frame.savedArgs.keys()) : new Set<string>();
+  // r14 is Go's goroutine pointer, not an argument: the runtime keeps it loaded
+  // for the whole life of the thread, and counting it as a parameter put an
+  // argument in every signature that happened to read it.
+  const defined = new Set(['rsp', 'rbp', 'r14']);
+  for (const register of spilled) defined.add(register);
   const inputs: string[] = [];
   for (const instruction of instructions.slice(0, 48)) {
     const mnemonic = instruction.mnemonic.toLowerCase();

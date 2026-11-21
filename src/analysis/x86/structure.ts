@@ -137,7 +137,13 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         const join = ipdom(current);
         if (thenBlock == null || elseBlock == null) break;
         if (join === elseBlock) {
-          out.push({ t: 'if', cond, then: emitRange(thenBlock, join) });
+          const thenBody = emitRange(thenBlock, join);
+          // An empty then-body is the negative of the same test. Printing
+          // `if (x != 0x12) { } else { ... }` for a comparison chain that tests
+          // for equality makes every case of a type switch read backwards, and
+          // the empty braces look like lost code.
+          if (!thenBody.length) out.push({ t: 'if', cond: negate(cond), then: emitRange(elseBlock, join) });
+          else out.push({ t: 'if', cond, then: thenBody });
         } else if (join === thenBlock) {
           out.push({ t: 'if', cond: negate(cond), then: emitRange(elseBlock, join) });
         } else {
@@ -172,14 +178,57 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       return { t: 'while', cond: header.cond || null, body };
     }
 
-    // do { ... } while (cond): a latch branches back to the header.
-    const latch = loop.latches.map((start) => byStart.get(start)).find((block) => block && block.term === 'jcc' && block.target === loop.header);
+    // do { ... } while (cond): the latch branches back to the header.
+    // A latch is a block whose branch goes back into the loop. Requiring it to
+    // target the *header* is too strict: Go lays a loop out so the backward branch
+    // can land on a block that continues the body, not on the block the dominator
+    // analysis named as the header. Those loops used to fall through to the
+    // `while (1)` case with an empty body and dump every block as an orphan.
+    // A latch is a block whose control reaches back to the loop start. That is
+    // normally a conditional branch, but a `fallthrough` block followed by the
+    // header is the same edge with no instruction of its own — Go uses it when
+    // the body ends exactly at the loop top. Requiring `jcc` skipped those and the
+    // loop came out as `while (1)` with an empty body.
+    const latch = loop.latches.map((start) => byStart.get(start)).find((block) => {
+      if (!block) return false;
+      const next = nextBlock(block, byStart, order);
+      if (block.term === 'jcc') return block.target != null && (block.target === loop.header || loop.blocks.has(block.target));
+      if (block.term === 'fallthrough') return next === loop.header || (next != null && loop.blocks.has(next));
+      return false;
+    });
     if (latch) {
       emitted.add(latch.start);
-      const body = emitRange(header.start, latch.start);
+      // The body is the header plus everything the loop owns up to the latch, in
+      // execution order — not the address range between them. Go lays a loop out
+      // so the latch can sit *before* the header (`test; jl` at a lower address),
+      // and an address-bounded range then comes out empty: the whole loop body
+      // landed in the orphan list at the end of the function, reading registers
+      // whose assignments had been optimised away in a different subtree.
+      const body: CtrlStmt[] = [];
+      for (const start of loopBlocksInOrder(loop, order)) {
+        const block = byStart.get(start);
+        if (!block || start === latch.start) continue;
+        emitted.add(start);
+        body.push(...block.stmts);
+        // A branch out of the loop, with its target still present, is a real
+        // conditional inside the body.
+        if (block.term === 'jcc' && block.target != null && !loop.blocks.has(block.target)) {
+          const targetBlock = byStart.get(block.target);
+          if (targetBlock && !targetBlock.folded && block.target !== exit) {
+            body.push({ t: 'if', cond: block.cond || { t: 'unknown', text: 'flags', size: 1 }, then: emitRange(block.target, exit) });
+          }
+        }
+      }
       body.push(...latch.stmts);
       depth -= 1;
-      return { t: 'do', body, cond: latch.cond || { t: 'unknown', text: 'flags', size: 1 } };
+      // A fallthrough latch carries no condition; the loop repeats when the header's
+      // own guard allows it, so the header's condition is the loop condition.
+      // A latch with no condition of its own means the loop is re-entered
+      // unconditionally and leaves through a guard inside the body — Go's
+      // `while (1) { ... if bad { break } ... }`. Printing `while (flags 0)` there
+      // would be a condition the binary does not have.
+      if (!latch.cond) return { t: 'while', cond: null, body };
+      return { t: 'do', body, cond: latch.cond };
     }
 
     // while (1) { ... }: the exit is reached from inside.
@@ -218,7 +267,8 @@ function nextBlock(block: LiftedBlock, byStart: Map<number, LiftedBlock>, ordere
   return next ? next.start : null;
 }
 
-function negate(expr: Expr): Expr {
+/** The opposite of a comparison, or a logical not when there is no opposite. */
+export function negate(expr: Expr): Expr {
   if (expr.t === 'bin') {
     const opposite: Record<string, string> = { '==': '!=', '!=': '==', '<': '>=', '>=': '<', '>': '<=', '<=': '>' };
     if (opposite[expr.op]) return { t: 'bin', op: opposite[expr.op], left: expr.left, right: expr.right, size: 1 };
@@ -302,6 +352,37 @@ function immediatePostDominator(block: number, post: Map<number, Set<number>>): 
     if (strict.every((other) => other === candidate || candidateSet.has(other))) return candidate;
   }
   return strict[0];
+}
+
+
+/**
+ * The loop's blocks in execution order, starting at the header.
+ *
+ * A loop body is a graph, not an address range. Walking from the header by
+ * successors and keeping only members keeps the order the code runs in, which is
+ * what the printout needs — and it works when the latch sits at a lower address
+ * than the header, where an address-bounded range is empty.
+ */
+function loopBlocksInOrder(loop: LoopInfo, order: number[]): number[] {
+  const started = [loop.header];
+  const seen = new Set<number>(started);
+  for (let index = 0; index < started.length; index++) {
+    const block = started[index];
+    const position = order.indexOf(block);
+    const next = position >= 0 && position + 1 < order.length ? order[position + 1] : null;
+    const candidates = [next, ...(loop.latches.includes(block) ? [] : [])].filter((item): item is number => item != null);
+    for (const candidate of candidates) {
+      if (!loop.blocks.has(candidate) || seen.has(candidate)) continue;
+      seen.add(candidate);
+      started.push(candidate);
+    }
+  }
+  // Any member the walk could not reach from the header (a branch target inside
+  // the body) is appended in address order so nothing is silently dropped.
+  for (const member of [...loop.blocks].sort((a, b) => a - b)) {
+    if (!seen.has(member)) { seen.add(member); started.push(member); }
+  }
+  return started;
 }
 
 function findLoops(
