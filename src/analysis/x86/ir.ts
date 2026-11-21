@@ -499,8 +499,14 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
         // `mov [rbp-8], rdi` is the prologue spilling an argument. The slot is
         // already named arg0, so printing `arg0 = rdi` would overwrite the
         // parameter with itself.
-        if (a?.kind === 'mem' && a.base === 'rbp' && typeof a.disp === 'number' && b?.kind === 'reg') {
-          const slot = frame.slots.get(a.disp);
+        // Go addresses the frame off `rsp` as often as off `rbp`, so both bases name
+        // the same slot: a displacement is only meaningful together with the base,
+        // and the rsp form needs the frame subtracted the same way `slotFor` does.
+        if (a?.kind === 'mem' && (a.base === 'rbp' || a.base === 'rsp') && typeof a.disp === 'number' && b?.kind === 'reg') {
+          const offset = a.base === 'rsp'
+            ? rspSlotOffset(a.disp + (ins.rspOffset || 0), frame)
+            : a.disp;
+          const slot = frame.slots.get(offset);
           if (slot && /^arg\d+$/.test(slot.name) && frame.argRegisters.includes(registerBase(b.reg || ''))) continue;
         }
         if (a && b) {

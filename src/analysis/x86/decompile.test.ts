@@ -489,3 +489,23 @@ test('a chain of versioned values folds transitively', () => {
   }
 })
 
+
+test('spilling an argument through rsp does not overwrite the parameter', () => {
+  // push rbp; mov rbp,rsp; sub rsp,0x28; mov [rsp+0x40], rcx; call f
+  // Go addresses its frame off rsp as often as off rbp. Only the rbp form was
+  // recognised as "this slot is arg0", so the rsp form printed `arg0 = rcx` —
+  // the parameter assigned to itself, from a value that is not the parameter.
+  const code = bytes(
+    0x55,
+    0x48, 0x89, 0xe5,
+    0x48, 0x83, 0xec, 0x28,               // sub rsp, 0x28
+    0x48, 0x89, 0x4c, 0x24, 0x40,         // mov [rsp+0x40], rcx
+    0xe8, 0x00, 0x00, 0x00, 0x00,         // call rel32
+    0x48, 0x83, 0xc4, 0x28,               // add rsp, 0x28
+    0x5d,                                 // pop rbp
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'spill', end: BASE + code.length, convention: 'sysv' })
+  assert.doesNotMatch(result.c, /arg0 = /, 'the parameter is not assigned to itself')
+  assert.doesNotMatch(result.c, /read before written/, 'and nothing is left unassigned')
+})
