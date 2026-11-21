@@ -1207,6 +1207,8 @@ function printStmt(stmt: CtrlStmt, level: number): string[] {
       lines.push(`${pad}}`);
       return lines;
     }
+    case 'continue':
+      return [`${pad}continue;`];
     case 'goto':
       return [`${pad}goto ${stmt.label};`];
     case 'label':

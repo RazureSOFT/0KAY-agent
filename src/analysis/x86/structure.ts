@@ -16,6 +16,7 @@ export type CtrlStmt =
   | { t: 'do'; body: CtrlStmt[]; cond: Expr }
   | { t: 'switch'; value: Expr; cases: Array<{ value: number; body: CtrlStmt[] }>; defaultBody?: CtrlStmt[] }
   | { t: 'goto'; label: string }
+  | { t: 'continue' }
   | { t: 'label'; name: string };
 
 export interface StructureResult {
@@ -76,6 +77,15 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
   const emitted = new Set<number>();
   let gotos = 0;
   let depth = 0;
+  /**
+   * The loops whose body is currently being emitted, innermost last.
+   *
+   * A `jmp` back to a loop header is a `continue`, and printing nothing for it left
+   * an empty branch where the source had `if (...) { continue }`. The information
+   * exists — the dominator analysis already knows the edge is a back edge — it just
+   * had no name in the output.
+   */
+  const loopStack: { header: number; exit: number | null }[] = [];
 
   const emitRange = (start: number | null, stop: number | null): CtrlStmt[] => {
     const out: CtrlStmt[] = [];
@@ -109,7 +119,12 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         const target = block.target ?? null;
         if (target == null) break;
         if (target === stop) break;
-        if (dominators.get(current)?.has(target)) break; // back edge: the loop owns it
+        if (dominators.get(current)?.has(target)) {
+          // Back edge. If it closes the loop the body is inside, that is `continue`.
+          const enclosing = loopStack.find((entry) => entry.header === target);
+          if (enclosing) out.push({ t: 'continue' });
+          break;
+        }
         if (emitted.has(target)) {
           out.push({ t: 'goto', label: labelOf(target) });
           gotos += 1;
@@ -149,7 +164,13 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
         } else {
           const thenBody = emitRange(thenBlock, join);
           const elseBody = emitRange(elseBlock, join);
-          out.push({ t: 'if', cond, then: thenBody, ...(elseBody.length ? { else: elseBody } : {}) });
+          // An empty then-body beside a real else-body is the same test written the
+          // other way round. It happens when the branch target was already emitted
+          // by an enclosing structure, so `emitRange` returned nothing: printing
+          // `if (x) { } else { ... }` shows an empty block that reads as lost code,
+          // and every case of a switch that shares a tail comes out inverted.
+          if (!thenBody.length && elseBody.length) out.push({ t: 'if', cond: negate(cond), then: elseBody });
+          else out.push({ t: 'if', cond, then: thenBody, ...(elseBody.length ? { else: elseBody } : {}) });
         }
         current = join;
         continue;
@@ -170,11 +191,15 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     }
     emitted.add(loop.header);
     const headerNext = nextBlock(header, byStart, order);
+    // Everything emitted from here on is inside this loop, so a backward branch to
+    // this header is a `continue` rather than an unexplained edge.
+    loopStack.push({ header: loop.header, exit: exit ?? null });
 
     // while (cond) { ... }: the header branches to the exit and falls into the body.
     if (header.term === 'jcc' && header.target === exit && headerNext != null && loop.blocks.has(headerNext)) {
       const body = emitRange(headerNext, loop.header);
       depth -= 1;
+      loopStack.pop();
       return { t: 'while', cond: header.cond || null, body };
     }
 
@@ -227,13 +252,15 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       // unconditionally and leaves through a guard inside the body — Go's
       // `while (1) { ... if bad { break } ... }`. Printing `while (flags 0)` there
       // would be a condition the binary does not have.
-      if (!latch.cond) return { t: 'while', cond: null, body };
+      if (!latch.cond) { loopStack.pop(); return { t: 'while', cond: null, body }; }
+      loopStack.pop();
       return { t: 'do', body, cond: latch.cond };
     }
 
     // while (1) { ... }: the exit is reached from inside.
     const body = emitRange(headerNext, exit);
     depth -= 1;
+    loopStack.pop();
     return { t: 'while', cond: null, body };
   };
 
