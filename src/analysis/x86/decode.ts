@@ -562,6 +562,14 @@ const TWO_BYTE_FLOW: Record<number, { name: string; flow?: Flow }> = {
   0x31: { name: 'rdtsc' },
   0xa2: { name: 'cpuid' },
   0xaf: { name: 'imul' },
+  // Prefetch and the fence block. `0f 18 /1` is prefetchw and `/0` is prefetcht0;
+  // the ModRM reg field selects which, so the instruction has an operand the decoder
+  // already knows how to parse. `0f ae` is lfence/sfence/mfence and clflush by the
+  // same scheme. Neither behaviour is something this IR represents, and the name is
+  // what the reader needs: without it the listing showed `0f18` beside a real
+  // commented-out memory reference.
+  0x18: { name: 'prefetch' },
+  0xae: { name: 'fence' },
   0xb6: { name: 'movzx' },
   0xb7: { name: 'movzx' },
   0xbe: { name: 'movsx' },
@@ -798,6 +806,8 @@ function decodeTwoByte(
   // sit in the same numeric range and would otherwise get a vector operand.
   const generalPurpose = (second >= 0x40 && second <= 0x4f)
     || second === 0xaf || second === 0xb6 || second === 0xb7 || second === 0xbe || second === 0xbf
+    || second === 0x18 || second === 0x19 || second === 0x1a || second === 0x1b
+    || second === 0x1c || second === 0x1d || second === 0x1e || second === 0x1f
     || (second >= 0x90 && second <= 0x9f)
     || (second >= 0xa3 && second <= 0xbb)
     || second === 0xbc || second === 0xbd;
@@ -891,6 +901,11 @@ function decodeTwoByte(
       }
       return finish(known.name, [destination, operand]);
     }
+    // Any other name in the table that takes a single memory operand. Without this
+    // the entry was consulted, the operand was parsed, and then the function fell
+    // through to the `0fXX` catch-all — so `prefetch` printed as `0f18` with its
+    // operand thrown away, which is the same as not having the entry at all.
+    return finish(known.name, [operand]);
   }
   // `0f 01` is a group instruction whose member is chosen by the ModRM byte, and
   // the ones the runtime uses — `swapgs`, `rdtscp`, `lgdt` — take no operand.
