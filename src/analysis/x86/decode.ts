@@ -119,6 +119,30 @@ export function decode(bytes: Uint8Array, options: DecodeOptions = {}): Instruct
 }
 
 /** Decode exactly one instruction at `offset`. Never throws. */
+
+/**
+ * AVX instruction names by their opcode byte.
+ *
+ * The operand shapes are not modelled — this IR does not track vector registers —
+ * but the name is what lets a reader recognise a byte-shuffling or float-converting
+ * block instead of reading `vex_6f`. `vzeroupper` is handled separately because it
+ * has no ModRM.
+ */
+const VEX_NAMES: Record<number, string> = {
+  0x6f: 'vmovdqa', 0x7f: 'vmovdqa', 0x10: 'vmovups', 0x11: 'vmovups',
+  0x28: 'vmovaps', 0x29: 'vmovaps', 0x57: 'vxorps', 0x54: 'vandps',
+  0x6e: 'vmovd', 0x7e: 'vmovd', 0xd6: 'vmovq',
+  0x60: 'vpunpcklbw', 0x61: 'vpunpcklwd', 0x62: 'vpunpckldq', 0x63: 'vpacksswb',
+  0x68: 'vpunpckhbw', 0x69: 'vpunpckhwd', 0x6a: 'vpunpckhdq', 0x6b: 'vpackssdw',
+  0x6c: 'vpunpcklqdq', 0x6d: 'vpunpckhqdq', 0x70: 'vpshufd',
+  0x71: 'vpsrlw', 0x72: 'vpsrld', 0x73: 'vpsrlq',
+  0x74: 'vpcmpeqb', 0x75: 'vpcmpeqw', 0x76: 'vpcmpeqd',
+  0xd7: 'vpmovmskb', 0xdb: 'vpand', 0xdf: 'vpandn', 0xeb: 'vpor', 0xef: 'vpxor',
+  0xf7: 'vpsadbw', 0xfe: 'vpaddd', 0xfa: 'vpsubd',
+  0x58: 'vaddps', 0x59: 'vmulps', 0x5c: 'vsubps', 0x5e: 'vdivps',
+  0x5a: 'vcvtps2pd', 0x5b: 'vcvtdq2ps', 0x2e: 'vucomiss', 0x2f: 'vcomiss',
+};
+
 export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instruction {
   const start = offset;
   let index = offset;
@@ -359,10 +383,12 @@ export function decodeOne(bytes: Uint8Array, offset: number, address = 0): Instr
         }
       }
       index = Math.min(cursor, bytes.length);
-      return {
-        ...finish(avxOpcode === 0x77 ? 'vzeroupper' : `vex_${avxOpcode.toString(16).padStart(2, '0')}`, []),
-        ...(avxOpcode === 0x77 ? {} : { unknown: true }),
-      };
+      const avxName = VEX_NAMES[avxOpcode];
+      if (!avxName && avxOpcode !== 0x77) {
+        // Length is right, name unknown. Report the opcode rather than guess.
+        return { ...finish(`vex_${avxOpcode.toString(16).padStart(2, '0')}`, []), unknown: true };
+      }
+      return finish(avxOpcode === 0x77 ? 'vzeroupper' : avxName, []);
     }
     case 0x90: return finish('nop', [], 'nop');
     case 0x98: return finish(operandSize === 64 ? 'cdqe' : operandSize === 16 ? 'cbw' : 'cwde', []);
