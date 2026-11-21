@@ -733,7 +733,13 @@ function decodeTwoByte(
     // the reader can look it up.
     const THREE_BYTE_NAMES: Record<number, Record<number, string>> = {
       0x38: { 0xdc: 'aesenc', 0xdd: 'aesenclast', 0xde: 'aesdec', 0xdf: 'aesdeclast', 0xdb: 'aesimc' },
-      0x3a: { 0x22: 'pinsrd', 0x44: 'pclmulqdq', 0x60: 'pcmpestrm', 0xdf: 'aeskeygenassist' },
+      0x3a: {
+        0x22: 'pinsrd', 0x44: 'pclmulqdq', 0x60: 'pcmpestrm', 0xdf: 'aeskeygenassist',
+        // The string compares and the byte-shuffle with an explicit mask, all of
+        // which Go's SIMD paths reach through the compiler's own intrinsics.
+        0x61: 'pcmpistri', 0x62: 'pcmpistrm', 0x63: 'pcmpistrmi',
+        0x0f: 'palignr', 0x0c: 'blendps', 0x0d: 'blendpd',
+      },
     };
     const name = THREE_BYTE_NAMES[second]?.[third] ?? `0f${second.toString(16)} ${third.toString(16)}`;
     return finish(name, []);
