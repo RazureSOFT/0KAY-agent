@@ -168,7 +168,7 @@ function isNamedReg(operand: Operand | undefined, name: string): boolean {
 }
 
 interface PendingCondition {
-  op: 'cmp' | 'test';
+  op: 'cmp' | 'test' | 'float';
   left: Expr;
   right: Expr;
 }
@@ -203,6 +203,19 @@ function conditionFrom(mnemonic: string, pending: PendingCondition | null): Expr
     if (spec.op === '==') return { t: 'bin', op: '==', left: subject, right: constExpr(0, left.size), size: 1 };
     if (spec.op === '!=') return { t: 'bin', op: '!=', left: subject, right: constExpr(0, left.size), size: 1 };
     return { t: 'bin', op: spec.op, left: subject, right: constExpr(0, left.size), size: 1 };
+  }
+  if (pending.op === 'float') {
+    // A pair of flags read from one float compare: Go tests ZF first (`jne`/`je`) and
+    // PF second (`jnp`/`jp`), and the second read only rules out the unordered case,
+    // so the condition is the first comparison.
+    if (mnemonic === 'jnp' || mnemonic === 'jp') return { t: 'const', v: 1, size: 1 };
+    // The operands are vector registers, which this IR does not track. Naming them
+    // directly (`xmm1 == xmm0`) invented variables that nothing assigns — the one
+    // output shape that reads as a bug in the *listing* rather than a limit of the
+    // analysis. A float comparison is stated as such instead, with the operand order
+    // preserved so the reader can line it up with the disassembly.
+    const describe = (e: Expr): string => (e.t === 'reg' ? e.name : 'value');
+    return { t: 'unknown', text: `float compare ${describe(left)} ${spec.op} ${describe(right)}`, size: 1 };
   }
   if (spec.zero) {
     return { t: 'bin', op: spec.op, left, right: constExpr(0, left.size), size: 1 };
@@ -355,7 +368,25 @@ const VECTOR_ONLY = new Set([
   'psadbw', 'paddd', 'psubd', 'andps', 'andnps', 'orps', 'xorps',
   'addps', 'mulps', 'subps', 'divps', 'sqrtps', 'rsqrtps', 'rcpps', 'minps', 'maxps',
   'cvtps2pd', 'cvtdq2ps', 'cvttpd2dq', 'vzeroupper', 'vzeroall',
+  // The VEX-encoded forms. Every one of them is a vector operation, and listing them
+  // by hand meant the list drifted out of step with the decoder's own name table:
+  // `vmovdqa` was in one and not the other, so 30 statements printed as unexplained
+  // through 2000 functions. Matching the `v` prefix keeps the two in step — it is
+  // the AVX family, and nothing else in this decoder starts with `v` except the
+  // opcode-form fallbacks, which are handled separately.
 ]);
+
+/** Is this mnemonic a vector operation this IR does not model? */
+function isVectorOnly(mnemonic: string): boolean {
+  if (VECTOR_ONLY.has(mnemonic)) return true;
+  // `vex_6f` and friends: the decoder could not name the instruction behind a VEX
+  // prefix. It still moves 128 bits through registers this IR does not track.
+  if (mnemonic.startsWith('vex_')) return true;
+  if (mnemonic.startsWith('evex_')) return true;
+  // Every named AVX instruction begins with `v`; no general-purpose x86 mnemonic
+  // does.
+  return mnemonic.length > 1 && mnemonic[0] === 'v';
+}
 
 export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame): LiftedBlock[] {
   const byStart = new Map<number, BasicBlock>();
@@ -434,6 +465,14 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       const [a, b] = ins.operands;
       if (m === 'cmp' || m === 'test') {
         pending = { op: m === 'cmp' ? 'cmp' : 'test', left: operandExpr(a, ins, frame), right: operandExpr(b, ins, frame) };
+        continue;
+      }
+      // The scalar float compares. `ucomiss`/`comiss` set ZF, PF and CF together, and
+      // Go's compiler reads them in pairs: `jne` then `jnp` is "not equal and not
+      // unordered", i.e. `!=` on the two values. Without this the pair printed as
+      // `if (!(0))` with a jump the reader could not follow.
+      if (m === 'ucomiss' || m === 'comiss' || m === 'ucomisd' || m === 'comisd') {
+        pending = { op: 'float', left: operandExpr(a, ins, frame), right: operandExpr(b, ins, frame) };
         continue;
       }
       // Track the stack pointer: push/pop and the prologue's `sub rsp` change what
@@ -554,7 +593,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       // whose operand shapes this decoder does not model — are stepping stones for
       // the vector unit alone. They carry no integer value this IR tracks, so they
       // are passed over rather than reported as something not understood.
-      if (VECTOR_ONLY.has(m)) continue;
+      if (isVectorOnly(m)) continue;
       // Atomics. `cmpxchg` compares the destination against rax and swaps on a
       // match; `xadd` exchanges and adds. Both say something about the value, so
       // they are recorded as a store with the exchange stated — dropping them
