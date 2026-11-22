@@ -548,18 +548,21 @@ function countNodes(nodes: CtrlStmt[]): number {
 }
 
 /**
- * Drop a `goto` that names the same label as the `goto` immediately before it.
+ * Drop a `goto` that names the same label as the `goto` immediately before it, and a
+ * label written twice in a row.
  *
  * Two writers can put the same jump side by side — an arm's own exit and the epilogue's
- * — and one of them is always noise. Only adjacent, and only across labels and notes
- * that carry nothing: a statement in between means control really does reach the jump
- * twice.
+ * — and one of them is always noise. A label written twice is worse than noise: C
+ * rejects the file, `C2045: 'L_14000e680': label redefined`, and 2 of 500 functions had
+ * it. Only adjacent, and only across labels and notes that carry nothing: a statement in
+ * between means control really does reach the jump twice.
  */
 function dropRepeatedJumps(nodes: CtrlStmt[]): CtrlStmt[] {
   const out: CtrlStmt[] = [];
   for (const node of nodes) {
     const previous = out[out.length - 1];
     if (node.t === 'goto' && previous?.t === 'goto' && previous.label === node.label) continue;
+    if (node.t === 'label' && previous?.t === 'label' && previous.name === node.name) continue;
     if (node.t === 'if') {
       out.push({ t: 'if', cond: node.cond, then: dropRepeatedJumps(node.then), ...(node.else ? { else: dropRepeatedJumps(node.else) } : {}) });
     } else if (node.t === 'while' || node.t === 'do') {

@@ -76,6 +76,7 @@ const fails: Record<string, Failure[]> = {
   undeclaredType: [],
   emptyLoop: [],
   repeatedGoto: [],
+  repeatedLabel: [],
   fallsOffEnd: [],
 }
 let functions = 0
@@ -119,6 +120,14 @@ for (const fn of named.slice(0, LIMIT)) {
   if (repeated) {
     fails.repeatedGoto.push({ name: fn.name, detail: repeated[1] })
   }
+
+  // 0c. The same label written twice. C rejects the file — `C2045: 'L_x': label
+  //     redefined` — and 2 of 500 functions had it, from a loop header emitted on both
+  //     the walk and the orphan pass.
+  const labelCounts = new Map<string, number>()
+  for (const m of c.matchAll(/^\s*(L_[0-9a-f]+):/gm)) labelCounts.set(m[1], (labelCounts.get(m[1]) ?? 0) + 1)
+  const doubledLabels = [...labelCounts].filter(([, n]) => n > 1).map(([name]) => name)
+  if (doubledLabels.length) fails.repeatedLabel.push({ name: fn.name, detail: doubledLabels.slice(0, 3).join(', ') })
 
   // 1. An empty pair of braces is an empty block. A body of comments is not empty:
   //    `ud2` and `int 3` are written up and say what the function does.
@@ -310,7 +319,7 @@ function stripComments(source: string): string {
 
 const order = [
   'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'duplicateDeclaration',
-  'undeclaredType', 'emptyLoop', 'repeatedGoto', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
+  'undeclaredType', 'emptyLoop', 'repeatedGoto', 'repeatedLabel', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
   'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)

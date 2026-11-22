@@ -51,9 +51,22 @@ export function typeOfExpr(expr: Expr): CType {
   }
 }
 
-/** Widen a parameter that the body dereferences into a pointer. */
+/**
+ * The type a parameter gets.
+ *
+ * Arithmetic, always — never a pointer. A parameter that the body dereferences also gets
+ * multiplied, masked and subtracted somewhere else in the same function: `arg0` is read
+ * as `*(long *)(rsp + arg0 * 8 + 0x20)` and returned as `arg0 & 1`. There is no single
+ * pointer type that allows both, and `cl` rejects each one it is given —
+ * `C2296: '*': not valid as left operand has type 'RegArgs *'`,
+ * `C2171: operator '-' cannot be applied to an operand of type 'char *'`.
+ *
+ * The evidence that a value is a pointer is still worth reporting; it goes in the
+ * function's header comment, where it costs nothing. This is the one place the listing
+ * trades a little readability for a file that compiles.
+ */
 export function refineParam(type: CType, usedAsAddress: boolean): CType {
-  if (usedAsAddress) return 'void *';
+  void usedAsAddress;
   return type;
 }
 

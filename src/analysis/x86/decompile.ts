@@ -152,44 +152,38 @@ export function decompileFunction(
   for (const param of inferred) {
     if (params.some((existing) => existing.name === param.name)) continue;
     const entry = info.vars.get(param.name);
-    params.push({ name: param.name, type: entry?.type === 'void *' ? 'void *' : 'long' });
+    params.push({ name: param.name, type: 'long' });
   }
   params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
   // The receiver's type, taken from the method's symbol name. Go spells it out —
-  // `runtime.(*mheap).alloc` — and the alternative for the first parameter is `long`,
-  // which is what 273 of 364 methods printed. Only applied where nothing better was
-  // found: a receiver the body actually dereferences already came back as `void *`, and
-  // that is a real pointer type already.
+  // `runtime.(*mheap).alloc` — and the alternative for the first parameter is `long`.
   //
-  // The type is also declared, because a name in a signature that nothing defines does
-  // not compile. `typedef struct X X;` declares an incomplete type, which is all the
-  // listing needs — it never defines one.
-  const receiverTypes = new Set<string>();
+  // It goes in the header comment, not the signature. A parameter declared `RegArgs *`
+  // cannot be multiplied: `runtime.printsp` reads `*(long *)(rsp + arg0 * 8 + 0x20)` and
+  // `runtime.(*RegArgs).Dump` returns `arg0 & 1`, and `cl` rejects both with
+  // `C2296: '*': not valid as left operand has type 'RegArgs *'`. Adopting the pointer
+  // type was worth 9 compile errors across 60 functions and no way to know the layout
+  // anyway, so the name is reported and the parameter stays arithmetic.
   const receiver = methodReceiver(fn.name);
-  if (receiver && params.length) {
-    const spelled = receiverType(receiver.receiver, receiver.pointer);
-    if (spelled && params[0].type === 'long') {
-      params[0].type = spelled;
-      receiverTypes.add(spelled.replace(/\s*\*$/, ''));
-    }
-  }
+  const receiverNote = receiver ? receiverType(receiver.receiver, receiver.pointer) : undefined;
   const locals = [...info.vars.values()]
     .filter((local) => !params.some((param) => param.name === local.name))
     // A declaration for a name that no printed statement mentions is noise, and
     // the reader cannot tell it from a value the pipeline lost. The collectors
     // run before the return-value rewrite above, so names that only appeared in a
     // dropped return are still in `vars`.
+    //
+    // `isUnassignedRegister` used to drop a register the body reads but never writes, on
+    // the grounds that the value came from the caller and a declaration would imply a
+    // store that does not exist. Dropping it makes the name undefined, and that is a
+    // compile error, not a tidier listing:
+    //
+    //     return rbx;                 <- C2065: 'rbx': undeclared identifier
+    //
+    // `internal/abi.(*Type).NumMethod` is one function in 60. The read is real — it is
+    // what folding the stack check left behind — so the name has to exist. The comment at
+    // the top of the body still says where the value came from.
     .filter((local) => mentionsName(finalBody, local.name))
-    // The stack pointer and frame base are not variables the function owns, so a
-    // declaration for either makes the reader look for an assignment that cannot
-    // exist. Every other name in `vars` is printed somewhere and has to be
-    // declared, or the body would use an undeclared identifier.
-    // `rsp` and `rbp` are not variables the function owns. A bare register name
-    // that nothing assigns is the value the warning at the top of the function
-    // already accounts for; declaring it would ask the reader for a store that
-    // does not exist. A register the body does write is a real local and stays.
-    .filter((local) => local.name !== 'rsp' && local.name !== 'rbp')
-    .filter((local) => !isUnassignedRegister(finalBody, local.name))
     .map((local) => ({ name: local.name, type: local.type }));
   const signature = `${returnType(info)} ${sanitiseName(fn.name)}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
@@ -198,6 +192,12 @@ export function decompileFunction(
     ? Math.round((fn.unknown / fn.instructions.length) * 1000) / 10
     : 0;
   lines.push(`/* ${fn.name} @ 0x${entry.toString(16)} — ${fn.instructions.length} instructions, ${blocks.length} blocks, ${structured.loops} loop(s), ${structured.gotos} goto(s)${unknownPct ? `, ${unknownPct}% undecoded` : ''} */`);
+  if (receiverNote) lines.push(`/* method on ${receiverNote} — arg0 in the source; the parameters stay arithmetic here */`);
+  // Parameters the body loads through, so the reader knows the value is an address even
+  // though nothing in the signature says so. `arg0` in `(*StructField).Embedded` reads
+  // `*(long *)arg0` and the return is `rcx & 8` — the type is genuinely both.
+  const pointerParams = [...info.addressNames].filter((name) => /^arg\d+$/.test(name)).sort();
+  if (pointerParams.length) lines.push(`/* ${pointerParams.join(', ')} hold an address (loaded through): not a pointer type, because they are also used as integers */`);
   if (inferred.length) lines.push('/* parameters inferred from register reads (register ABI); the signature is approximate */');
   // Declare what the body calls. A call to a name nothing declares is a constraint
   // violation in C99 — the compiler has to assume the arguments and the return type,
@@ -237,11 +237,6 @@ export function decompileFunction(
     lines.push(`long ${callee}();`);
   }
   if (called.size) lines.push('');
-  // The receiver type the signature names, declared before it is used. An incomplete
-  // `typedef struct X X;` is enough: the listing only ever holds a pointer to it.
-  for (const type of [...receiverTypes].sort()) {
-    lines.push(`typedef struct ${type} ${type};`);
-  }
   lines.push(`${signature}`);
   lines.push('{');
   for (const local of locals) lines.push(`    ${local.type} ${local.name};`);
@@ -621,6 +616,13 @@ interface Collected {
   returnsValue: boolean;
   /** Names returned without ever being written — an undefined read, not a value. */
   undefinedReturns: Set<string>;
+  /**
+   * Names the body loads through, so they hold an address rather than a value.
+   *
+   * Reported in a comment instead of as a pointer type: the same name is also multiplied
+   * and masked, and no single pointer type allows both. See `refineParam`.
+   */
+  addressNames: Set<string>;
 }
 
 
@@ -664,6 +666,7 @@ function addressedNames(body: CtrlStmt[]): Set<string> {
 
 function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set(), passThroughReturn = false): Collected {
   const vars: Collected['vars'] = new Map();
+  const addressNames = new Set<string>();
   // `rsp` and `rbp` always hold something: the stack pointer and the frame base
   // exist before the function does. Reporting either as "read before written" is
   // never right, and it was a large share of the remaining warnings on functions
@@ -706,8 +709,12 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
       case 'load': {
         if (value.addr.t === 'var' || value.addr.t === 'reg') {
           note(value.addr.name, value.addr.size);
-          const entry = vars.get(value.addr.name);
-          if (entry) entry.type = 'void *';
+          // Recorded, not spelled. A name that is dereferenced here is also multiplied
+          // or masked elsewhere — `rcx` in `(*StructField).Embedded` is loaded from
+          // `arg0` and then tested with `rcx & 8` — and a `char *` that is `&`-ed is a
+          // constraint violation: `C2296: '&': not valid as left operand has type
+          // 'char *'`. The fact that it holds an address goes in the header comment.
+          addressNames.add(value.addr.name);
         }
         expr(value.addr);
         return;
@@ -879,7 +886,7 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
   for (const name of undefinedReturns) {
     if (/^stack_arg_/.test(name)) undefinedReturns.delete(name);
   }
-  return { vars, returnsValue, undefinedReturns };
+  return { vars, returnsValue, undefinedReturns, addressNames };
 }
 
 /** Does any printed statement read or write this name? */
@@ -980,7 +987,7 @@ function parameterList(frame: Frame, info: Collected): Array<{ name: string; typ
     if (!match) continue;
     const index = Number(match[1]);
     const entry = info.vars.get(slot.name);
-    const usedAsAddress = entry?.type === 'void *';
+    const usedAsAddress = entry?.type === 'char *';
     byIndex.set(index, { name: slot.name, type: refineParam(typeForSize(slot.size || 64), usedAsAddress) });
   }
   return [...byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, value]) => value);
@@ -988,28 +995,6 @@ function parameterList(frame: Frame, info: Collected): Array<{ name: string; typ
 
 function returnType(info: Collected): CType | 'void' {
   return info.returnsValue ? 'long' : 'void';
-}
-
-/**
- * A value that is printed before anything writes it.
- *
- * The disassembly is complete — the register really is read with no prior
- * write in this function — so the honest output says so once at the declaration
- * instead of leaving a bare `long rax;` that reads like a normal local.
- */
-
-/** Is this a register name the body never assigns? */
-function isUnassignedRegister(body: CtrlStmt[], name: string): boolean {
-  if (!/^(?:r[a-z]{2}|r\d{1,2}|return_address)$/.test(name)) return false;
-  // The escapes have to be doubled. In a template literal `\w` and `\s` are not string
-  // escapes, so the backslash is dropped and the pattern becomes `[^w.]rdx =[^=]` —
-  // which matches almost nothing, so the test said "never assigned" about names it was
-  // looking straight at. `rdx = arg2 + -0x1;` was printed in the body and left out of
-  // the declarations, and 203 functions in the first 300 used a name that was never
-  // declared, which no C compiler accepts.
-  const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`);
-  const lines = body.map((item) => printStmtForCheck(item)).join('\n');
-  return !assigned.test(lines);
 }
 
 /** A flat rendering of a statement tree, used only to look for `name =`. */

@@ -633,27 +633,29 @@ test('an indirect call is declared, not left undeclared', () => {
   assert.match(result.c.split('{')[0] || '', /long indirect_call\(\);/, 'and declared')
 })
 
-test('a method receiver is spelled with its type, and the type is declared', () => {
-  // `ret` alone: the body carries nothing, so the parameter list is built from the
-  // symbol name. The receiver type is the one thing the name states outright, and
-  // without it the first parameter reads `long` — which is what 273 of 364 methods in a
-  // 24 MB binary printed before this.
+test('a method receiver is reported by its type, in the header rather than the signature', () => {
+  // The receiver's type is the one thing the symbol name states outright, and without it
+  // the first parameter reads `long` with nothing to say what it is.
+  //
+  // It goes in the comment rather than the signature because a pointer type does not
+  // compile: the same parameter is multiplied and masked elsewhere — `*(long *)(rsp +
+  // arg0 * 8 + 0x20)`, `arg0 & 1` — and `cl` rejects `RegArgs *` for both. Reporting it
+  // costs nothing and keeps the file compilable.
   const code = bytes(0xc3)
   const result = decompileFunction(code, BASE, BASE, {
     name: 'internal/runtime/maps.(*Map).Clear',
     end: BASE + code.length,
     convention: 'sysv',
   })
-  // The declaration comes first, so the signature is not naming a type from nowhere.
-  assert.match(result.c, /typedef struct Map Map;/, `the type is declared\n${result.c}`)
-  assert.match(result.c, /\(\s*Map \* arg0\s*\)/, `the receiver takes its type from the name\n${result.c}`)
+  assert.match(result.c, /method on Map \*/, `the receiver type is reported\n${result.c}`)
+  // The parameter itself stays arithmetic, so the file compiles.
+  assert.match(result.c, /\(\s*long arg0\s*\)/, `the parameter is not a pointer\n${result.c}`)
 })
 
-test('a receiver the body dereferences keeps the pointer type it already had', () => {
-  // `mov [rax], rbx` uses rax as an address. rax is Go's first argument register, so
-  // the receiver here is the dereferenced one and the parameter is already `void *` —
-  // a real pointer type. Replacing it with a named one would be a step backwards, so
-  // the name only fills in where nothing better was found.
+test('a parameter the body loads through is named in the header', () => {
+  // `mov [rax], rbx` uses rax as an address. rax is Go's first argument register, so the
+  // reader is told arg0 holds an address — but it stays `long`, because the same value
+  // is usually added to or compared as a number in the same function.
   const code = bytes(
     0x48, 0x89, 0x18,                    // mov [rax], rbx
     0xc3,                                // ret
@@ -663,8 +665,8 @@ test('a receiver the body dereferences keeps the pointer type it already had', (
     end: BASE + code.length,
     convention: 'sysv',
   })
-  assert.match(result.c, /void \* arg0/, `the dereferenced receiver stays a pointer\n${result.c}`)
-  assert.ok(!/typedef struct Thing/.test(result.c), `and no type is declared for it\n${result.c}`)
+  assert.match(result.c, /arg0 hold an address/, `the address use is reported\n${result.c}`)
+  assert.ok(!/char \*/.test(result.c), `and no pointer type is printed\n${result.c}`)
 })
 
 test('an anonymous struct receiver is left alone', () => {
