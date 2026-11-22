@@ -322,13 +322,39 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
 
   const body = emitRange(entry, null);
   const orphans = order.filter((start) => !emitted.has(start));
-  // Anything unreachable is still shown, after a label, rather than dropped.
+  // Anything control flow did not reach is still shown, after a label, rather than
+  // dropped — the panic paths and alignment padding of a Go function sit in its address
+  // range with nothing branching into them, and a listing that hides them reads as if
+  // the function were smaller than it is.
+  //
+  // The terminator is honoured, and a `fallthrough` continues at the next surviving
+  // block, because emitting the block alone left every orphan that *falls through*
+  // stopping dead at its own last statement: `runtime.mapassign_fast32` printed
+  // `rax = r9 + arg2;` and closed the body there, the block that continues to the shared
+  // epilogue having been appended as an orphan whose fall-through was never followed.
+  //
+  // Walking these through `emitRange` instead was wrong: an orphan's `jmp` can point
+  // back at a block the main walk already printed, and the loop machinery turned that
+  // into `while (1) { }` — an empty loop in `gcWriteBarrier` that had not been there.
+  // One block at a time, with an explicit jump, keeps the shape and stays out of the
+  // loop finder.
   for (const start of orphans) {
+    if (emitted.has(start)) continue;
     const block = byStart.get(start);
     if (!block) continue;
     body.push({ t: 'label', name: labelOf(start) }, ...block.stmts);
-    if (block.term === 'jmp' && block.target != null) body.push({ t: 'goto', label: labelOf(block.target) });
     emitted.add(start);
+    if (block.term === 'jmp' && block.target != null) {
+      body.push({ t: 'goto', label: labelOf(block.target) });
+    } else if (block.term === 'fallthrough') {
+      const next = nextBlock(block, byStart, order);
+      // Only when the next block was printed already: an orphan that is itself still
+      // pending will be appended with its own label, and a jump to a label that has not
+      // been written yet lands nowhere.
+      if (next != null && next !== block.start && emitted.has(next)) {
+        body.push({ t: 'goto', label: labelOf(next) });
+      }
+    }
   }
   const gotos2 = pruneLabels(body);
   void depth;

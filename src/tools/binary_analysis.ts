@@ -14,6 +14,7 @@ import { success, failure } from './helpers.js';
 import { parseImage, executableSections, sectionNamed, vaddrToOffset } from '../analysis/x86/image.js';
 import type { Section } from '../analysis/x86/image.js';
 import { parsePclntab, findPclntab } from '../analysis/x86/pclntab.js';
+import { sanitiseName } from '../analysis/x86/ir.js';
 import { parseSymbols, functionAt } from '../analysis/x86/symbols.js';
 import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
@@ -335,18 +336,28 @@ export class BinaryAnalysisTool extends Tool {
 const NO_RETURN_SUFFIXES = [
   'runtime.gopanic', 'runtime.panicindex', 'panicslice', 'panicdivide',
   'panicoverflow', 'panicshift', 'panicmem', 'panicunsupported',
+  // `panicbounds` was missing from the list, so a body ending on
+  // `rax = runtime_panicBounds();` read as a function that runs off its end.
+  'panicbounds',
   'runtime.throw', 'runtime.fatal', 'runtime.goexit', 'runtime.exit',
   'runtime.morestack', 'morestack_noctxt', 'runtime.sigpanic',
   'runtime.panicdottype', 'runtime.panicnil', 'runtime.unsafe', 'abort',
 ];
 
-function collectNoReturnTargets(functions: Array<{ name: string; entry: number }>): Set<string> {
+export function collectNoReturnTargets(functions: Array<{ name: string; entry: number }>): Set<string> {
   const targets = new Set<string>();
   for (const fn of functions) {
     const name = fn.name.toLowerCase();
     if (!NO_RETURN_SUFFIXES.some((suffix) => name.includes(suffix.toLowerCase()))) continue;
-    // The IR names a call after its target address, so that is what a block
-    // compares against.
+    // The IR carries the callee's printed name, which is the symbol name run through
+    // `sanitiseName` — `runtime.gopanic` prints as `runtime_gopanic`. Adding only the
+    // `sub_<address>` spelling meant this set matched nothing once calls started
+    // printing names instead of addresses, and every panic path stopped being folded:
+    // 14 of 800 functions ended on `rax = runtime_panicBounds();` with no return.
+    //
+    // The address spelling stays as well, for any path that still names a call by
+    // address rather than by symbol.
+    targets.add(sanitiseName(fn.name));
     targets.add(`sub_${(fn.entry >>> 0).toString(16)}`);
   }
   return targets;

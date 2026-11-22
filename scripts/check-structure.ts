@@ -13,6 +13,7 @@ import * as fs from 'node:fs/promises'
 import { parseImage, executableSections, vaddrToOffset } from '../src/analysis/x86/image.js'
 import { findPclntab } from '../src/analysis/x86/pclntab.js'
 import { decompileFunction } from '../src/analysis/x86/decompile.js'
+import { collectNoReturnTargets } from '../src/tools/binary_analysis.js'
 
 // Usage: npm run check:structure -- <binary> [function-limit]
 // Environment overrides exist for convenience; the arguments are what the script
@@ -52,6 +53,11 @@ const readU64At = (address: number): number | null => {
   return Number(value)
 }
 const isCode = (address: number): boolean => codeRanges.some(([from, to]) => address >= from && address < to)
+// The same panic-path set the tool passes in. A call that never returns ends its path,
+// and without this the checker reads the code after it as reachable and reports a
+// function that ends on `rax = runtime_panicBounds();` — 14 of 800, all of them the
+// checker disagreeing with the tool rather than a defect in the listing.
+const noReturnCalls = collectNoReturnTargets(entries)
 
 interface Failure { name: string; detail: string }
 const fails: Record<string, Failure[]> = {
@@ -83,6 +89,7 @@ for (const fn of named.slice(0, LIMIT)) {
       names,
       readU64At,
       isCode,
+      ...(noReturnCalls.size ? { noReturnCalls } : {}),
     })
   } catch (error) {
     fails.braceImbalance.push({ name: fn.name, detail: `threw: ${(error as Error).message}` })
@@ -244,7 +251,14 @@ for (const fn of named.slice(0, LIMIT)) {
     // `continue` or `goto` leaves the block, and a `}` closes one, so none of them is a
     // fall-through. A `switch` printed before the final `return` put `break;` last and
     // reported 48 functions that do return.
-    if (lastLine && !/^(return|goto|break|continue|\}|\{|else)\b/.test(lastLine.trim()) && !/^\}/.test(lastLine.trim())) {
+    //
+    // A call that never returns ends the path just as surely: nothing follows
+    // `runtime_gopanic()`, so a body ending on it is complete. Go's panic helpers are
+    // collected by name, and a `cgocallbackg` that ends on `rax = runtime_gopanic();`
+    // is the last statement of the function, not a missing return.
+    const lastCall = /\b([A-Za-z_]\w*)\([^()]*\);\s*$/.exec(lastLine.trim())
+    const endsInNoReturn = lastCall != null && noReturnCalls.has(lastCall[1])
+    if (lastLine && !endsInNoReturn && !/^(return|goto|break|continue|\}|\{|else)\b/.test(lastLine.trim()) && !/^\}/.test(lastLine.trim())) {
       fails.fallsOffEnd.push({ name: fn.name, detail: lastLine.trim().slice(0, 50) })
     }
   }
