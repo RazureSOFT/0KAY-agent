@@ -1,11 +1,16 @@
 /**
- * Self-contained binary analysis. No external decompiler is involved: the
- * container is parsed here, Go's function table supplies real entry points
- * when present, and disassembly follows control flow from those entries.
+ * Binary analysis. The container is parsed here, Go's function table supplies real entry
+ * points when present, and disassembly follows control flow from those entries — none of
+ * that needs anything installed.
  *
- * The tool always says which source of entry points it used. Reporting a
- * linear sweep from the image entry as if it were a function list would be a
- * fabricated result.
+ * `action=external` is the one exception: it asks a separately installed decompiler for a
+ * second opinion on a function, and says so. It is worth having because that one reads
+ * debug information more completely than this tree does — it produced a seven-parameter
+ * signature where this side has `long arg0` — and it is worth *not* depending on, because
+ * it needs a JVM, an install, and twelve minutes of auto-analysis on first use.
+ *
+ * The tool always says which source of entry points it used. Reporting a linear sweep from
+ * the image entry as if it were a function list would be a fabricated result.
  */
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -20,6 +25,7 @@ import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
 import { uniqueNames } from './unique_names.js';
 import { parseDwarf, signatureAt } from '../analysis/x86/dwarf.js';
+import { findGhidra, decompileWithGhidra } from '../analysis/x86/ghidra.js';
 import { buildCfg, cfgSummary } from '../analysis/x86/cfg.js';
 import { toPseudoC } from '../analysis/x86/pseudoc.js';
 import { decompileFunction } from '../analysis/x86/decompile.js';
@@ -149,12 +155,13 @@ export class BinaryAnalysisTool extends Tool {
       'action=summary reports the container, executable sections and how function entry points were found.',
       'action=functions lists real function entries from the Go function table or the linker symbol table; action=disasm disassembles one function by following control flow from its entry; action=cfg returns basic blocks and edges; action=pseudoc renders a reading aid.',
       'action=decompile prints the function as C: named stack slots and arguments, folded conditions, structured if/while/do, and an unknown comment for anything it cannot express. action=xref reports callers, callees and data references.',
+      'action=external asks a separately installed decompiler for a second opinion on one function and returns its C verbatim. It is the only action that needs anything installed: it reads debug information more completely than the built-in reader, so its signatures name parameters and types where action=decompile prints long arg0, and it mis-reads Go stack checks as loops where action=decompile folds them. Use it when the signature matters more than the control flow, or to check the built-in output.',
       'Select a function with functionName or address (decimal or 0x hex). Every result states which entry-point source was used; without one only the image entry is walked.',
     ].join(' ');
   }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action', 'path'], properties: {
-      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc', 'decompile', 'xref'] },
+      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc', 'decompile', 'xref', 'external'] },
       path: { type: 'string', description: 'Binary to inspect, absolute or workspace-relative.' },
       functionName: { type: 'string', description: 'Substring of a function name.' },
       address: { type: 'string', description: 'Hex (0x...) or decimal virtual address.' },
@@ -266,6 +273,28 @@ export class BinaryAnalysisTool extends Tool {
           });
           payload = { ...base, ...decompiled };
           text = decompiled.c;
+          break;
+        }
+        case 'external': {
+          const fn = pickFunction(loaded, args);
+          const section = codeSection(loaded.image, fn.entry || loaded.textStart);
+          if (!section) return failure('no executable section was found in this image');
+          const location = await findGhidra(process.env.OKAY_EXTERNAL_DECOMPILER);
+          if (!location) {
+            // Not an error: the built-in path is the default and nothing here requires the
+            // install. Saying which directory was searched is what lets the caller fix it.
+            return failure('no external decompiler install was found; set OKAY_EXTERNAL_DECOMPILER to its directory');
+          }
+          const source = await decompileWithGhidra({
+            location,
+            binary: target,
+            address: fn.entry || section.vaddr,
+            projectRoot: process.env.OKAY_EXTERNAL_PROJECT ?? path.join(path.dirname(target), '.external-project'),
+            timeoutMs: Number(args.timeoutSeconds || 1800) * 1000,
+          });
+          if (!source) return failure(`the external decompiler produced nothing for ${fn.name} at 0x${fn.entry.toString(16)}`);
+          payload = { ...base, function: fn.name, entry: `0x${fn.entry.toString(16)}`, external: source };
+          text = source;
           break;
         }
         case 'xref': {
