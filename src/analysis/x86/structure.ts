@@ -183,7 +183,19 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
 
       if (block.term === 'jmp') {
         const target = block.target ?? null;
-        if (target == null) break;
+        // A jump through a register — Go finishes an interface-method wrapper with
+        // `jmp rcx`, the itab entry. There is no address to follow, but saying nothing
+        // left the listing with no exit: `(*cancelCtx).Deadline` ended on
+        // `rcx = *(long *)(rcx + 0x18);` with the tail call nowhere. Only the wrapper
+        // returns nothing itself, so the load that feeds the jump is what the body
+        // computes and the comment says where control went.
+        if (target == null) {
+          if (block.indirect) {
+            out.push({ t: 'note', text: `control leaves through ${block.indirect}` });
+            out.push({ t: 'return', value: { t: 'reg', name: 'rax', size: 64 } });
+          }
+          break;
+        }
         if (target === stop) {
           // This arm ends by jumping to the block the two arms rejoin at. When that
           // block has already been printed — the shared epilogue usually has — the arm
@@ -433,6 +445,18 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     emitted.add(start);
     if (block.term === 'jmp' && block.target != null) {
       body.push({ t: 'goto', label: labelOf(block.target) });
+    } else if (block.term === 'jcc' && block.target != null) {
+      // An orphan ending in a conditional branch stopped dead at its own last statement
+      // and left the listing with no exit: `time.appendNano` ended on
+      // `rdi = (unsigned int)v_17;`. The block is one nothing reaches, so which arm it
+      // would have taken cannot matter — naming the branch target keeps control flow in
+      // the listing, which is the whole reason orphans are shown at all.
+      //
+      // Unless the block it falls into is the next orphan: then the two are printed one
+      // after the other and the jump would cut the fall-through in half, putting
+      // `goto L_x;` in front of a statement that belongs to the arm above it.
+      const next = nextBlock(block, byStart, order);
+      if (next == null || emitted.has(next)) body.push({ t: 'goto', label: labelOf(block.target) });
     } else if (block.term === 'fallthrough') {
       const next = nextBlock(block, byStart, order);
       // Only when the next block was printed already: an orphan that is itself still

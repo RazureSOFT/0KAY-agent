@@ -48,6 +48,15 @@ export interface LiftedBlock {
   cond: Expr | null;
   term: 'jmp' | 'jcc' | 'ret' | 'fallthrough';
   target?: number;
+  /**
+   * The register an indirect `jmp` goes through.
+   *
+   * Set when `target` is absent because the destination is in a register — Go reaches a
+   * method through the itab this way, as the last instruction of a wrapper. Nothing can
+   * be followed from it, but dropping it silently left the listing with no exit at all:
+   * `(*cancelCtx).Deadline` ended on `rcx = *(long *)(rcx + 0x18);`.
+   */
+  indirect?: string;
   /** Instructions decoded in this block (for coverage reporting). */
   instructions: number;
   /** Removed from the structured output (e.g. a stack-growth thunk). */
@@ -439,6 +448,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     let cond: Expr | null = null;
     let term: LiftedBlock['term'] = 'fallthrough';
     let target: number | undefined;
+    let indirect: string | undefined;
     let unknown = 0;
 
     // The offset is measured from where `rsp` sits *after* the prologue, because
@@ -520,6 +530,9 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       if (m === 'jmp') {
         term = 'jmp';
         target = a?.target;
+        // `jmp rcx` — the destination is a value, so there is no address to follow. The
+        // register is kept so the listing can say where control went instead of stopping.
+        if (target == null && a?.kind === 'reg' && a.reg) indirect = registerBase(a.reg);
         continue;
       }
       if (m.startsWith('j') && (JCC[m] || FLAG_JUMPS.has(m))) {
@@ -870,6 +883,7 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       cond,
       term,
       ...(target != null ? { target } : {}),
+      ...(indirect != null ? { indirect } : {}),
       instructions: block.instructions.length,
     });
     void unknown;

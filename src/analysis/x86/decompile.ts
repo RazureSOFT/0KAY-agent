@@ -54,6 +54,19 @@ export interface DecompileOptions {
   readU64At?: (address: number) => number | null;
   /** Whether an address points at code, used to find where a jump table ends. */
   isCode?: (address: number) => boolean;
+  /**
+   * The signature the compiler recorded, when the image carries DWARF for this function.
+   *
+   * This replaces the inferred parameter list outright: the names, the count and the
+   * types are all known, and guessing at them from which registers the body happens to
+   * read is strictly worse. The types are still rendered as C the listing can compile —
+   * a `*runtime.maps.Map` becomes `long` with a comment, because a pointer type cannot
+   * be multiplied and Go's own code does both.
+   */
+  signature?: {
+    params: { name: string; type: string }[];
+    returns?: { name: string; type: string }[];
+  };
 }
 
 export interface DecompiledFunction {
@@ -143,18 +156,53 @@ export function decompileFunction(
       inferred.push({ name: 'arg0', register: 'rax', index: 0 });
     }
   }
+  // DWARF names, applied to the registers the disassembly put in those positions.
+  //
+  // The mapping is positional because that is all the two lists share: `inferred` says
+  // which register holds argument N, and DWARF says what argument N is called. Renaming
+  // here rather than only in the signature is what makes the body agree with the
+  // declaration — `countGeneric` printed `(long b, ...)` above a body still reading
+  // `arg0`, which is not a listing anyone can follow.
+  const dwarfParams = options?.signature?.params ?? [];
+  if (dwarfParams.length) {
+    for (let index = 0; index < inferred.length && index < dwarfParams.length; index += 1) {
+      const name = sanitiseName(dwarfParams[index].name);
+      if (name && !/^arg\d+$/.test(name)) inferred[index].name = name;
+    }
+  }
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
   let finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
 
   const info = collect(finalBody, frame, paramNames, passThroughReturn);
-  const params = parameterList(frame, info);
-  for (const param of inferred) {
-    if (params.some((existing) => existing.name === param.name)) continue;
-    const entry = info.vars.get(param.name);
-    params.push({ name: param.name, type: 'long' });
+  // DWARF wins when it is there. The recorded signature has real names and a real count;
+  // everything below this point infers them from which registers the body reads, which
+  // cannot tell two arguments of the same size apart and cannot see one that is never
+  // read. The types are still flattened to `long` for the reasons in `refineParam` — a
+  // parameter Go multiplies cannot be declared `*Map` — but the names are the compiler's.
+  const fromDwarf = options?.signature?.params ?? [];
+  // The recorded count and the body's own use of `argN` can disagree: this binary has
+  // DWARF for `countGeneric` naming two parameters while the body reads a third. Printing
+  // the two would make `arg2` a local that happens to be read before it is written, so the
+  // longer of the two wins and the extra slots keep their `argN` name.
+  let paramCount = fromDwarf.length;
+  for (const name of info.vars.keys()) {
+    const match = /^arg(\d+)$/.exec(name);
+    if (match) paramCount = Math.max(paramCount, Number(match[1]) + 1);
   }
-  params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
+  const params = fromDwarf.length
+    ? Array.from({ length: paramCount }, (_unused, index) => ({
+      name: index < fromDwarf.length ? sanitiseName(fromDwarf[index].name) : `arg${index}`,
+      type: 'long' as const,
+    }))
+    : parameterList(frame, info);
+  if (!fromDwarf.length) {
+    for (const param of inferred) {
+      if (params.some((existing) => existing.name === param.name)) continue;
+      params.push({ name: param.name, type: 'long' });
+    }
+    params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
+  }
   // Recursive calls get the argument count the signature states. Done here, with the
   // parameters settled, so the count is the one the listing will print.
   finalBody = padSelfCalls(finalBody, sanitiseName(fn.name), params.length);
@@ -200,8 +248,15 @@ export function decompileFunction(
   // though nothing in the signature says so. `arg0` in `(*StructField).Embedded` reads
   // `*(long *)arg0` and the return is `rcx & 8` — the type is genuinely both.
   const pointerParams = [...info.addressNames].filter((name) => /^arg\d+$/.test(name)).sort();
-  if (pointerParams.length) lines.push(`/* ${pointerParams.join(', ')} hold an address (loaded through): not a pointer type, because they are also used as integers */`);
-  if (inferred.length) lines.push('/* parameters inferred from register reads (register ABI); the signature is approximate */');
+  if (pointerParams.length) {
+    const subject = pointerParams.join(', ');
+    const verb = pointerParams.length === 1 ? 'holds' : 'hold';
+    lines.push(`/* ${subject} ${verb} an address (loaded through): not a pointer type, because ${pointerParams.length === 1 ? 'it is' : 'they are'} also used as integers */`);
+  }
+  // Only when it is true. A DWARF signature is recorded by the compiler, not inferred,
+  // and saying otherwise sends the reader looking for the guesswork that is not there.
+  if (inferred.length && !dwarfParams.length) lines.push('/* parameters inferred from register reads (register ABI); the signature is approximate */');
+  if (dwarfParams.length) lines.push(`/* parameters recorded in the debug information (${dwarfParams.length} of them) */`);
   // Declare what the body calls. A call to a name nothing declares is a constraint
   // violation in C99 — the compiler has to assume the arguments and the return type,
   // and most refuse outright. The body calls other functions of the same binary, which
@@ -307,10 +362,17 @@ function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, bySt
   //
   // The walk stops at the first such block. Everything before it is retry-only and is
   // folded as usual; that block and whatever follows stay, because a jump needs them.
+  //
+  // The guard itself does not count. Its branch *is* the first edge of the retry it
+  // feeds, so counting it made every guard look like a second reference to its own
+  // target and nothing was ever folded: `time.appendNano` kept its whole morestack
+  // sequence — save five registers, `call morestack_noctxt`, restore them, `jmp` entry —
+  // and the listing ended on `rdi = (unsigned int)v_17;` with no return.
   const onPath = new Set(path);
   const all = [...byStart.values()];
   const targetsOf = (start: number): boolean => all.some((other) =>
-    !onPath.has(other.start)
+    other.start !== guard.start
+    && !onPath.has(other.start)
     && (other.target === start
       || (other.switch != null
         && (other.switch.cases.some((item) => item.target === start)

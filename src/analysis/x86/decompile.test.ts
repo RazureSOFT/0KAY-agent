@@ -665,7 +665,7 @@ test('a parameter the body loads through is named in the header', () => {
     end: BASE + code.length,
     convention: 'sysv',
   })
-  assert.match(result.c, /arg0 hold an address/, `the address use is reported\n${result.c}`)
+  assert.match(result.c, /arg0 holds an address/, `the address use is reported\n${result.c}`)
   assert.ok(!/char \*/.test(result.c), `and no pointer type is printed\n${result.c}`)
 })
 

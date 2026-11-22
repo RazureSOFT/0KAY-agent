@@ -19,6 +19,7 @@ import { parseSymbols, functionAt } from '../analysis/x86/symbols.js';
 import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
 import { uniqueNames } from './unique_names.js';
+import { parseDwarf, signatureAt } from '../analysis/x86/dwarf.js';
 import { buildCfg, cfgSummary } from '../analysis/x86/cfg.js';
 import { toPseudoC } from '../analysis/x86/pseudoc.js';
 import { decompileFunction } from '../analysis/x86/decompile.js';
@@ -366,7 +367,17 @@ export function collectNoReturnTargets(functions: Array<{ name: string; entry: n
 
 export async function decompileSummary(
   target: string,
-  options: { maxFunctions?: number; functionName?: string; maxInstructions?: number } = {},
+  options: {
+    maxFunctions?: number;
+    functionName?: string;
+    maxInstructions?: number;
+    /**
+     * Skip the DWARF pass. It is on by default: a signature the compiler recorded is
+     * better than one inferred from register reads, and the cost is one decompression of
+     * the debug sections.
+     */
+    dwarf?: boolean;
+  } = {},
 ): Promise<{
   format: string;
   bits: number;
@@ -396,6 +407,15 @@ export async function decompileSummary(
   const budget = options.functionName ? Math.min(picked.length, 8) : 3;
   const decompiled: NonNullable<Awaited<ReturnType<typeof decompileSummary>>['decompiled']> = [];
   const noReturnCalls = collectNoReturnTargets(loaded.functions);
+  // Debug information, when the build kept any. It is the only source of parameter names
+  // and counts — `_func.args` is zero on a release build — and it may cover only part of
+  // the binary, so every use below is conditional.
+  const dwarf = options.dwarf === false
+    ? null
+    : parseDwarf(
+      loaded.image.sections.map((s) => ({ name: s.name ?? '', offset: s.offset, size: s.size })),
+      (offset, size) => loaded.bytes.subarray(offset, offset + size),
+    );
   // Address to name, so a call prints where it goes instead of `sub_40086ee0()`. The
   // list is already in hand — it is where `fn` came from — and names are made unique,
   // because a Go symbol is not: `internal/bytealg.countGeneric` exists once per element
@@ -416,10 +436,12 @@ export async function decompileSummary(
   if (section) {
     for (const fn of picked.slice(0, budget)) {
       try {
+        const signature = dwarf ? signatureAt(dwarf, fn.entry) : undefined;
         const result = decompileFunction(loaded.bytes, imageBase, fn.entry, {
           // The disambiguated name, so a call to this function lands on it rather than on
           // the same-named copy the table lists first.
           name: names.get(fn.entry) ?? fn.name,
+          ...(signature?.params.length ? { signature: { params: signature.params } } : {}),
           end: fn.end > fn.entry ? Math.min(fn.end, section.vaddr + section.size) : section.vaddr + section.size,
           imageFormat: loaded.image.format,
           maxInstructions: options.maxInstructions ?? 2000,
