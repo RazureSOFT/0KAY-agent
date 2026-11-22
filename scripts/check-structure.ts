@@ -74,6 +74,7 @@ const fails: Record<string, Failure[]> = {
   undeclaredCallee: [],
   duplicateDeclaration: [],
   undeclaredType: [],
+  emptyLoop: [],
   fallsOffEnd: [],
 }
 let functions = 0
@@ -99,6 +100,16 @@ for (const fn of named.slice(0, LIMIT)) {
   functions += 1
   instructions += r.instructions
   const c = r.c
+
+  // 0. A `while (1)` with nothing in it is a loop the structure pass could not fill.
+  //    Go's `for {}` is real but always has a body; an empty one means the block that
+  //    belonged inside was dropped, and whatever follows it is unreachable. Zero over a
+  //    24 MB binary, which is what makes it worth asserting — it is the shape a
+  //    regression in the loop walk takes.
+  if (/while \(1\) \{\s*\}/.test(c) || /while \(1\) \{\n\s*\}/.test(c)) {
+    const at = c.search(/while \(1\) \{/)
+    fails.emptyLoop.push({ name: fn.name, detail: `line ${c.slice(0, at).split('\n').length}` })
+  }
 
   // 1. An empty pair of braces is an empty block. A body of comments is not empty:
   //    `ud2` and `int 3` are written up and say what the function does.
@@ -290,7 +301,7 @@ function stripComments(source: string): string {
 
 const order = [
   'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'duplicateDeclaration',
-  'undeclaredType', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
+  'undeclaredType', 'emptyLoop', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
   'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)

@@ -276,6 +276,17 @@ export function decompileFunction(
 /** Fold the stack-growth retry a guard feeds, if that is where it leads. */
 function foldRetryPath(guard: import('./ir.js').LiftedBlock, entry: number, byStart: Map<number, import('./ir.js').LiftedBlock>): boolean {
   if (guard.term !== 'jcc' || guard.target == null) return false;
+  // The branch has to be the stack check, not just any branch that happens to lead back
+  // to the entry. Go compares the stack pointer against the stack bound —
+  // `cmp rsp, [r14+0x10]`, or `lea r12, [rsp-0x30]; cmp r12, [r14+0x10]` — so the
+  // comparison mentions `rsp` or `r14`. Anything else is an ordinary branch that shares
+  // its tail with the retry.
+  //
+  // `runtime.panicshift` is the case that proved it: `mov rax, [rip+X]; test rax, rax;
+  // je +4` selects between a panic call and the next instruction, and the panic call's
+  // block happens to fall through into morestack and back to the entry. Folding it as a
+  // retry deleted the `gopanic` call and left the function ending on a load.
+  if (!mentionsStackPointer(guard.cond)) return false;
   const path: number[] = [];
   const seen = new Set<number>();
   let current: number | null = guard.target;
@@ -463,6 +474,31 @@ function foldUnreachable(
 }
 
 /** Does this block's last statement call a routine that never returns? */
+/**
+ * Does this condition compare the stack pointer?
+ *
+ * The stack-growth check reads `rsp` (or a register derived from it) and compares it
+ * against the bound held in `r14`. A branch whose condition mentions neither is not the
+ * stack check, whatever it leads to.
+ */
+function mentionsStackPointer(expr: Expr | null | undefined): boolean {
+  if (!expr) return false;
+  switch (expr.t) {
+    case 'reg':
+    case 'var':
+      return expr.name === 'rsp' || expr.name === 'r14';
+    case 'bin':
+      return mentionsStackPointer(expr.left) || mentionsStackPointer(expr.right);
+    case 'un':
+    case 'cast':
+      return mentionsStackPointer(expr.value);
+    case 'load':
+      return mentionsStackPointer(expr.addr);
+    default:
+      return false;
+  }
+}
+
 function endsInNoReturnCall(block: import('./ir.js').LiftedBlock, noReturnCalls: Set<string>): boolean {
   if (!noReturnCalls.size) return false;
   for (let index = block.stmts.length - 1; index >= 0; index -= 1) {
