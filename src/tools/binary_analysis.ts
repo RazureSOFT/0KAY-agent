@@ -433,6 +433,36 @@ export async function decompileSummary(
     return Number(value);
   };
   const isCode = (address: number): boolean => codeRanges.some(([from, to]) => address >= from && address < to);
+  /**
+   * The text at a constant address, when there is text there.
+   *
+   * Go's format tables, error messages and digit strings all live in `.rdata` and are
+   * reached through a constant. `0x140756613` is `"0123456789"` in the binary this was
+   * written against, and printing the literal alone tells the reader nothing.
+   *
+   * A Go string is a pointer and a length with no terminator, so the extent has to be
+   * inferred: take printable bytes up to a limit, and only accept the result when it ends
+   * at something that is not printable. A run that stops at the limit is the middle of
+   * something larger and is left alone — reporting half a string as if it were the whole
+   * one is worse than reporting none.
+   */
+  const MAX_TEXT = 120;
+  const textAt = (address: number): string | null => {
+    const offset = vaddrToOffset(address, loaded.image.sections);
+    if (offset < 0 || offset >= loaded.bytes.length) return null;
+    const printable = (byte: number): boolean => byte >= 0x20 && byte < 0x7f;
+    if (!printable(loaded.bytes[offset])) return null;
+    let end = offset;
+    while (end < loaded.bytes.length && end - offset < MAX_TEXT && printable(loaded.bytes[end])) end += 1;
+    const length = end - offset;
+    if (length < 4) return null;
+    if (end - offset === MAX_TEXT && end < loaded.bytes.length && printable(loaded.bytes[end])) return null;
+    const text = Buffer.from(loaded.bytes.subarray(offset, end)).toString('latin1');
+    // A fragment of code or a pointer table reads as printable often enough to matter;
+    // requiring it to look like words keeps the output from being noise.
+    if (!/[a-zA-Z]{2}/.test(text)) return null;
+    return JSON.stringify(text);
+  };
   if (section) {
     for (const fn of picked.slice(0, budget)) {
       try {
@@ -442,6 +472,7 @@ export async function decompileSummary(
           // the same-named copy the table lists first.
           name: names.get(fn.entry) ?? fn.name,
           ...(signature?.params.length ? { signature: { params: signature.params } } : {}),
+          textAt,
           end: fn.end > fn.entry ? Math.min(fn.end, section.vaddr + section.size) : section.vaddr + section.size,
           imageFormat: loaded.image.format,
           maxInstructions: options.maxInstructions ?? 2000,

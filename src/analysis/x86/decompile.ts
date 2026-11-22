@@ -55,6 +55,14 @@ export interface DecompileOptions {
   /** Whether an address points at code, used to find where a jump table ends. */
   isCode?: (address: number) => boolean;
   /**
+   * The printable text at an address, if that is what is there.
+   *
+   * A constant in the body is usually a global's address, and when it points at a string
+   * the listing can say which one. Go stores a string as pointer and length with no
+   * terminator, so the caller decides the extent — this only reports what it was told.
+   */
+  textAt?: (address: number) => string | null;
+  /**
    * The signature the compiler recorded, when the image carries DWARF for this function.
    *
    * This replaces the inferred parameter list outright: the names, the count and the
@@ -319,7 +327,12 @@ export function decompileFunction(
   const uninitialised = uninitialisedNote(info);
   if (uninitialised) lines.push(`    ${uninitialised}`);
   if (locals.length) lines.push('');
-  for (const stmt of finalBody) lines.push(...printStmt(stmt, 1));
+  rodataText = options?.textAt;
+  try {
+    for (const stmt of finalBody) lines.push(...printStmt(stmt, 1));
+  } finally {
+    rodataText = undefined;
+  }
   lines.push('}');
 
   return {
@@ -1552,12 +1565,30 @@ const PRECEDENCE: Record<string, number> = {
   '&': 35, '^': 30, '|': 25,
 };
 
+/**
+ * What is at a constant address, for the duration of one `decompileFunction` call.
+ *
+ * Threading this through `printExpr` and its twenty call sites as a parameter would touch
+ * every recursive branch for a rendering detail. `decompileFunction` is synchronous and
+ * runs to completion before returning, so a module-level slot cannot be read by a second
+ * call — `trace/decompile` is the only thing that would ever run two at once and it awaits
+ * each one. The slot is cleared in a `finally` for the case where the printer throws.
+ */
+let rodataText: ((address: number) => string | null) | undefined;
+
 function printExpr(expr: Expr, parentPrecedence = 0, asCondition = false): string {
   switch (expr.t) {
     case 'const': {
       const value = expr.v;
       if (value < 0) return `-0x${Math.abs(value).toString(16)}`;
-      return value <= 9 ? String(value) : `0x${value.toString(16)}`;
+      const literal = value <= 9 ? String(value) : `0x${value.toString(16)}`;
+      // A constant large enough to be an address, and one that actually points at text.
+      // Go keeps a string as pointer and length, so the extent comes from the caller.
+      if (value > 0xffff && rodataText) {
+        const text = rodataText(value);
+        if (text) return `${literal} /* ${text} */`;
+      }
+      return literal;
     }
     case 'reg':
     case 'var':

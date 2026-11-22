@@ -81,3 +81,29 @@ test('a name that receives a parameter once is followed, and one reused is not',
   assert.ok(/is dereferenced at[^*]*\+0x20/.test(twice.c), `the second value still has a layout\n${twice.c}`);
   assert.ok(!/rax is dereferenced at[^*]*\+0x20/.test(twice.c), `but it is not attributed to rax\n${twice.c}`);
 });
+
+test('a constant that points at text is labelled with it', () => {
+  // Go reaches its error messages and format tables through a constant. `0x140756613` is
+  // `"0123456789"` in the binary this was written against, and the literal alone tells a
+  // reader nothing.
+  const code = bytes(
+    0x48, 0xb8, 0x00, 0x20, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, // mov rax, 0x140002000
+    0xc3,
+  );
+  const result = decompileFunction(code, BASE, BASE, {
+    end: BASE + code.length,
+    convention: 'sysv',
+    textAt: (address) => (address === 0x140002000 ? JSON.stringify('panic: ') : null),
+  });
+  assert.match(result.c, /0x140002000 \/\* "panic: " \*\//, `the text is named\n${result.c}`);
+});
+
+test('a constant with no text behind it is left as a number', () => {
+  const code = bytes(
+    0x48, 0xb8, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x2000
+    0xc3,
+  );
+  const result = decompileFunction(code, BASE, BASE, { end: BASE + code.length, convention: 'sysv' });
+  assert.match(result.c, /0x2000/, `still the literal\n${result.c}`);
+  assert.ok(!/\/\* "/.test(result.c), `and no invented text\n${result.c}`);
+});
