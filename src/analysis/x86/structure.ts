@@ -451,10 +451,15 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
   // After `pruneLabels`, not before: the repeats sit either side of a label that turns
   // out to be unused, and with the labels still in place the two jumps are not adjacent
   // and nothing is removed.
-  const gotos2 = pruneLabels(body);
+  //
+  // The count comes from the tree that is returned, not from `pruneLabels` — it counted
+  // the jumps before the repeats were dropped, and the header then disagreed with the
+  // listing by 3 in `indexbody`.
+  pruneLabels(body);
   const withoutRepeats = dropRepeatedJumps(body);
+  const jumps = countGotos(withoutRepeats);
   void depth;
-  return { body: withoutRepeats, orphans, loops: loops.length, gotos: gotos2 };
+  return { body: withoutRepeats, orphans, loops: loops.length, gotos: jumps };
 }
 
 
@@ -570,6 +575,21 @@ function dropRepeatedJumps(nodes: CtrlStmt[]): CtrlStmt[] {
     }
   }
   return out;
+}
+
+/** How many jumps the listing will print, counting every nesting level. */
+function countGotos(nodes: CtrlStmt[]): number {
+  let jumps = 0;
+  for (const node of nodes) {
+    if (node.t === 'goto') jumps += 1;
+    else if (node.t === 'if') jumps += countGotos(node.then) + countGotos(node.else ?? []);
+    else if (node.t === 'while' || node.t === 'do') jumps += countGotos(node.body);
+    else if (node.t === 'switch') {
+      for (const entry of node.cases) jumps += countGotos(entry.body);
+      if (node.defaultBody) jumps += countGotos(node.defaultBody);
+    }
+  }
+  return jumps;
 }
 
 function pruneLabels(body: CtrlStmt[]): number {
