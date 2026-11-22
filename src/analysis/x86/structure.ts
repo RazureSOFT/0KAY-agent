@@ -131,6 +131,8 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     const out: CtrlStmt[] = [];
     let current = start;
     let guard = 0;
+    /** The blocks this arm printed, so the exit does not jump to one of its own. */
+    const printedHere = new Set<number>();
     while (current != null && current !== stop && guard++ < order.length * 4) {
       if (emitted.has(current)) {
         // This block was printed on an earlier path, and control reaches it again from
@@ -166,6 +168,7 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       // was never written; labelling the ones that are never jumped to costs nothing
       // because `pruneLabels` takes them out again at the end.
       out.push({ t: 'label', name: labelOf(current) }, ...block.stmts);
+      printedHere.add(current);
 
       if (block.term === 'ret') break;
       if (block.switch) {
@@ -181,7 +184,36 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       if (block.term === 'jmp') {
         const target = block.target ?? null;
         if (target == null) break;
-        if (target === stop) break;
+        if (target === stop) {
+          // This arm ends by jumping to the block the two arms rejoin at. When that
+          // block has already been printed — the shared epilogue usually has — the arm
+          // has to say where it goes instead of stopping dead: `runtime.notesleep`'s
+          // inner branch reached `ret` through a `jmp` and printed nothing after it, so
+          // the function ended on `rbx = stack_arg_16;`.
+          //
+          // A bare `return` is repeated, so the reader sees the exit where it happens.
+          // Anything more is jumped to: repeating statements that clear a flag or bump a
+          // counter would run them twice.
+          const join = byStart.get(stop);
+          if (join && emitted.has(stop)) {
+            if (join.term === 'ret') {
+              const repeated = sharedReturn(stop, null, byStart, emitted);
+              // The shared epilogue is usually more than a bare `return` —
+              // `notesleep`'s clears a flag and bumps a counter first — and repeating
+              // those statements would run them twice. The jump is the only way to reach
+              // them without duplicating work, and it is what the source had.
+              if (repeated.length) out.push(...repeated);
+              else {
+                out.push({ t: 'goto', label: labelOf(stop) });
+                gotos += 1;
+              }
+            } else {
+              out.push({ t: 'goto', label: labelOf(stop) });
+              gotos += 1;
+            }
+          }
+          break;
+        }
         if (dominators.get(current)?.has(target)) {
           // Back edge. If it closes the loop the body is inside, that is `continue`.
           const enclosing = loopStack.find((entry) => entry.header === target);
@@ -231,6 +263,38 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       }
 
       current = next;
+    }
+    // Where the walk stops matters as much as where it goes. Three exits leave this
+    // arm with nothing printed for the block it was heading to, and each one reads as a
+    // lost body rather than an end:
+    //
+    //   - the block was printed on an earlier path: handled above, with a `goto`;
+    //   - the block is the join: reaching it means "continue at the join", and the join
+    //     is printed after this arm, unless a loop got in the way;
+    //   - the walk ran out of blocks or hit its budget: nothing to say.
+    //
+    // The middle case is the one that goes wrong. A loop inside an arm consumes its own
+    // exit block, so by the time the arm ends the join has been printed nowhere and is
+    // never revisited: `runtime.notesleep`'s `if (*(long *)arg1 == 0)` arm printed
+    // `runtime_semasleep();` and stopped, and the function ended on `rbx = stack_arg_16;`
+    // with no return.
+    //
+    // Only a block this arm did *not* print: jumping to the one it just printed is a
+    // jump to itself, which reads as `L_x: goto L_x;`.
+    const exit = current != null && current !== stop && !printedHere.has(current) ? current : null;
+    const reached = exit != null ? byStart.get(exit) : undefined;
+    if (exit != null && reached && emitted.has(exit) && out.length) {
+      if (reached.term === 'ret') {
+        const repeated = sharedReturn(exit, null, byStart, emitted);
+        if (repeated.length) out.push(...repeated);
+        else {
+          out.push({ t: 'goto', label: labelOf(exit) });
+          gotos += 1;
+        }
+      } else {
+        out.push({ t: 'goto', label: labelOf(exit) });
+        gotos += 1;
+      }
     }
     return out;
   };
