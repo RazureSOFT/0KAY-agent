@@ -10,6 +10,43 @@ function bytes(...values: number[]): Uint8Array {
 
 const BASE = 0x1000;
 
+/**
+ * Every name in the body is declared, and every declared name is assigned.
+ *
+ * Both directions matter and they fail differently. An undeclared name is a compile
+ * error — the reader cannot look the name up either. A declared name that nothing
+ * assigns is a value the pipeline lost on the way to the printer.
+ *
+ * This used to check only the second direction, in a way that could not fail: the
+ * pattern meant to find `name =` dropped its backslashes inside a template literal, so
+ * it matched nothing and every assertion passed. Meanwhile the body printed names the
+ * header never declared, in 203 functions out of 300.
+ */
+function assertEveryNameIsDeclaredAndAssigned(c: string): void {
+  const header = c.split('{')[0] || '';
+  const body = c.slice(c.indexOf('{') + 1);
+  const declared = new Set<string>()
+  for (const m of header.matchAll(/\b(?:long|int|char|short|float|double|unsigned|void|__int64)\b\s*\*?\s*([A-Za-z_]\w*)/g)) {
+    declared.add(m[1])
+  }
+  for (const m of body.matchAll(/^\s*(?:long|int|char|short|float|double|unsigned|void|__int64)\s+\*?\s*([A-Za-z_]\w*)\s*;/gm)) {
+    declared.add(m[1])
+  }
+  // A register with a `_N` suffix is a versioned name the same way `rbx` is.
+  const isRegister = (name: string): boolean => /^(?:r[a-z]{2}|r\d{1,2}|e[a-z]{2}|v_\d+|stack_\d+|xmm\d+|ymm\d+)(?:_\d+)?$/.test(name)
+  const assigned = new Set<string>()
+  for (const m of body.matchAll(/\b([a-zA-Z_]\w*)\s*=(?!=)/g)) assigned.add(m[1])
+  for (const name of assigned) {
+    if (!isRegister(name)) continue
+    if (name === 'rsp' || name === 'rbp') continue
+    assert.ok(declared.has(name), `${name} is used in the body but never declared\n${c}`)
+  }
+  for (const name of declared) {
+    if (!isRegister(name)) continue
+    assert.ok(assigned.has(name), `${name} is declared but nothing assigns it\n${c}`)
+  }
+}
+
 test('an if/else becomes structured C, not a goto', () => {
   // cmp rdi, 0; je +6; mov eax,1; ret; xor eax,eax; ret
   const code = bytes(
@@ -458,13 +495,12 @@ test('a versioned value read once is folded into its reader', () => {
     0xc3,                              // ret
   )
   const result = decompileFunction(code, BASE, BASE, { name: 'fold', end: BASE + code.length, convention: 'sysv' })
-  // Whatever the pipeline names the intermediate, the body must still assign every
-  // name it reads.
-  const declared = [...result.c.matchAll(/^\s{4}long (\w+);$/gm)].map((m) => m[1])
-  for (const name of declared) {
-    const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`, 'm').test(result.c)
-    assert.ok(assigned, `${name} is declared and must be assigned somewhere`)
-  }
+  // Both directions. "Declared implies assigned" is the one that catches a value the
+  // pipeline dropped; "assigned implies declared" is the one that catches a name the
+  // body uses and the header never introduced, which is a compile error and was the
+  // actual defect — 203 functions in 300 used an undeclared name, and this test passed
+  // on all of them because it only asked the first question.
+  assertEveryNameIsDeclaredAndAssigned(result.c)
 })
 
 test('a chain of versioned values folds transitively', () => {
@@ -482,11 +518,7 @@ test('a chain of versioned values folds transitively', () => {
     0xc3,                                 // ret
   )
   const result = decompileFunction(code, BASE, BASE, { name: 'bump', end: BASE + code.length, convention: 'sysv' })
-  const declared = [...result.c.matchAll(/^\s{4}(?:long|int|short|char) (\w+);$/gm)].map((m) => m[1])
-  for (const name of declared) {
-    const assigned = new RegExp(`(^|[^\\w.])${name}\\s*=[^=]`, 'm').test(result.c)
-    assert.ok(assigned, `${name} is declared and must be assigned somewhere in the printed body`)
-  }
+  assertEveryNameIsDeclaredAndAssigned(result.c)
 })
 
 
