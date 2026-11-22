@@ -132,7 +132,24 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     let current = start;
     let guard = 0;
     while (current != null && current !== stop && guard++ < order.length * 4) {
-      if (emitted.has(current)) break;
+      if (emitted.has(current)) {
+        // This block was printed on an earlier path, and control reaches it again from
+        // here. Breaking silently ended the body at that point, and where the block
+        // carried the only `return` on this route the function lost it: `runtime.mapassign`
+        // printed `*(long *)arg2 = ...` as its last statement with no return at all,
+        // because the epilogue it shares had already been printed inside an earlier
+        // branch.
+        //
+        // A `ret` needs no jump — it ends the path either way, and `branchArm` already
+        // repeats a shared epilogue where one is needed. Anything else does, and the
+        // label is at its first printing, so the jump lands.
+        const repeated = byStart.get(current);
+        if (repeated && repeated.term !== 'ret') {
+          out.push({ t: 'goto', label: labelOf(current) });
+          gotos += 1;
+        }
+        break;
+      }
       const loop = loopByHeader.get(current);
       if (loop) {
         out.push(emitLoop(loop));
