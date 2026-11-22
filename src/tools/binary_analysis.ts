@@ -112,6 +112,67 @@ function parseAddress(value: unknown): number {
   return parsed;
 }
 
+/** The built-in listing for one function, or null when there is no code section. */
+function builtInListing(loaded: Loaded, fn: FunctionEntry, limit: number): ReturnType<typeof decompileFunction> | null {
+  const section = codeSection(loaded.image, fn.entry || loaded.textStart);
+  if (!section) return null;
+  const imageBase = section.vaddr - section.offset;
+  const end = fn.end > fn.entry
+    ? Math.min(fn.end, section.vaddr + section.size)
+    : section.vaddr + section.size;
+  const codes = executableSections(loaded.image).map((s) => [s.vaddr, s.vaddr + s.size] as const);
+  return decompileFunction(loaded.bytes, imageBase, fn.entry || section.vaddr, {
+    name: fn.name,
+    end,
+    imageFormat: loaded.image.format,
+    maxInstructions: limit,
+    names: new Map(loaded.functions.map((entry) => [entry.entry, entry.name])),
+    readU64At: (address: number) => {
+      const offset = vaddrToOffset(address, loaded.image.sections);
+      if (offset < 0 || offset + 8 > loaded.bytes.length) return null;
+      let value = 0n;
+      for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(loaded.bytes[offset + byte]);
+      return Number(value);
+    },
+    isCode: (address: number) => codes.some(([from, to]) => address >= from && address < to),
+  });
+}
+
+/** The external decompiler's listing for one address. */
+async function externalListing(
+  location: Awaited<ReturnType<typeof findGhidra>>,
+  target: string,
+  address: number,
+  args: Record<string, any>,
+): Promise<string | null> {
+  if (!location) return null;
+  return decompileWithGhidra({
+    location,
+    binary: target,
+    address,
+    projectRoot: process.env.OKAY_EXTERNAL_PROJECT ?? path.join(path.dirname(target), '.external-project'),
+    timeoutMs: Number(args.timeoutSeconds || 1800) * 1000,
+  });
+}
+
+/**
+ * How many parameters a listing declares, or null when no signature was found.
+ *
+ * Exported for the test. It is the only part of `compare` with a decision in it: the rest
+ * is running two decompilations and putting the strings next to each other.
+ *
+ * Both renderings spell a signature as `type name(type a, type b)`. Counting commas is
+ * enough for the comparison, where the point is `1` against `7` and not the exact shape.
+ */
+export function parameterCountOf(listing: string): number | null {
+  // The signature is the first `name(...)` whose body follows; a prototype line has none.
+  const match = /^\w[\w ]*\**\s*(\w+)\s*\(([^)]*)\)\s*$/m.exec(listing);
+  if (!match) return null;
+  const inner = match[2].trim();
+  if (!inner || inner === 'void') return 0;
+  return inner.split(',').filter((part) => part.trim()).length;
+}
+
 function pickFunction(loaded: Loaded, args: Record<string, any>): FunctionEntry {
   if (loaded.functions.length) {
     if (args.functionName) {
@@ -156,12 +217,13 @@ export class BinaryAnalysisTool extends Tool {
       'action=functions lists real function entries from the Go function table or the linker symbol table; action=disasm disassembles one function by following control flow from its entry; action=cfg returns basic blocks and edges; action=pseudoc renders a reading aid.',
       'action=decompile prints the function as C: named stack slots and arguments, folded conditions, structured if/while/do, and an unknown comment for anything it cannot express. action=xref reports callers, callees and data references.',
       'action=external asks a separately installed decompiler for a second opinion on one function and returns its C verbatim. It is the only action that needs anything installed: it reads debug information more completely than the built-in reader, so its signatures name parameters and types where action=decompile prints long arg0, and it mis-reads Go stack checks as loops where action=decompile folds them. Use it when the signature matters more than the control flow, or to check the built-in output.',
+      'action=compare runs both and returns them side by side with a list of observed differences — parameter counts, whether the stack check became a loop, whether integer widths are distinguished. It does not say which is better: on this binary each has been wrong on the strong point of the other.',
       'Select a function with functionName or address (decimal or 0x hex). Every result states which entry-point source was used; without one only the image entry is walked.',
     ].join(' ');
   }
   get parameters(): Record<string, any> {
     return { type: 'object', required: ['action', 'path'], properties: {
-      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc', 'decompile', 'xref', 'external'] },
+      action: { type: 'string', enum: ['summary', 'functions', 'disasm', 'cfg', 'pseudoc', 'decompile', 'xref', 'external', 'compare'] },
       path: { type: 'string', description: 'Binary to inspect, absolute or workspace-relative.' },
       functionName: { type: 'string', description: 'Substring of a function name.' },
       address: { type: 'string', description: 'Hex (0x...) or decimal virtual address.' },
@@ -249,28 +311,8 @@ export class BinaryAnalysisTool extends Tool {
         }
         case 'decompile': {
           const fn = pickFunction(loaded, args);
-          const section = codeSection(loaded.image, fn.entry || loaded.textStart);
-          if (!section) return failure('no executable section was found in this image');
-          const imageBase = section.vaddr - section.offset;
-          const end = fn.end > fn.entry
-            ? Math.min(fn.end, section.vaddr + section.size)
-            : section.vaddr + section.size;
-          const codes = executableSections(loaded.image).map((s) => [s.vaddr, s.vaddr + s.size] as const);
-          const decompiled = decompileFunction(loaded.bytes, imageBase, fn.entry || section.vaddr, {
-            name: fn.name,
-            end,
-            imageFormat: loaded.image.format,
-            maxInstructions: limit,
-            names: new Map(loaded.functions.map((entry) => [entry.entry, entry.name])),
-            readU64At: (address: number) => {
-              const offset = vaddrToOffset(address, loaded.image.sections);
-              if (offset < 0 || offset + 8 > loaded.bytes.length) return null;
-              let value = 0n;
-              for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(loaded.bytes[offset + byte]);
-              return Number(value);
-            },
-            isCode: (address: number) => codes.some(([from, to]) => address >= from && address < to),
-          });
+          const decompiled = builtInListing(loaded, fn, limit);
+          if (!decompiled) return failure('no executable section was found in this image');
           payload = { ...base, ...decompiled };
           text = decompiled.c;
           break;
@@ -285,16 +327,63 @@ export class BinaryAnalysisTool extends Tool {
             // install. Saying which directory was searched is what lets the caller fix it.
             return failure('no external decompiler install was found; set OKAY_EXTERNAL_DECOMPILER to its directory');
           }
-          const source = await decompileWithGhidra({
-            location,
-            binary: target,
-            address: fn.entry || section.vaddr,
-            projectRoot: process.env.OKAY_EXTERNAL_PROJECT ?? path.join(path.dirname(target), '.external-project'),
-            timeoutMs: Number(args.timeoutSeconds || 1800) * 1000,
-          });
+          const source = await externalListing(location, target, fn.entry || section.vaddr, args);
           if (!source) return failure(`the external decompiler produced nothing for ${fn.name} at 0x${fn.entry.toString(16)}`);
           payload = { ...base, function: fn.name, entry: `0x${fn.entry.toString(16)}`, external: source };
           text = source;
+          break;
+        }
+        case 'compare': {
+          const fn = pickFunction(loaded, args);
+          const section = codeSection(loaded.image, fn.entry || loaded.textStart);
+          if (!section) return failure('no executable section was found in this image');
+          const location = await findGhidra(process.env.OKAY_EXTERNAL_DECOMPILER);
+          const builtIn = builtInListing(loaded, fn, limit);
+          if (!builtIn) return failure('no executable section was found in this image');
+          const external = location ? await externalListing(location, target, fn.entry || section.vaddr, args) : null;
+
+          // Facts, not a verdict. Which listing is better is a judgement about the specific
+          // function, and both have been wrong on this binary: the external one names seven
+          // parameters the built-in one calls `arg0`, and the built-in one folds a Go stack
+          // check the external one prints as a `while` loop that does not exist. Stating the
+          // observations and leaving the choice to the reader is the only honest form.
+          const externalParams = external ? parameterCountOf(external) : null;
+          const builtInParams = parameterCountOf(builtIn.c);
+          const observations: string[] = [];
+          if (external == null) {
+            observations.push(location
+              ? 'the external decompiler produced no output for this function'
+              : 'no external decompiler install was found; set OKAY_EXTERNAL_DECOMPILER to compare');
+          } else {
+            observations.push(`parameters: built-in ${builtInParams ?? 'unknown'}, external ${externalParams ?? 'unknown'}`);
+            // A `while` around a call to the stack-growth helper is the signature of a
+            // mis-read stack check; the built-in reader folds it and says so in a comment.
+            const fakeLoop = /while[^;]*morestack/i.test(external);
+            const folded = /stack check:/i.test(builtIn.c);
+            if (fakeLoop && folded) observations.push('control flow: the external listing shows the stack-check retry as a loop; the built-in one folds it');
+            else if (fakeLoop) observations.push('control flow: the external listing shows a loop around the stack-growth call');
+            const externalTypes = /\b(int|bool|uint\d*|longlong|undefined\d?)\b/.test(external);
+            if (externalTypes && !/\b(int|short|char)\s+\w+\s*;/.test(builtIn.c)) observations.push('types: the external listing distinguishes integer widths; the built-in one declares long');
+          }
+
+          payload = {
+            ...base,
+            function: fn.name,
+            entry: `0x${fn.entry.toString(16)}`,
+            builtIn: builtIn.c,
+            external,
+            observations,
+          };
+          text = [
+            `/* ${fn.name} @ 0x${fn.entry.toString(16)} */`,
+            ...observations.map((line) => `/* ${line} */`),
+            '',
+            '/* ---- built-in ---- */',
+            builtIn.c,
+            '',
+            '/* ---- external ---- */',
+            external ?? '/* not available */',
+          ].join('\n');
           break;
         }
         case 'xref': {
