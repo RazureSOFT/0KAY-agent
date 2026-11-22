@@ -15,7 +15,7 @@ import { lift, registerBase, sanitiseName, type Expr, type Stmt } from './ir.js'
 import { structure, negate, type CtrlStmt } from './structure.js';
 import { optimizeStatements } from './optimize.js';
 import { recoverSwitch } from './switch.js';
-import { typeForSize, typeOfExpr, refineParam, type CType } from './types.js';
+import { typeForSize, typeOfExpr, refineParam, methodReceiver, receiverType, type CType } from './types.js';
 
 export interface DecompileOptions {
   name?: string;
@@ -65,8 +65,8 @@ export interface DecompiledFunction {
   blocks: number;
   loops: number;
   gotos: number;
-  params: Array<{ name: string; type: CType }>;
-  locals: Array<{ name: string; type: CType }>;
+  params: Array<{ name: string; type: CType | string }>;
+  locals: Array<{ name: string; type: CType | string }>;
   note?: string;
 }
 
@@ -155,6 +155,24 @@ export function decompileFunction(
     params.push({ name: param.name, type: entry?.type === 'void *' ? 'void *' : 'long' });
   }
   params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
+  // The receiver's type, taken from the method's symbol name. Go spells it out —
+  // `runtime.(*mheap).alloc` — and the alternative for the first parameter is `long`,
+  // which is what 273 of 364 methods printed. Only applied where nothing better was
+  // found: a receiver the body actually dereferences already came back as `void *`, and
+  // that is a real pointer type already.
+  //
+  // The type is also declared, because a name in a signature that nothing defines does
+  // not compile. `typedef struct X X;` declares an incomplete type, which is all the
+  // listing needs — it never defines one.
+  const receiverTypes = new Set<string>();
+  const receiver = methodReceiver(fn.name);
+  if (receiver && params.length) {
+    const spelled = receiverType(receiver.receiver, receiver.pointer);
+    if (spelled && params[0].type === 'long') {
+      params[0].type = spelled;
+      receiverTypes.add(spelled.replace(/\s*\*$/, ''));
+    }
+  }
   const locals = [...info.vars.values()]
     .filter((local) => !params.some((param) => param.name === local.name))
     // A declaration for a name that no printed statement mentions is noise, and
@@ -219,6 +237,11 @@ export function decompileFunction(
     lines.push(`long ${callee}();`);
   }
   if (called.size) lines.push('');
+  // The receiver type the signature names, declared before it is used. An incomplete
+  // `typedef struct X X;` is enough: the listing only ever holds a pointer to it.
+  for (const type of [...receiverTypes].sort()) {
+    lines.push(`typedef struct ${type} ${type};`);
+  }
   lines.push(`${signature}`);
   lines.push('{');
   for (const local of locals) lines.push(`    ${local.type} ${local.name};`);
@@ -914,8 +937,8 @@ function nameOf(expr: Expr): string {
   return expr.t === 'var' || expr.t === 'reg' ? expr.name : '';
 }
 
-function parameterList(frame: Frame, info: Collected): Array<{ name: string; type: CType }> {
-  const byIndex = new Map<number, { name: string; type: CType }>();
+function parameterList(frame: Frame, info: Collected): Array<{ name: string; type: CType | string }> {
+  const byIndex = new Map<number, { name: string; type: CType | string }>();
   for (const slot of frame.slots.values()) {
     const match = /^arg(\d+)$/.exec(slot.name);
     if (!match) continue;

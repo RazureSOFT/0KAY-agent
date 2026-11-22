@@ -56,3 +56,45 @@ export function refineParam(type: CType, usedAsAddress: boolean): CType {
   if (usedAsAddress) return 'void *';
   return type;
 }
+
+/**
+ * A name usable as a C type, from the receiver in a method's symbol name.
+ *
+ * Go writes a method as `pkg.(*Type).Method` or `pkg.(Type).Method`, so the receiver's
+ * type is spelled out in the name the listing already carries. Recovering it is worth
+ * the trouble because the alternative is a first parameter declared `long`, and 273 of
+ * 364 methods in a 24 MB binary came out that way — the receiver is dereferenced late or
+ * handed to a callee, so the "is it used as an address" test never fires.
+ *
+ * `undefined` when the receiver is not a name this can spell: an anonymous struct
+ * (`(struct { io.Reader })`) is six methods in the whole binary and inventing an
+ * identifier for it would be worse than leaving the parameter as it was.
+ */
+export function receiverType(receiver: string | undefined, pointer: boolean): string | undefined {
+  if (!receiver) return undefined;
+  // A generic instantiation carries its type arguments: `OnceValue[go.shape.string]`.
+  // The type itself is what a reader wants, and the arguments are already in the
+  // function name.
+  const bare = receiver.replace(/\[.*$/, '').trim();
+  if (!/^[A-Za-z_]\w*$/.test(bare)) return undefined;
+  // The package path is dropped: `internal/runtime/maps.Map` is `Map`. A full path is
+  // not a C identifier, and the short name is what the source called it.
+  const name = bare;
+  return pointer ? `${name} *` : name;
+}
+
+/**
+ * The receiver of a method symbol, as `{ receiver, pointer }`.
+ *
+ * `runtime.(*mheap).alloc` gives `{ mheap, true }`. A plain function, or a name whose
+ * receiver is not a simple identifier, gives `undefined`.
+ */
+export function methodReceiver(symbol: string): { receiver: string; pointer: boolean } | undefined {
+  // Only the part after the last slash matters for the package, and the receiver is the
+  // parenthesised group just before the final dot: `pkg.Type.Method` has no receiver.
+  const match = /\((\*?)([^()]*)\)\.([A-Za-z_]\w*)(?:\[[^\]]*\])?(?:\.func\d+)?$/.exec(symbol);
+  if (!match) return undefined;
+  const receiver = match[2];
+  if (!receiver) return undefined;
+  return { receiver, pointer: match[1] === '*' };
+}

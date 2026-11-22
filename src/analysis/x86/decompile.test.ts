@@ -632,3 +632,48 @@ test('an indirect call is declared, not left undeclared', () => {
   assert.match(result.c, /indirect_call\(\)/, `the call is marked indirect\n${result.c}`)
   assert.match(result.c.split('{')[0] || '', /long indirect_call\(\);/, 'and declared')
 })
+
+test('a method receiver is spelled with its type, and the type is declared', () => {
+  // `ret` alone: the body carries nothing, so the parameter list is built from the
+  // symbol name. The receiver type is the one thing the name states outright, and
+  // without it the first parameter reads `long` — which is what 273 of 364 methods in a
+  // 24 MB binary printed before this.
+  const code = bytes(0xc3)
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'internal/runtime/maps.(*Map).Clear',
+    end: BASE + code.length,
+    convention: 'sysv',
+  })
+  // The declaration comes first, so the signature is not naming a type from nowhere.
+  assert.match(result.c, /typedef struct Map Map;/, `the type is declared\n${result.c}`)
+  assert.match(result.c, /\(\s*Map \* arg0\s*\)/, `the receiver takes its type from the name\n${result.c}`)
+})
+
+test('a receiver the body dereferences keeps the pointer type it already had', () => {
+  // `mov [rax], rbx` uses rax as an address. rax is Go's first argument register, so
+  // the receiver here is the dereferenced one and the parameter is already `void *` —
+  // a real pointer type. Replacing it with a named one would be a step backwards, so
+  // the name only fills in where nothing better was found.
+  const code = bytes(
+    0x48, 0x89, 0x18,                    // mov [rax], rbx
+    0xc3,                                // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'pkg.(*Thing).set',
+    end: BASE + code.length,
+    convention: 'sysv',
+  })
+  assert.match(result.c, /void \* arg0/, `the dereferenced receiver stays a pointer\n${result.c}`)
+  assert.ok(!/typedef struct Thing/.test(result.c), `and no type is declared for it\n${result.c}`)
+})
+
+test('an anonymous struct receiver is left alone', () => {
+  // `(struct { io.Reader }).Read` is real in the Go runtime. There is no identifier to
+  // print for it, and inventing one would be worse than the parameter as it was.
+  const code = bytes(0xc3)
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'pkg.(struct { io.Reader }).Read',
+    end: BASE + code.length, convention: 'sysv',
+  })
+  assert.ok(!/typedef struct \{/.test(result.c), `no fabricated type\n${result.c}`)
+})

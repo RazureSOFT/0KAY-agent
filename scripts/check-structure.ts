@@ -73,6 +73,7 @@ const fails: Record<string, Failure[]> = {
   invalidIdentifier: [],
   undeclaredCallee: [],
   duplicateDeclaration: [],
+  undeclaredType: [],
   fallsOffEnd: [],
 }
 let functions = 0
@@ -262,6 +263,24 @@ for (const fn of named.slice(0, LIMIT)) {
       fails.fallsOffEnd.push({ name: fn.name, detail: lastLine.trim().slice(0, 50) })
     }
   }
+
+  // 13. Every type the signature names is declared in the listing. The receiver's type
+  //     comes from the method's symbol name — `Map * arg0` — and a name in a signature
+  //     that nothing defines does not compile. The listing declares it as an incomplete
+  //     `typedef struct Map Map;`, and this checks the two agree.
+  const declaredTypes = new Set<string>()
+  for (const m of code.matchAll(/^typedef struct ([A-Za-z_]\w*) \1;/gm)) declaredTypes.add(m[1])
+  const usedTypes = new Set<string>()
+  for (const m of code.matchAll(/\(([^)]*)\)\s*\{/g)) {
+    for (const part of m[1].split(',')) {
+      const named = /\b([A-Za-z_]\w*)\s*\*\s*[A-Za-z_]\w*\s*$/.exec(part.trim())
+      if (named && !/^(?:char|int|short|long|unsigned|void|float|double)$/.test(named[1])) usedTypes.add(named[1])
+    }
+  }
+  const missingTypes = [...usedTypes].filter((name) => !declaredTypes.has(name))
+  if (missingTypes.length) {
+    fails.undeclaredType.push({ name: fn.name, detail: missingTypes.slice(0, 3).join(', ') })
+  }
 }
 
 /** Remove block comments, so a check on the code does not read the notes. */
@@ -271,8 +290,8 @@ function stripComments(source: string): string {
 
 const order = [
   'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'duplicateDeclaration',
-  'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto', 'unusedLabel',
-  'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
+  'undeclaredType', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
+  'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)
 let bad = 0
