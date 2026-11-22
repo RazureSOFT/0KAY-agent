@@ -40,3 +40,44 @@ test('a jump through a register says where control went, and leaves an exit', ()
   const last = lastStatement(result.c).trim();
   assert.match(last, /^(return|goto|break|continue)\b/, `the body has an exit, and it ends on it\n${result.c}`);
 });
+
+test('the layout behind a parameter is reported, in offset order', () => {
+  // `mov [rax+0x8], rdx; mov rcx, [rax+0x10]` through the same base says the object has
+  // something 8 bytes in and something 16 bytes in. Neither is nameable in a stripped
+  // binary, but the set of offsets is a layout and a reader can use it.
+  const code = bytes(
+    0x48, 0x89, 0x50, 0x08,       // mov [rax+0x08], rdx
+    0x48, 0x8b, 0x48, 0x10,       // mov rcx, [rax+0x10]
+    0xc3,                         // ret
+  );
+  const result = decompileFunction(code, BASE, BASE, { name: 'pkg.f', end: BASE + code.length, convention: 'sysv' });
+  const note = /(\w+) is dereferenced at ([^*]+)\*\//.exec(result.c);
+  assert.ok(note, `the layout is reported\n${result.c}`);
+  const offsets = note[2];
+  assert.match(offsets, /\+0x8/, `the first offset\n${result.c}`);
+  assert.match(offsets, /\+0x10/, `the second\n${result.c}`);
+  assert.ok(offsets.indexOf('+0x8') < offsets.indexOf('+0x10'), `in order\n${result.c}`);
+});
+
+test('a name that receives a parameter once is followed, and one reused is not', () => {
+  // `mov rcx, rax; mov [rcx+0x20], rdx` is the same object as rax. `mov rcx, rax` twice,
+  // with other work between, is two different values in the same register and its offsets
+  // belong to neither.
+  const followed = bytes(
+    0x48, 0x89, 0xc1,             // mov rcx, rax
+    0x48, 0x89, 0x51, 0x20,       // mov [rcx+0x20], rdx
+    0xc3,
+  );
+  const once = decompileFunction(followed, BASE, BASE, { name: 'pkg.f', end: BASE + followed.length, convention: 'sysv' });
+  assert.ok(/is dereferenced at[^*]*\+0x20/.test(once.c), `one assignment is an alias\n${once.c}`);
+
+  const reused = bytes(
+    0x48, 0x89, 0xc1,             // mov rcx, rax
+    0x48, 0x89, 0xd1,             // mov rcx, rdx   <- second life
+    0x48, 0x89, 0x51, 0x20,       // mov [rcx+0x20], rdx
+    0xc3,
+  );
+  const twice = decompileFunction(reused, BASE, BASE, { name: 'pkg.f', end: BASE + reused.length, convention: 'sysv' });
+  assert.ok(/is dereferenced at[^*]*\+0x20/.test(twice.c), `the second value still has a layout\n${twice.c}`);
+  assert.ok(!/rax is dereferenced at[^*]*\+0x20/.test(twice.c), `but it is not attributed to rax\n${twice.c}`);
+});

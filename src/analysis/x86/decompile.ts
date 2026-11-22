@@ -236,6 +236,23 @@ export function decompileFunction(
     // the top of the body still says where the value came from.
     .filter((local) => mentionsName(finalBody, local.name))
     .map((local) => ({ name: local.name, type: local.type }));
+  // The layout behind each parameter, as far as the body reveals it. Reported for
+  // parameters only: a local that is loaded through is usually a slice or map descriptor
+  // whose fields the reader already knows, and the parameters are what the caller handed
+  // in and cannot see.
+  const declared = new Set([...params.map((param) => param.name), ...locals.map((local) => local.name)]);
+  const layouts = fieldOffsets(finalBody, declared);
+  const layoutNotes: string[] = [];
+  for (const param of params) {
+    const offsets = layouts.get(param.name);
+    if (!offsets || !offsets.size) continue;
+    const parts = [...offsets].sort((a, b) => a[0] - b[0])
+      .map(([offset, width]) => `+0x${offset.toString(16)} ${typeForSize(width || 64)}`);
+    // Three is enough to recognise a header; more is a wall of hex that reads worse than
+    // the body it describes.
+    const shown = parts.slice(0, 8).join(', ');
+    layoutNotes.push(`/* ${param.name} is dereferenced at ${shown}${parts.length > 8 ? `, and ${parts.length - 8} more` : ''} */`);
+  }
   const signature = `${returnType(info)} ${sanitiseName(fn.name)}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
   const lines: string[] = [];
@@ -248,6 +265,7 @@ export function decompileFunction(
   // though nothing in the signature says so. `arg0` in `(*StructField).Embedded` reads
   // `*(long *)arg0` and the return is `rcx & 8` — the type is genuinely both.
   const pointerParams = [...info.addressNames].filter((name) => /^arg\d+$/.test(name)).sort();
+  for (const note of layoutNotes) lines.push(note);
   if (pointerParams.length) {
     const subject = pointerParams.join(', ');
     const verb = pointerParams.length === 1 ? 'holds' : 'hold';
@@ -1018,6 +1036,100 @@ function mentionsName(body: CtrlStmt[], name: string): boolean {
     }
   };
   return body.some(inStmt);
+}
+
+/**
+ * Constant offsets at which each name is dereferenced: the shape of the object behind it.
+ *
+ * `mov [rdx+0x50], rax` and `mov rax, [rdx+0x8]` say more together than apart. Neither
+ * names the fields — nothing in a stripped binary does — but the set of offsets, in order,
+ * with the width of each access, is a layout, and a reader trying to decide what `arg2` is
+ * gets further with `+0x0 long, +0x8 long, +0x40 long` than with nothing.
+ *
+ * Only `base + constant` counts. An indexed access is through an array, and an offset that
+ * is itself a variable says nothing about layout.
+ *
+ * The width recorded is the widest seen at that offset, because a struct field read as two
+ * `char`s and a `short` is a field of the larger size at its own offset but not at the
+ * other.
+ */
+function fieldOffsets(body: CtrlStmt[], names: Set<string>): Map<string, Map<number, number>> {
+  const found = new Map<string, Map<number, number>>();
+  /**
+   * A name that only ever receives one parameter, so anything done through it is an
+   * access through that parameter.
+   *
+   * `rcx = arg0` followed by `*(long *)(rcx + 0x10)` is the same object as `arg0`, and 46
+   * of 400 functions read their parameters that way. Only a single assignment to the name
+   * counts: a register reused for a second value is not an alias, and attributing the
+   * second life's offsets to the parameter would invent a layout that is not there.
+   */
+  const aliases = new Map<string, string>();
+  const resolveAliases = (item: CtrlStmt): void => {
+    switch (item.t) {
+      case 'assign': {
+        const target = item.target;
+        if (target.t !== 'reg' && target.t !== 'var') return;
+        // Whatever the name held before is gone, so a parameter source registers as an
+        // alias and anything else clears it. That is what keeps a register reused for a
+        // second object from being credited with the first object's layout.
+        const source = item.value;
+        if ((source.t === 'reg' || source.t === 'var') && names.has(source.name)) {
+          aliases.set(target.name, source.name);
+        } else {
+          aliases.delete(target.name);
+        }
+        return;
+      }
+      case 'if': item.then.forEach(resolveAliases); (item.else || []).forEach(resolveAliases); return;
+      case 'while': item.body.forEach(resolveAliases); return;
+      case 'do': item.body.forEach(resolveAliases); return;
+      default: return;
+    }
+  };
+  body.forEach(resolveAliases);
+  const canonical = (name: string): string => aliases.get(name) ?? name;
+  const record = (base: string, offset: number, width: number): void => {
+    const resolved = canonical(base);
+    if (!names.has(resolved)) return;
+    let offsets = found.get(resolved);
+    if (!offsets) { offsets = new Map(); found.set(resolved, offsets); }
+    offsets.set(offset, Math.max(offsets.get(offset) ?? 0, width));
+  };
+  const visit = (value: Expr | undefined, width = 0): void => {
+    if (!value) return;
+    switch (value.t) {
+      case 'load': {
+        const addr = value.addr;
+        // Only `base + constant`. `base + index * 8` is an array element and says nothing
+        // about layout, and an offset that is itself a variable says less than nothing.
+        if (addr.t === 'bin' && addr.op === '+' && addr.right.t === 'const' && addr.right.v >= 0) {
+          const left = addr.left;
+          if (left.t === 'reg' || left.t === 'var') record(left.name, addr.right.v, value.size);
+        }
+        visit(addr, width);
+        return;
+      }
+      case 'bin': visit(value.left, width); visit(value.right, width); return;
+      case 'un': case 'cast': visit(value.value, width); return;
+      case 'select': visit(value.cond, width); visit(value.a, width); visit(value.b, width); return;
+      case 'call': for (const arg of value.args) visit(arg, width); return;
+      default: return;
+    }
+  };
+  const walk = (item: CtrlStmt): void => {
+    switch (item.t) {
+      case 'assign': visit(item.target); visit(item.value); return;
+      case 'expr': visit(item.expr); return;
+      case 'return': visit(item.value); return;
+      case 'if': visit(item.cond); item.then.forEach(walk); (item.else || []).forEach(walk); return;
+      case 'while': visit(item.cond || undefined); item.body.forEach(walk); return;
+      case 'do': item.body.forEach(walk); visit(item.cond); return;
+      default: return;
+    }
+  };
+  body.forEach(walk);
+  return found;
 }
 
 /**
