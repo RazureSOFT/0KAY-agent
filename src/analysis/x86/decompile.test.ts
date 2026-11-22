@@ -583,3 +583,52 @@ test('a register rotation survives dead-store elimination', () => {
   assert.ok(moves.length >= 2, `the rotation is printed, not collapsed: ${result.c}`)
   for (const [, to, from] of moves) assert.notEqual(to, from, 'no move reads its own destination')
 })
+
+test('a Go symbol name becomes a C identifier', () => {
+  // `internal/runtime/maps.(*Map).Clear` has four characters C rejects in an
+  // identifier. 98.9% of the Go function table needs rewriting, so the definition would
+  // be rejected before the body was read.
+  const code = bytes(0xc3)
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'internal/runtime/maps.(*Map).Clear',
+    end: BASE + code.length,
+    convention: 'sysv',
+  })
+  const definition = /^\s*[\w]*\s*\*?\s*([A-Za-z_]\w*)\s*\(/m.exec(result.c.split('\n').slice(2).join('\n'))
+  assert.ok(definition, `a definition line is printed\n${result.c}`)
+  assert.match(definition[1], /^[A-Za-z_]\w*$/, 'the name is a C identifier')
+  assert.match(definition[1], /internal_runtime_maps/, 'the package path is still readable in it')
+})
+
+test('a call prints a name and the listing declares it', () => {
+  // call rel32; ret — the target is a real function of the binary, named by the table.
+  const code = bytes(
+    0xe8, 0x10, 0x00, 0x00, 0x00,         // call BASE+0x15
+    0xc3,                                 // ret
+    0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90,
+    0xc3,                                 // the callee
+  )
+  const names = new Map([[BASE + 0x15, 'pkg.name']])
+  const result = decompileFunction(code, BASE, BASE, {
+    name: 'caller', end: BASE + code.length, convention: 'sysv', names,
+  })
+  // The name is printed, mangled the same way the definition would be.
+  assert.match(result.c, /pkg_name\(\)/, `the callee is named\n${result.c}`)
+  // And declared: a call to an undeclared name is a C99 constraint violation.
+  const header = result.c.split('{')[0] || ''
+  assert.match(header, /long pkg_name\(\);/, `the callee is declared above\n${result.c}`)
+})
+
+test('an indirect call is declared, not left undeclared', () => {
+  // call rbx — the target is in a register, so there is no name to look up. The listing
+  // says `indirect_call` and declares it, which is honest about what is known and still
+  // compiles.
+  const code = bytes(
+    0xff, 0xd3,                           // call rbx
+    0xc3,                                 // ret
+  )
+  const result = decompileFunction(code, BASE, BASE, { name: 'viaptr', end: BASE + code.length, convention: 'sysv' })
+  assert.match(result.c, /indirect_call\(\)/, `the call is marked indirect\n${result.c}`)
+  assert.match(result.c.split('{')[0] || '', /long indirect_call\(\);/, 'and declared')
+})

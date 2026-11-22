@@ -250,6 +250,7 @@ export class BinaryAnalysisTool extends Tool {
             end,
             imageFormat: loaded.image.format,
             maxInstructions: limit,
+            names: new Map(loaded.functions.map((entry) => [entry.entry, entry.name])),
           });
           payload = { ...base, ...decompiled };
           text = decompiled.c;
@@ -374,6 +375,9 @@ export async function decompileSummary(
   const budget = options.functionName ? Math.min(picked.length, 8) : 3;
   const decompiled: NonNullable<Awaited<ReturnType<typeof decompileSummary>>['decompiled']> = [];
   const noReturnCalls = collectNoReturnTargets(loaded.functions);
+  // Address to name, so a call prints where it goes instead of `sub_40086ee0()`. The
+  // list is already in hand — it is where `fn` came from.
+  const names = new Map(loaded.functions.map((entry) => [entry.entry, entry.name]));
   if (section) {
     for (const fn of picked.slice(0, budget)) {
       try {
@@ -383,6 +387,7 @@ export async function decompileSummary(
           imageFormat: loaded.image.format,
           maxInstructions: options.maxInstructions ?? 2000,
           ...(noReturnCalls.size ? { noReturnCalls } : {}),
+          names,
         });
         decompiled.push({
           name: result.name, entry: `0x${result.entry.toString(16)}`, c: result.c,

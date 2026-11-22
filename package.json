@@ -10,7 +10,8 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "check:structure": "node --import tsx scripts/check-structure.ts"
+    "check:structure": "node --import tsx scripts/check-structure.ts",
+    "check:names": "node --import tsx scripts/check-name-mangling.ts"
   },
   "dependencies": {
     "@0kay/mcp": "file:../mcp",

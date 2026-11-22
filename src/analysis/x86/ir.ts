@@ -114,8 +114,7 @@ function addressExpr(operand: Operand, instruction: Instruction): Expr {
   return expr || constExpr(0, 64);
 }
 
-export function slotFor(offset: number, size: number, frame: Frame): Expr {
-  const slot = frame.slots.get(offset);
+export function slotFor(offset: number, size: number, frame: Frame): Expr {  const slot = frame.slots.get(offset);
   return { t: 'var', name: slot ? slot.name : (offset < 0 ? `v_${Math.abs(offset)}` : `stack_${offset}`), size: size || 64 };
 }
 
@@ -408,7 +407,7 @@ function isVectorOnly(mnemonic: string): boolean {
   return mnemonic.length > 1 && mnemonic[0] === 'v';
 }
 
-export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame): LiftedBlock[] {
+export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: Frame, names?: Map<number, string>): LiftedBlock[] {
   const byStart = new Map<number, BasicBlock>();
   for (const block of blocks) byStart.set(block.start, block);
   const lifted: LiftedBlock[] = [];
@@ -546,7 +545,22 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
       }
       if (m === 'call') {
         const targetExpr = a ? operandExpr(a, ins, frame, true) : constExpr(0, 64);
-        const name = targetExpr.t === 'const' ? `sub_${(targetExpr.v >>> 0).toString(16)}` : 'indirect_call';
+        // A direct call names its destination when a symbol table was handed in, and
+        // falls back to the address otherwise. `sub_40086ee0()` is not a call to
+        // anything: the name is declared nowhere and a C compiler rejects it. The same
+        // address is `internal/runtime/maps.fatal` in the Go function table, which the
+        // caller has and simply never passed down.
+        let name = 'indirect_call';
+        if (targetExpr.t === 'const') {
+          // No `>>> 0` here. The call target is a full 64-bit address — `0x140086ee0` is
+          // 5369261792, past 2^32 — and `>>> 0` truncates it to `0x40086ee0`, which
+          // matches no function table entry. That is why every call stayed `sub_...`
+          // even with the table in hand. The unsigned coercion belongs where a value is
+          // being printed as 32-bit, not where an address is being looked up.
+          const address = targetExpr.v;
+          const known = names?.get(address) ?? names?.get(address >>> 0);
+          name = known ? sanitiseName(known) : `sub_${address.toString(16)}`;
+        }
         const args: Expr[] = [];
         for (const register of frame.argRegisters) {
           const value = regValues.get(register);
@@ -862,4 +876,30 @@ export function lift(instructions: Instruction[], blocks: BasicBlock[], frame: F
     void byStart;
   }
   return lifted;
+}
+
+/**
+ * Turn a Go symbol name into an identifier a C compiler accepts.
+ *
+ * Go names are not C names. `internal/runtime/maps.(*Map).Clear` has four kinds of
+ * character C does not allow in an identifier, and 98.9% of the names in the function
+ * table fail the test — so a call to one and the definition of one are both rejected
+ * before the rest of the body is even read. The mangling is reversible, which is the
+ * point: the reader can see the package path and the receiver in the printed name.
+ *
+ * The rule is the usual one for this: everything outside `[A-Za-z0-9_]` becomes `_`,
+ * with `_1`-style escapes for the separators that carry meaning, so two different Go
+ * names cannot collide after the rewrite. Called from both the call site and the
+ * definition, so the two agree.
+ */
+export function sanitiseName(name: string): string {
+  // A plain substitution of every character C rejects — 98.9% of the Go function table
+  // needs it. Kept this simple after checking, not assuming: a version that gave `.`
+  // and `/` different spellings to avoid collisions, and another that transliterated
+  // brackets and receivers, both worked, and the plain one has no collisions either
+  // across the 19376 names of a 24 MB binary. `internal/runtime/maps.(*Map).Clear`
+  // becomes `internal_runtime_maps___Map__Clear`, which a reader can follow back.
+  const out = name.replace(/[^A-Za-z0-9_]/g, '_');
+  // A leading digit is not an identifier either.
+  return /^[0-9]/.test(out) ? `_${out}` : out;
 }

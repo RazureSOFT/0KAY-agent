@@ -36,6 +36,10 @@ for (const s of image.sections) {
 }
 const named = entries.filter((e) => !/^(func_|sub_|unknown)/i.test(e.name))
 const sec = executableSections(image)[0]
+// The same name map the tool passes in. Without it every call is `sub_<address>()`,
+// which is not a declared function and not what the tool prints either — the checker
+// would report a defect that the real output does not have.
+const names = new Map(entries.map((entry) => [entry.entry, entry.name]))
 
 interface Failure { name: string; detail: string }
 const fails: Record<string, Failure[]> = {
@@ -48,6 +52,8 @@ const fails: Record<string, Failure[]> = {
   repeatedCondition: [],
   readBeforeWritten: [],
   undeclaredName: [],
+  invalidIdentifier: [],
+  undeclaredCallee: [],
 }
 let functions = 0
 let instructions = 0
@@ -60,6 +66,7 @@ for (const fn of named.slice(0, LIMIT)) {
       end: fn.end > fn.entry ? fn.end : undefined,
       imageFormat: image.format,
       maxInstructions: 4000,
+      names,
     })
   } catch (error) {
     fails.braceImbalance.push({ name: fn.name, detail: `threw: ${(error as Error).message}` })
@@ -151,11 +158,56 @@ for (const fn of named.slice(0, LIMIT)) {
   if (missing.size) {
     fails.undeclaredName.push({ name: fn.name, detail: [...missing].slice(0, 4).join(', ') })
   }
+
+  // 9. Every identifier the listing introduces has to be a valid C identifier — the
+  //    function's own name included. 98.9% of the names in the Go function table are
+  //    not: `internal/runtime/maps.(*Map).Clear` has four characters C rejects in an
+  //    identifier. A definition whose name is not an identifier is the one error no
+  //    compiler will look past, and it is also what a call to that function prints.
+  const signatureName = /^\s*[\w*\s]+?([A-Za-z_]\w*)\s*\(/.exec(c.split('\n').find((line) => line.includes('(') && !line.trimStart().startsWith('/*')) || '')
+  if (signatureName && !/^[A-Za-z_]\w*$/.test(signatureName[1])) {
+    fails.invalidIdentifier.push({ name: fn.name, detail: `definition named ${signatureName[1]}` })
+  }
+  for (const m of c.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) {
+    const callee = m[1]
+    if (/^(?:if|while|for|switch|return|sizeof)$/.test(callee)) continue
+    if (/^[A-Za-z_]\w*$/.test(callee)) continue
+    fails.invalidIdentifier.push({ name: fn.name, detail: `call to ${callee}` })
+  }
+
+  // 10. Every function the body calls is declared. A call to an undeclared name is a
+  //     constraint violation in C99, the same class as an undeclared variable: 30% of
+  //     functions had one. The declaration is printed above the definition, so the
+  //     names the body calls have to be a subset of the names the listing introduces.
+  //
+  //     Comments are stripped first. The body carries notes like "bts sets one bit of
+  //     the destination (bit 52)", and matching inside those reported `destination` as
+  //     a call — 126 functions, every one of them a false positive.
+  const code = stripComments(c)
+  const introduced = new Set<string>()
+  for (const m of code.matchAll(/\b(?:long|int|char|short|void|unsigned|__int64)\s+\*?\s*([A-Za-z_]\w*)\s*\(/g)) introduced.add(m[1])
+  const keywords = new Set(['if', 'while', 'for', 'switch', 'return', 'sizeof'])
+  const called = new Set<string>()
+  for (const m of code.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) {
+    if (keywords.has(m[1])) continue
+    if (/^(?:unsigned|int|long|char|short|void)$/.test(m[1])) continue
+    called.add(m[1])
+  }
+  const undeclaredCallee = [...called].filter((name) => !introduced.has(name))
+  if (undeclaredCallee.length) {
+    fails.undeclaredCallee.push({ name: fn.name, detail: undeclaredCallee.slice(0, 3).join(', ') })
+  }
+}
+
+/** Remove block comments, so a check on the code does not read the notes. */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, ' ')
 }
 
 const order = [
-  'undeclaredName', 'braceImbalance', 'emptyBranch', 'danglingGoto', 'unusedLabel',
-  'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
+  'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'braceImbalance', 'emptyBranch',
+  'danglingGoto', 'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition',
+  'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)
 let bad = 0

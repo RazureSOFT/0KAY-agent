@@ -11,7 +11,7 @@
 import { disassembleFunction } from './function.js';
 import { buildCfg } from './cfg.js';
 import { analyzeFrame, inferRegisterParams, type Convention, type Frame } from './frame.js';
-import { lift, registerBase, type Expr, type Stmt } from './ir.js';
+import { lift, registerBase, sanitiseName, type Expr, type Stmt } from './ir.js';
 import { structure, negate, type CtrlStmt } from './structure.js';
 import { optimizeStatements } from './optimize.js';
 import { recoverSwitch } from './switch.js';
@@ -34,6 +34,16 @@ export interface DecompileOptions {
    * body where rbx is the panic value.
    */
   noReturnCalls?: Set<string>;
+  /**
+   * Address of a routine to its name, so a call can print where it goes.
+   *
+   * Without this a call is `sub_40086ee0()`, and that is not C: the name is not
+   * declared anywhere and a compiler rejects the call. The caller usually has the Go
+   * function table in hand — the same list it got `entry` from — so the names are
+   * available and were simply never passed down. `sub_40086ee0` is
+   * `internal/runtime/maps.fatal`.
+   */
+  names?: Map<number, string>;
 }
 
 export interface DecompiledFunction {
@@ -65,7 +75,7 @@ export function decompileFunction(
   });
   const blocks = buildCfg(fn.instructions);
   const frame = analyzeFrame(fn.instructions, convention);
-  const lifted = lift(fn.instructions, blocks, frame);
+  const lifted = lift(fn.instructions, blocks, frame, options.names);
   for (let index = 0; index < lifted.length; index++) {
     const info = recoverSwitch(
       lifted[index], blocks[index]?.instructions || [], code, baseVaddr,
@@ -142,7 +152,7 @@ export function decompileFunction(
     .filter((local) => local.name !== 'rsp' && local.name !== 'rbp')
     .filter((local) => !isUnassignedRegister(finalBody, local.name))
     .map((local) => ({ name: local.name, type: local.type }));
-  const signature = `${returnType(info)} ${fn.name}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
+  const signature = `${returnType(info)} ${sanitiseName(fn.name)}(${params.length ? params.map((param) => `${param.type} ${param.name}`).join(', ') : 'void'})`;
 
   const lines: string[] = [];
   const unknownPct = fn.instructions.length
@@ -150,6 +160,44 @@ export function decompileFunction(
     : 0;
   lines.push(`/* ${fn.name} @ 0x${entry.toString(16)} — ${fn.instructions.length} instructions, ${blocks.length} blocks, ${structured.loops} loop(s), ${structured.gotos} goto(s)${unknownPct ? `, ${unknownPct}% undecoded` : ''} */`);
   if (inferred.length) lines.push('/* parameters inferred from register reads (register ABI); the signature is approximate */');
+  // Declare what the body calls. A call to a name nothing declares is a constraint
+  // violation in C99 — the compiler has to assume the arguments and the return type,
+  // and most refuse outright. The body calls other functions of the same binary, which
+  // one function's listing does not define, so the declarations go here.
+  //
+  // The parameter list is left empty rather than guessed: `long f();` says the arguments
+  // are unspecified, which is exactly what is known. Inventing a signature from the
+  // registers the caller happened to load would be a different kind of wrong.
+  const called = new Set<string>();
+  const collectCalls = (items: CtrlStmt[]): void => {
+    for (const item of items) {
+      if (item.t === 'assign' || item.t === 'expr') {
+        gatherCalls(item.t === 'assign' ? item.value : item.expr, called);
+      } else if (item.t === 'return' && item.value) {
+        gatherCalls(item.value, called);
+      } else if (item.t === 'if') {
+        gatherCalls(item.cond, called);
+        collectCalls(item.then);
+        if (item.else) collectCalls(item.else);
+      } else if (item.t === 'while') {
+        if (item.cond) gatherCalls(item.cond, called);
+        collectCalls(item.body);
+      } else if (item.t === 'do') {
+        collectCalls(item.body);
+        gatherCalls(item.cond, called);
+      }
+    }
+  };
+  collectCalls(finalBody);
+  const ownName = sanitiseName(fn.name);
+  for (const callee of [...called].sort()) {
+    if (callee === ownName) continue;
+    // `indirect_call` is a real callee as far as the listing is concerned: the call goes
+    // through a register, so there is no address to look up and the name says exactly
+    // that. Declaring it keeps the listing C without claiming to know the target.
+    lines.push(`long ${callee}();`);
+  }
+  if (called.size) lines.push('');
   lines.push(`${signature}`);
   lines.push('{');
   for (const local of locals) lines.push(`    ${local.type} ${local.name};`);
@@ -755,6 +803,36 @@ function collect(body: CtrlStmt[], frame: Frame, params: Set<string> = new Set()
 }
 
 /** Does any printed statement read or write this name? */
+/**
+ * Add every function name an expression calls to `into`.
+ *
+ * Used to declare the calls before the definition, so the listing is C. Walks the whole
+ * expression rather than only the top level: `x = f(g())` calls both, and a call inside
+ * a comparison — `if (cmp(a, b) > 0)` — is as undeclared as one on its own line.
+ */
+function gatherCalls(value: Expr | undefined, into: Set<string>): void {
+  if (!value) return;
+  switch (value.t) {
+    case 'call':
+      if (value.target) into.add(value.target);
+      for (const arg of value.args) gatherCalls(arg, into);
+      return;
+    case 'load':
+      gatherCalls(value.addr, into);
+      return;
+    case 'bin':
+      gatherCalls(value.left, into); gatherCalls(value.right, into); return;
+    case 'un':
+      gatherCalls(value.value, into); return;
+    case 'cast':
+      gatherCalls(value.value, into); return;
+    case 'select':
+      gatherCalls(value.cond, into); gatherCalls(value.a, into); gatherCalls(value.b, into); return;
+    default:
+      return;
+  }
+}
+
 function mentionsName(body: CtrlStmt[], name: string): boolean {
   const inExpr = (value: Expr | undefined): boolean => {
     if (!value) return false;
