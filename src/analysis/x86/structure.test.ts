@@ -107,3 +107,57 @@ test('a constant with no text behind it is left as a number', () => {
   assert.match(result.c, /0x2000/, `still the literal\n${result.c}`);
   assert.ok(!/\/\* "/.test(result.c), `and no invented text\n${result.c}`);
 });
+
+test('a write that nothing reads before it is overwritten is dropped', () => {
+  // `mov eax, 5; mov eax, 7` — the first value is never read. `eax` is written to clear the
+  // upper half of `rax` as often as for its value, and the lift kept both.
+  const code = bytes(
+    0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+    0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+    0xc3,
+  );
+  const result = decompileFunction(code, BASE, BASE, { end: BASE + code.length, convention: 'sysv' });
+  assert.match(result.c, /return 7;/, `the surviving value\n${result.c}`);
+  assert.ok(!/return 5;/.test(result.c), `the discarded one is gone\n${result.c}`);
+});
+
+test('the last write in a block is kept, because something outside may read it', () => {
+  // The liveness pass runs backwards; when it reaches the top of the block the names it
+  // has not seen written are that block's result. Removing them would change what the
+  // function returns, and this is the case that a naive "overwritten later" check misses.
+  const code = bytes(
+    0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+    0xc3,
+  );
+  const result = decompileFunction(code, BASE, BASE, { end: BASE + code.length, convention: 'sysv' });
+  assert.match(result.c, /return 5;/, `the block result survives\n${result.c}`);
+});
+
+test('a call is never dropped, even when its result is overwritten', () => {
+  // The result of `a()` is discarded, but `a()` ran. `runtime_printlock()` followed by
+  // `runtime_printstring()` prints twice; deleting the first changes the program. 520 of
+  // the 1067 overwrites measured on this binary are calls for exactly this reason.
+  const code = bytes(
+    0xe8, 0x00, 0x00, 0x00, 0x00, // call a
+    0xe8, 0x00, 0x00, 0x00, 0x00, // call b
+    0xe8, 0x00, 0x00, 0x00, 0x00, // call c
+    0xc3,
+  );
+  const names = new Map([[0x1005, 'a'], [0x100a, 'b'], [0x100f, 'c']]);
+  const result = decompileFunction(code, BASE, BASE, { end: BASE + code.length, convention: 'sysv', names });
+  assert.match(result.c, /a\(\);/, `the first call is still there\n${result.c}`);
+  assert.match(result.c, /b\(\);/, `and the second\n${result.c}`);
+});
+
+test('a value that is read before being overwritten is kept', () => {
+  // `mov eax, 5; add eax, 3` reads what it writes. Dropping the first would leave the sum
+  // starting from whatever was in the register, which is not the same program.
+  const code = bytes(
+    0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+    0x83, 0xc0, 0x03,             // add eax, 3
+    0xc3,
+  );
+  const result = decompileFunction(code, BASE, BASE, { end: BASE + code.length, convention: 'sysv' });
+  assert.match(result.c, /5/, `the first value contributes\n${result.c}`);
+  assert.match(result.c, /8|3/, `and the arithmetic survives\n${result.c}`);
+});
