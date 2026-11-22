@@ -10,7 +10,7 @@
  * Exit code is the number of failing invariants, so it can be used as a gate.
  */
 import * as fs from 'node:fs/promises'
-import { parseImage, executableSections } from '../src/analysis/x86/image.js'
+import { parseImage, executableSections, vaddrToOffset } from '../src/analysis/x86/image.js'
 import { findPclntab } from '../src/analysis/x86/pclntab.js'
 import { decompileFunction } from '../src/analysis/x86/decompile.js'
 
@@ -40,6 +40,18 @@ const sec = executableSections(image)[0]
 // which is not a declared function and not what the tool prints either — the checker
 // would report a defect that the real output does not have.
 const names = new Map(entries.map((entry) => [entry.entry, entry.name]))
+// The same jump-table reader the tool passes in. A switch table lives in `.rdata`, so
+// without the image's address mapping every switch is missed — and the listing the tool
+// produces and the listing this checker sees would be different things.
+const codeRanges = executableSections(image).map((s) => [s.vaddr, s.vaddr + s.size] as const)
+const readU64At = (address: number): number | null => {
+  const offset = vaddrToOffset(address, image.sections)
+  if (offset < 0 || offset + 8 > bytes.length) return null
+  let value = 0n
+  for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(bytes[offset + byte])
+  return Number(value)
+}
+const isCode = (address: number): boolean => codeRanges.some(([from, to]) => address >= from && address < to)
 
 interface Failure { name: string; detail: string }
 const fails: Record<string, Failure[]> = {
@@ -54,6 +66,8 @@ const fails: Record<string, Failure[]> = {
   undeclaredName: [],
   invalidIdentifier: [],
   undeclaredCallee: [],
+  duplicateDeclaration: [],
+  fallsOffEnd: [],
 }
 let functions = 0
 let instructions = 0
@@ -67,6 +81,8 @@ for (const fn of named.slice(0, LIMIT)) {
       imageFormat: image.format,
       maxInstructions: 4000,
       names,
+      readU64At,
+      isCode,
     })
   } catch (error) {
     fails.braceImbalance.push({ name: fn.name, detail: `threw: ${(error as Error).message}` })
@@ -197,6 +213,41 @@ for (const fn of named.slice(0, LIMIT)) {
   if (undeclaredCallee.length) {
     fails.undeclaredCallee.push({ name: fn.name, detail: undeclaredCallee.slice(0, 3).join(', ') })
   }
+
+  // 11. A local declared twice in the same scope is a redefinition, and a parameter
+  //     declared again as a local shadows it. Both are errors, and both are cheap to
+  //     produce when the collectors and the declaration printer disagree.
+  const declaredLocals = new Map<string, number>()
+  for (const m of body.matchAll(/^\s{4}(?:long|int|char|short|float|double|unsigned|void)\s+\*?\s*([A-Za-z_]\w*)\s*;/gm)) {
+    declaredLocals.set(m[1], (declaredLocals.get(m[1]) || 0) + 1)
+  }
+  const doubled = [...declaredLocals].filter(([, count]) => count > 1).map(([n]) => n)
+  if (doubled.length) fails.duplicateDeclaration.push({ name: fn.name, detail: doubled.slice(0, 3).join(', ') })
+
+  // 12. A non-void function whose last printed statement is not a `return` can fall off
+  //     the end, which is undefined behaviour and a warning every project turns into an
+  //     error. The printer emits `return` on every path that leaves the body, so this
+  //     only fires when a path lost its return.
+  const returnType = (c.split('\n').find((line) => line.includes('(') && !line.trimStart().startsWith('/*')) || '').trim().split(/\s+/)[0]
+  if (returnType && returnType !== 'void') {
+    // `body` still carries the closing brace, so a body ending in `return x; }` has its
+    // last *statement* one line up. Ignoring the brace keeps this from reporting every
+    // function that returns properly — 497 of 500 without it.
+    // `body` still carries the closing brace, so a body ending in `return x; }` has its
+    // last *statement* one line up. Ignoring the brace keeps this from reporting every
+    // function that returns properly — 497 of 500 without it.
+    const tail = body.replace(/\s+$/, '')
+    const lastLine = tail.split('\n')
+      .filter((line) => line.trim() && !line.trim().startsWith('/*') && line.trim() !== '}')
+      .pop() || ''
+    // The last *line* is what matters only when it is a plain statement. A `break`,
+    // `continue` or `goto` leaves the block, and a `}` closes one, so none of them is a
+    // fall-through. A `switch` printed before the final `return` put `break;` last and
+    // reported 48 functions that do return.
+    if (lastLine && !/^(return|goto|break|continue|\}|\{|else)\b/.test(lastLine.trim()) && !/^\}/.test(lastLine.trim())) {
+      fails.fallsOffEnd.push({ name: fn.name, detail: lastLine.trim().slice(0, 50) })
+    }
+  }
 }
 
 /** Remove block comments, so a check on the code does not read the notes. */
@@ -205,9 +256,9 @@ function stripComments(source: string): string {
 }
 
 const order = [
-  'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'braceImbalance', 'emptyBranch',
-  'danglingGoto', 'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition',
-  'readBeforeWritten',
+  'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'duplicateDeclaration',
+  'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto', 'unusedLabel',
+  'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)
 let bad = 0

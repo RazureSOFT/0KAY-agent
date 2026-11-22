@@ -44,6 +44,16 @@ export interface DecompileOptions {
    * `internal/runtime/maps.fatal`.
    */
   names?: Map<number, string>;
+  /**
+   * Read the eight bytes at a virtual address, for jump-table recovery.
+   *
+   * The table lives in `.rdata`, outside the code this function was handed, so it can
+   * only be reached through the image. Without this the reader falls back to treating
+   * the address as an offset into the code, which finds nothing.
+   */
+  readU64At?: (address: number) => number | null;
+  /** Whether an address points at code, used to find where a jump table ends. */
+  isCode?: (address: number) => boolean;
 }
 
 export interface DecompiledFunction {
@@ -76,10 +86,21 @@ export function decompileFunction(
   const blocks = buildCfg(fn.instructions);
   const frame = analyzeFrame(fn.instructions, convention);
   const lifted = lift(fn.instructions, blocks, frame, options.names);
+  // A jump table sits in `.rdata`, not in the code section the function came from, so
+  // reading it means mapping an address through the image's sections. When the caller
+  // has the image, it says so; otherwise the only thing that can be read is the code
+  // itself, and a table outside it cannot be found.
+  const readU64At = options.readU64At ?? ((address: number): number | null => {
+    const offset = address - baseVaddr;
+    if (offset < 0 || offset + 8 > code.length) return null;
+    let value = 0n;
+    for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(code[offset + byte]);
+    return Number(value);
+  });
+  const isCodeAddress = options.isCode ?? ((address: number) => address >= baseVaddr && address - baseVaddr < code.length);
   for (let index = 0; index < lifted.length; index++) {
     const info = recoverSwitch(
-      lifted[index], blocks[index]?.instructions || [], code, baseVaddr,
-      (address) => address >= baseVaddr && address - baseVaddr < code.length,
+      lifted[index], blocks[index]?.instructions || [], readU64At, isCodeAddress,
     );
     if (info) lifted[index].switch = info;
   }

@@ -11,7 +11,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { Tool, type ToolContext, type ToolResult } from './types.js';
 import { success, failure } from './helpers.js';
-import { parseImage, executableSections, sectionNamed } from '../analysis/x86/image.js';
+import { parseImage, executableSections, sectionNamed, vaddrToOffset } from '../analysis/x86/image.js';
 import type { Section } from '../analysis/x86/image.js';
 import { parsePclntab, findPclntab } from '../analysis/x86/pclntab.js';
 import { parseSymbols, functionAt } from '../analysis/x86/symbols.js';
@@ -245,12 +245,21 @@ export class BinaryAnalysisTool extends Tool {
           const end = fn.end > fn.entry
             ? Math.min(fn.end, section.vaddr + section.size)
             : section.vaddr + section.size;
+          const codes = executableSections(loaded.image).map((s) => [s.vaddr, s.vaddr + s.size] as const);
           const decompiled = decompileFunction(loaded.bytes, imageBase, fn.entry || section.vaddr, {
             name: fn.name,
             end,
             imageFormat: loaded.image.format,
             maxInstructions: limit,
             names: new Map(loaded.functions.map((entry) => [entry.entry, entry.name])),
+            readU64At: (address: number) => {
+              const offset = vaddrToOffset(address, loaded.image.sections);
+              if (offset < 0 || offset + 8 > loaded.bytes.length) return null;
+              let value = 0n;
+              for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(loaded.bytes[offset + byte]);
+              return Number(value);
+            },
+            isCode: (address: number) => codes.some(([from, to]) => address >= from && address < to),
           });
           payload = { ...base, ...decompiled };
           text = decompiled.c;
@@ -378,6 +387,18 @@ export async function decompileSummary(
   // Address to name, so a call prints where it goes instead of `sub_40086ee0()`. The
   // list is already in hand — it is where `fn` came from.
   const names = new Map(loaded.functions.map((entry) => [entry.entry, entry.name]));
+  // Jump tables live in `.rdata`, which the function's own `code` window does not cover,
+  // so the reader is handed the image's address mapping. Without it every switch in the
+  // binary was missed.
+  const codeRanges = executableSections(loaded.image).map((s) => [s.vaddr, s.vaddr + s.size] as const);
+  const readU64At = (address: number): number | null => {
+    const offset = vaddrToOffset(address, loaded.image.sections);
+    if (offset < 0 || offset + 8 > loaded.bytes.length) return null;
+    let value = 0n;
+    for (let byte = 7; byte >= 0; byte--) value = (value << 8n) | BigInt(loaded.bytes[offset + byte]);
+    return Number(value);
+  };
+  const isCode = (address: number): boolean => codeRanges.some(([from, to]) => address >= from && address < to);
   if (section) {
     for (const fn of picked.slice(0, budget)) {
       try {
@@ -388,6 +409,8 @@ export async function decompileSummary(
           maxInstructions: options.maxInstructions ?? 2000,
           ...(noReturnCalls.size ? { noReturnCalls } : {}),
           names,
+          readU64At,
+          isCode,
         });
         decompiled.push({
           name: result.name, entry: `0x${result.entry.toString(16)}`, c: result.c,
