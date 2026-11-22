@@ -18,6 +18,7 @@ import { sanitiseName } from '../analysis/x86/ir.js';
 import { parseSymbols, functionAt } from '../analysis/x86/symbols.js';
 import type { FunctionEntry } from '../analysis/x86/symbols.js';
 import { disassembleFunction, coverageOf } from '../analysis/x86/function.js';
+import { uniqueNames } from './unique_names.js';
 import { buildCfg, cfgSummary } from '../analysis/x86/cfg.js';
 import { toPseudoC } from '../analysis/x86/pseudoc.js';
 import { decompileFunction } from '../analysis/x86/decompile.js';
@@ -275,7 +276,7 @@ export class BinaryAnalysisTool extends Tool {
             limit: Math.max(1, Math.min(Number(args.scanLimit) || 500, 20000)),
             isMapped: (address) => loaded.image.sections.some((s) => address >= s.vaddr && address < s.vaddr + s.size),
           });
-          const names = new Map(loaded.functions.map((entry) => [entry.entry, entry.name]));
+          const names = uniqueNames(loaded.functions);
           const label = (address: number) => ({ address: `0x${address.toString(16)}`, name: names.get(address) || null });
           const fnEnd = fn.end > fn.entry ? fn.end : Number.POSITIVE_INFINITY;
           const dataRefs = [...graph.dataRefs.entries()]
@@ -396,8 +397,10 @@ export async function decompileSummary(
   const decompiled: NonNullable<Awaited<ReturnType<typeof decompileSummary>>['decompiled']> = [];
   const noReturnCalls = collectNoReturnTargets(loaded.functions);
   // Address to name, so a call prints where it goes instead of `sub_40086ee0()`. The
-  // list is already in hand — it is where `fn` came from.
-  const names = new Map(loaded.functions.map((entry) => [entry.entry, entry.name]));
+  // list is already in hand — it is where `fn` came from — and names are made unique,
+  // because a Go symbol is not: `internal/bytealg.countGeneric` exists once per element
+  // size, and a call to the second copy printed as a recursive call to the first.
+  const names = uniqueNames(loaded.functions);
   // Jump tables live in `.rdata`, which the function's own `code` window does not cover,
   // so the reader is handed the image's address mapping. Without it every switch in the
   // binary was missed.
@@ -414,7 +417,9 @@ export async function decompileSummary(
     for (const fn of picked.slice(0, budget)) {
       try {
         const result = decompileFunction(loaded.bytes, imageBase, fn.entry, {
-          name: fn.name,
+          // The disambiguated name, so a call to this function lands on it rather than on
+          // the same-named copy the table lists first.
+          name: names.get(fn.entry) ?? fn.name,
           end: fn.end > fn.entry ? Math.min(fn.end, section.vaddr + section.size) : section.vaddr + section.size,
           imageFormat: loaded.image.format,
           maxInstructions: options.maxInstructions ?? 2000,

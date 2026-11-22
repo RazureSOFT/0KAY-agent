@@ -145,7 +145,7 @@ export function decompileFunction(
   }
   const renamed = new Map(inferred.map((param) => [param.register, param.name]));
   const paramNames = new Set(inferred.map((param) => param.name));
-  const finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
+  let finalBody = renamed.size ? body.map((stmt) => renameStmt(stmt, renamed, paramNames)) : body;
 
   const info = collect(finalBody, frame, paramNames, passThroughReturn);
   const params = parameterList(frame, info);
@@ -155,6 +155,9 @@ export function decompileFunction(
     params.push({ name: param.name, type: 'long' });
   }
   params.sort((a, b) => Number(a.name.replace(/\D/g, '')) - Number(b.name.replace(/\D/g, '')));
+  // Recursive calls get the argument count the signature states. Done here, with the
+  // parameters settled, so the count is the one the listing will print.
+  finalBody = padSelfCalls(finalBody, sanitiseName(fn.name), params.length);
   // The receiver's type, taken from the method's symbol name. Go spells it out —
   // `runtime.(*mheap).alloc` — and the alternative for the first parameter is `long`.
   //
@@ -908,6 +911,13 @@ function gatherCalls(value: Expr | undefined, into: Set<string>): void {
       gatherCalls(value.addr, into);
       return;
     case 'bin':
+      // Division by a constant zero prints as a call to `runtime_panicdivide` — see
+      // `printExpr` — so the name has to be declared even though no `call` node carries
+      // it. Without this the listing says "undeclared identifier" about a function it
+      // printed itself. 21 of 4000 functions.
+      if ((value.op === '/' || value.op === '%') && value.right.t === 'const' && value.right.v === 0) {
+        into.add('runtime_panicdivide');
+      }
       gatherCalls(value.left, into); gatherCalls(value.right, into); return;
     case 'un':
       gatherCalls(value.value, into); return;
@@ -1081,6 +1091,56 @@ function renameExpr(expr: Expr, mapping: Map<string, string>): Expr {
 }
 
 /**
+ * Give every call to this function the argument count the signature states.
+ *
+ * A recursive call carries the same arguments as the function itself, so a call with
+ * fewer names than the signature has is an inference miss, not a different call. The
+ * value on the other side is not always recoverable: `mapKeyError2` recurses from inside
+ * a loop, where the registers the arguments arrived in have long been overwritten, and
+ * three of its four call sites came out as `mapKeyError2()`. `cl` rejects that —
+ * `C2198: 'mapKeyError2(long,long)': too few arguments for call` — and the listing is the
+ * only place the argument count is known at all, because nothing else in the image
+ * records it.
+ *
+ * Only the count is fixed. The arguments keep whatever was recovered, and a call that
+ * recovered none reads as passing the function's own parameters, which is what the
+ * register state at that point usually is.
+ */
+function padSelfCalls(body: CtrlStmt[], own: string, arity: number): CtrlStmt[] {
+  if (arity === 0) return body;
+  const pad = (value: Expr): Expr => {
+    switch (value.t) {
+      case 'call': {
+        const args = value.args.map(pad);
+        if (value.target !== own || args.length >= arity) return { ...value, args };
+        const filled = [...args];
+        for (let index = filled.length; index < arity; index += 1) {
+          filled.push({ t: 'var', name: `arg${index}`, size: 64 });
+        }
+        return { ...value, args: filled };
+      }
+      case 'bin': return { ...value, left: pad(value.left), right: pad(value.right) };
+      case 'un': case 'cast': return { ...value, value: pad(value.value) };
+      case 'load': return { ...value, addr: pad(value.addr) };
+      case 'select': return { ...value, cond: pad(value.cond), a: pad(value.a), b: pad(value.b) };
+      default: return value;
+    }
+  };
+  const walk = (stmt: CtrlStmt): CtrlStmt => {
+    switch (stmt.t) {
+      case 'assign': return { ...stmt, target: pad(stmt.target), value: pad(stmt.value) };
+      case 'expr': return { ...stmt, expr: pad(stmt.expr) };
+      case 'return': return stmt.value ? { ...stmt, value: pad(stmt.value) } : stmt;
+      case 'if': return { ...stmt, cond: pad(stmt.cond), then: stmt.then.map(walk), ...(stmt.else ? { else: stmt.else.map(walk) } : {}) };
+      case 'while': return { ...stmt, cond: stmt.cond ? pad(stmt.cond) : null, body: stmt.body.map(walk) };
+      case 'do': return { ...stmt, body: stmt.body.map(walk), cond: pad(stmt.cond) };
+      default: return stmt;
+    }
+  };
+  return body.map(walk);
+}
+
+/**
  * Rename registers to parameter names, and stop the body from assigning them.
  *
  * A parameter is a name for a value that arrived in a register, not a variable
@@ -1093,6 +1153,7 @@ function renameExpr(expr: Expr, mapping: Map<string, string>): Expr {
  * So an assignment whose target is a parameter keeps the register name instead:
  * the value is real, the variable it lands in is not the argument.
  */
+
 function renameStmt(stmt: CtrlStmt, mapping: Map<string, string>, params: Set<string>): CtrlStmt {
   switch (stmt.t) {
     case 'assign': {
@@ -1331,6 +1392,14 @@ function printExpr(expr: Expr, parentPrecedence = 0, asCondition = false): strin
       return `*(${typeForSize(expr.size)} *)${wrap(expr.addr, 90)}`;
     case 'bin': {
       if ((expr.op === '>>' || expr.op === '<<') && expr.right.t === 'const' && expr.right.v === 0) return printExpr(expr.left, parentPrecedence);
+      // Division by a constant zero. Go emits the check as a call to `panicdivide` and
+      // then the `div` itself, and the recovery sees the divisor as the zero the panic
+      // arm left in the register. Printing `-0x1 / 0` is not C — `cl` reports
+      // `C2124: divide or mod by zero` — and the code cannot do anything else, since a
+      // zero divisor panics. The call is what the source has.
+      if ((expr.op === '/' || expr.op === '%') && expr.right.t === 'const' && expr.right.v === 0) {
+        return 'runtime_panicdivide()';
+      }
       const precedence = PRECEDENCE[expr.op] ?? 10;
       const text = `${printExpr(expr.left, precedence)} ${expr.op} ${printExpr(expr.right, precedence + 1)}`;
       return precedence < parentPrecedence ? `(${text})` : text;

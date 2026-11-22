@@ -64,6 +64,12 @@ function substitute(expr: Expr, env: Map<string, Expr>): Expr {
     case 'bin':
       return { ...expr, left: substitute(expr.left, env), right: substitute(expr.right, env) };
     case 'un':
+      // `&x` is the address of `x`, not the address of whatever `x` currently holds.
+      // Substituting into it turned `mov [rsp+0x30], 0x2d; lea rbx, [rsp+0x30]` into
+      // `v_48 = 0x2d; rbx = &0x2d;`, which is not C at all — `cl` reports
+      // `C2101: '&' on constant`. Every other unary operator takes the value, so `-x` and
+      // `~x` are still folded.
+      if (expr.op === '&') return expr;
       return { ...expr, value: substitute(expr.value, env) };
     case 'cast':
       return { ...expr, value: substitute(expr.value, env) };
@@ -346,7 +352,11 @@ export function inlineSingleUseTemps(stmts: Stmt[]): Stmt[] {
       case 'reg': case 'var': return value.name === name ? with_ : value;
       case 'load': return { ...value, addr: swap(value.addr, name, with_) };
       case 'bin': return { ...value, left: swap(value.left, name, with_), right: swap(value.right, name, with_) };
-      case 'un': return { ...value, value: swap(value.value, name, with_) };
+      case 'un':
+        // `&x` needs `x` to stay a name. Inlining the value into it gave
+        // `rbx = &0x2d` for `mov [rsp+0x30], 0x2d; lea rbx, [rsp+0x30]`, and `cl`
+        // rejects that with `C2101: '&' on constant`. Same rule as `substitute`.
+        return value.op === '&' ? value : { ...value, value: swap(value.value, name, with_) };
       case 'cast': return { ...value, value: swap(value.value, name, with_) };
       case 'select': return { ...value, cond: swap(value.cond, name, with_), a: swap(value.a, name, with_), b: swap(value.b, name, with_) };
       case 'call': return { ...value, args: value.args.map((arg) => swap(arg, name, with_)) };
