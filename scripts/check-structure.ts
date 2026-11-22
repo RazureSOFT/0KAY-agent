@@ -75,6 +75,7 @@ const fails: Record<string, Failure[]> = {
   duplicateDeclaration: [],
   undeclaredType: [],
   emptyLoop: [],
+  repeatedGoto: [],
   fallsOffEnd: [],
 }
 let functions = 0
@@ -109,6 +110,14 @@ for (const fn of named.slice(0, LIMIT)) {
   if (/while \(1\) \{\s*\}/.test(c) || /while \(1\) \{\n\s*\}/.test(c)) {
     const at = c.search(/while \(1\) \{/)
     fails.emptyLoop.push({ name: fn.name, detail: `line ${c.slice(0, at).split('\n').length}` })
+  }
+
+  // 0b. The same `goto` twice in a row. Two writers of an arm's exit put the same jump
+  //     side by side, and 23% of functions had it — 185 of 800 — when one of them was
+  //     left to the epilogue as well.
+  const repeated = /goto (L_[0-9a-f]+);\s*\n\s*goto \1;/.exec(c)
+  if (repeated) {
+    fails.repeatedGoto.push({ name: fn.name, detail: repeated[1] })
   }
 
   // 1. An empty pair of braces is an empty block. A body of comments is not empty:
@@ -301,7 +310,7 @@ function stripComments(source: string): string {
 
 const order = [
   'invalidIdentifier', 'undeclaredName', 'undeclaredCallee', 'duplicateDeclaration',
-  'undeclaredType', 'emptyLoop', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
+  'undeclaredType', 'emptyLoop', 'repeatedGoto', 'fallsOffEnd', 'braceImbalance', 'emptyBranch', 'danglingGoto',
   'unusedLabel', 'gotoCountMismatch', 'selfAssign', 'repeatedCondition', 'readBeforeWritten',
 ]
 console.log(`functions ${functions} | instructions ${instructions}`)

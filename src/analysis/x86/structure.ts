@@ -212,6 +212,11 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
               gotos += 1;
             }
           }
+          // Handled: the exit is written above, and the fall-out at the end of the walk
+          // would write it a second time. `time.appendNano` printed
+          // `goto L_1400b1b5e; goto L_1400b1b5e;` when this was left to the epilogue,
+          // in 185 of 800 functions.
+          current = null;
           break;
         }
         if (dominators.get(current)?.has(target)) {
@@ -283,7 +288,25 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
     // jump to itself, which reads as `L_x: goto L_x;`.
     const exit = current != null && current !== stop && !printedHere.has(current) ? current : null;
     const reached = exit != null ? byStart.get(exit) : undefined;
-    if (exit != null && reached && emitted.has(exit) && out.length) {
+    // Not when the arm already ends by naming that block. Two writers of the same jump
+    // produced `goto L_x; goto L_x;` — 185 of 800 functions — so the tail of `out` is
+    // searched rather than only its last element: nested arms each append their own and
+    // the same label came out four times in a row in `indexbody`.
+    //
+    // Only a jump with nothing after it counts. Once another statement or label has been
+    // written the earlier jump is no longer the end of this arm and a new one is right.
+    let alreadyNamed = false;
+    for (let index = out.length - 1; index >= 0; index -= 1) {
+      const node = out[index];
+      if (node.t === 'goto' && exit != null) {
+        if (node.label === labelOf(exit)) { alreadyNamed = true; break; }
+        // A jump to somewhere else means the earlier one was not the tail.
+        break;
+      }
+      if (node.t !== 'goto' && node.t !== 'label' && node.t !== 'note') break;
+      if (node.t === 'label' && exit != null && node.name !== labelOf(exit)) break;
+    }
+    if (exit != null && reached && emitted.has(exit) && out.length && !alreadyNamed) {
       if (reached.term === 'ret') {
         const repeated = sharedReturn(exit, null, byStart, emitted);
         if (repeated.length) out.push(...repeated);
@@ -420,9 +443,18 @@ export function structure(blocks: LiftedBlock[], entry: number): StructureResult
       }
     }
   }
+  // A jump written twice in a row goes to the same place twice. Two arms that end by
+  // naming the same block, or an arm's own jump next to the epilogue's, put the same
+  // `goto` side by side and the reader learns nothing from the second. `indexbody` had
+  // four in a row.
+  //
+  // After `pruneLabels`, not before: the repeats sit either side of a label that turns
+  // out to be unused, and with the labels still in place the two jumps are not adjacent
+  // and nothing is removed.
   const gotos2 = pruneLabels(body);
+  const withoutRepeats = dropRepeatedJumps(body);
   void depth;
-  return { body, orphans, loops: loops.length, gotos: gotos2 };
+  return { body: withoutRepeats, orphans, loops: loops.length, gotos: gotos2 };
 }
 
 
@@ -508,6 +540,36 @@ function countNodes(nodes: CtrlStmt[]): number {
     else if (node.t === 'switch') { for (const c of node.cases) total += countNodes(c.body); if (node.defaultBody) total += countNodes(node.defaultBody); }
   }
   return total;
+}
+
+/**
+ * Drop a `goto` that names the same label as the `goto` immediately before it.
+ *
+ * Two writers can put the same jump side by side — an arm's own exit and the epilogue's
+ * — and one of them is always noise. Only adjacent, and only across labels and notes
+ * that carry nothing: a statement in between means control really does reach the jump
+ * twice.
+ */
+function dropRepeatedJumps(nodes: CtrlStmt[]): CtrlStmt[] {
+  const out: CtrlStmt[] = [];
+  for (const node of nodes) {
+    const previous = out[out.length - 1];
+    if (node.t === 'goto' && previous?.t === 'goto' && previous.label === node.label) continue;
+    if (node.t === 'if') {
+      out.push({ t: 'if', cond: node.cond, then: dropRepeatedJumps(node.then), ...(node.else ? { else: dropRepeatedJumps(node.else) } : {}) });
+    } else if (node.t === 'while' || node.t === 'do') {
+      out.push({ ...node, body: dropRepeatedJumps(node.body) });
+    } else if (node.t === 'switch') {
+      out.push({
+        ...node,
+        cases: node.cases.map((entry) => ({ ...entry, body: dropRepeatedJumps(entry.body) })),
+        ...(node.defaultBody ? { defaultBody: dropRepeatedJumps(node.defaultBody) } : {}),
+      });
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
 }
 
 function pruneLabels(body: CtrlStmt[]): number {
